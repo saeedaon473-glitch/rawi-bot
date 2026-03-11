@@ -2243,10 +2243,10 @@ async def cmd_daily_question(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["daily_q_date"] = today
     opts = q["options"]
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(opts[0], callback_data=f"dq_{opts[0]}"),
-         InlineKeyboardButton(opts[1], callback_data=f"dq_{opts[1]}")],
-        [InlineKeyboardButton(opts[2], callback_data=f"dq_{opts[2]}"),
-         InlineKeyboardButton(opts[3], callback_data=f"dq_{opts[3]}")],
+        [InlineKeyboardButton(opts[0], callback_data="dq_0"),
+         InlineKeyboardButton(opts[1], callback_data="dq_1")],
+        [InlineKeyboardButton(opts[2], callback_data="dq_2"),
+         InlineKeyboardButton(opts[3], callback_data="dq_3")],
     ])
     await update.message.reply_text(
         "❓ سؤال ديني اليوم\n"
@@ -3666,6 +3666,31 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif q.data.startswith("dq_"):
         await q.answer()
+        today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+        # تحقق إذا أجاب اليوم
+        with sqlite3.connect("bot.db") as _conn:
+            _row = _conn.execute("SELECT correct FROM daily_question WHERE user_id=? AND date=?", (user.id, today)).fetchone()
+        if _row:
+            await q.answer("✅ أجبت على هذا السؤال اليوم مسبقاً!", show_alert=True)
+            return
+        dq = context.user_data.get("daily_q") or get_question_of_day()
+        opts = dq["options"]
+        answer_idx = int(q.data.split("_")[1])
+        chosen = opts[answer_idx]
+        correct = dq["answer"]
+        is_correct = chosen == correct
+        with sqlite3.connect("bot.db") as _conn:
+            _conn.execute(
+                "INSERT OR REPLACE INTO daily_question (user_id, date, q_index, answered, correct) VALUES (?,?,?,1,?)",
+                (user.id, today, 0, 1 if is_correct else 0)
+            )
+        if is_correct:
+            msg = f"✅ إجابة صحيحة! أحسنت 🌟\n\n📖 {dq.get('explain','')}"
+        else:
+            msg = f"❌ إجابة خاطئة\n\n✅ الإجابة الصحيحة: {correct}\n\n📖 {dq.get('explain','')}"
+        await q.edit_message_text(
+            f"❓ {dq['q']}\n\n{msg}\n\n🌙 تعال غداً لسؤال جديد!"
+        )
 
     elif q.data == "weekly_hint":
         await q.answer()
@@ -4103,13 +4128,8 @@ def main():
     app.add_handler(CommandHandler("random", random_hadith))
     app.add_handler(CommandHandler("donate", donate_command))
     app.add_handler(CommandHandler("balance", cmd_balance))
-    app.add_handler(CommandHandler("topics", cmd_topics))
-    app.add_handler(CommandHandler("favorites", cmd_favorites))
-    app.add_handler(CommandHandler("favs", cmd_favorites))
-    app.add_handler(CommandHandler("settime", cmd_set_notif_time))
     app.add_handler(CommandHandler("challenge", cmd_challenge_now))
     app.add_handler(CommandHandler("duel", cmd_duel))
-    app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("mystatus", cmd_mystatus))
 
     # معالجات الدفع
