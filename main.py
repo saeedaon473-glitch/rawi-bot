@@ -2214,17 +2214,21 @@ async def cmd_sahaba(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def send_quiz_question(msg, context, q, num):
     """إرسال سؤال في الاختبار اليومي"""
     opts = q["options"]
+    # نستخدم index الخيار عشان نتجنب مشكلة callback_data الطويل
     kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton(opts[0], callback_data=f"quiz_{opts[0]}"),
-         InlineKeyboardButton(opts[1], callback_data=f"quiz_{opts[1]}")],
-        [InlineKeyboardButton(opts[2], callback_data=f"quiz_{opts[2]}"),
-         InlineKeyboardButton(opts[3], callback_data=f"quiz_{opts[3]}")],
+        [InlineKeyboardButton(opts[0], callback_data=f"quiz_0"),
+         InlineKeyboardButton(opts[1], callback_data=f"quiz_1")],
+        [InlineKeyboardButton(opts[2], callback_data=f"quiz_2"),
+         InlineKeyboardButton(opts[3], callback_data=f"quiz_3")],
     ])
     await msg.reply_text(
         f"❓ *اختبار اليوم — سؤال {num}/5*\n"
         "━━━━━━━━━━━━━━━\n\n"
         f"📌 {q['q']}\n\n"
-        "اختر الإجابة الصحيحة 👇",
+        f"1️⃣ {opts[0]}\n"
+        f"2️⃣ {opts[1]}\n"
+        f"3️⃣ {opts[2]}\n"
+        f"4️⃣ {opts[3]}",
         parse_mode="Markdown",
         reply_markup=kb
     )
@@ -2436,9 +2440,14 @@ async def handle_admin_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         for i, (uid, name, uname, amount, charge_id, date) in enumerate(rows, 1):
             u = f"@{uname}" if uname else str(uid)
             msg += f"{i}. {name or 'مجهول'} ({u})\n   ⭐ {amount} نجمة | 🗓 {date[:10]}\n   🔑 {charge_id}\n\n"
+            # charge_id قد يكون طويل - نخزنه في context
+            refund_key = f"refund_{i}"
+            if not context.user_data.get("refund_map"):
+                context.user_data["refund_map"] = {}
+            context.user_data["refund_map"][refund_key] = {"uid": uid, "charge_id": charge_id, "amount": amount}
             buttons.append([InlineKeyboardButton(
                 f"↩️ استرداد {amount}⭐ — {name or uid}",
-                callback_data=f"refund_{uid}_{charge_id}"
+                callback_data=refund_key
             )])
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
         return
@@ -3614,13 +3623,12 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
 
     elif q.data.startswith("quiz_"):
-        chosen = q.data[5:]
+        chosen_idx = int(q.data[5:]) if q.data[5:].isdigit() else -1
         questions = context.user_data.get("quiz_questions", [])
         idx_q = context.user_data.get("quiz_index", 0)
         score = context.user_data.get("quiz_score", 0)
         date = context.user_data.get("quiz_date", "")
         if not questions:
-            # استرجع من DB
             sess = load_quiz_session(user.id)
             if sess and sess.get("questions"):
                 questions = sess["questions"]
@@ -3638,6 +3646,10 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("انتهت الجلسة", show_alert=True)
             return
         q_data = questions[idx_q]
+        if chosen_idx < 0 or chosen_idx >= len(q_data["options"]):
+            await q.answer("خطأ في الإجابة", show_alert=True)
+            return
+        chosen = q_data["options"][chosen_idx]
         correct = chosen == q_data["answer"]
         if correct:
             score += 1
@@ -3888,23 +3900,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif q.data.startswith("refund_") and user.id in ADMIN_IDS:
         await q.answer()
-        parts = q.data.split("_", 2)
-        if len(parts) == 3:
-            target_uid = int(parts[1])
-            charge_id = parts[2]
-            try:
-                await context.bot.refund_star_payment(
-                    user_id=target_uid,
-                    telegram_payment_charge_id=charge_id
-                )
-                # احذف من donations
-                conn = sqlite3.connect("bot.db")
-                conn.execute("DELETE FROM donations WHERE user_id=? AND charge_id=?", (target_uid, charge_id))
-                conn.commit()
-                conn.close()
-                await q.message.reply_text(f"✅ تم استرداد النجوم للمستخدم {target_uid}")
-            except Exception as e:
-                await q.message.reply_text(f"❌ فشل الاسترداد: {e}")
+        refund_map = context.user_data.get("refund_map", {})
+        info = refund_map.get(q.data)
+        if not info:
+            await q.message.reply_text("❌ انتهت الجلسة، افتح سجل الفواتير من جديد")
+            return
+        target_uid = info["uid"]
+        charge_id = info["charge_id"]
+        amount = info["amount"]
+        try:
+            await context.bot.refund_star_payment(
+                user_id=target_uid,
+                telegram_payment_charge_id=charge_id
+            )
+            conn = sqlite3.connect("bot.db")
+            conn.execute("DELETE FROM donations WHERE user_id=? AND charge_id=?", (target_uid, charge_id))
+            conn.commit()
+            conn.close()
+            await q.message.reply_text(f"✅ تم استرداد {amount}⭐ للمستخدم {target_uid}")
+        except Exception as e:
+            await q.message.reply_text(f"❌ فشل الاسترداد: {e}")
 
     elif q.data == "confirm_report":
         await q.answer()
