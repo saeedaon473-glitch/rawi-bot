@@ -680,29 +680,7 @@ def get_tier_label(tier: int) -> str:
     return labels.get(tier, "👤 مستخدم عادي")
 
 def get_tier_features(tier: int) -> str:
-    if tier == 0:
-        return (
-            "المزايا المتاحة لك بالدعم:\n"
-            f"  ⭐ {TIER1_STARS}+ نجمة → 🔎 بحث بالموضوع\n"
-            f"  ⭐ {TIER2_STARS}+ نجوم → 💾 المفضلة\n"
-            f"  ⭐ {TIER3_STARS}+ نجمة → 🕐 تخصيص وقت الإشعار\n"
-        )
-    elif tier == 1:
-        return (
-            "مزاياك الحالية:\n  ✅ 🔎 بحث بالموضوع\n\n"
-            "لفتح المزيد:\n"
-            f"  ⭐ {TIER2_STARS}+ نجوم → 💾 المفضلة\n"
-            f"  ⭐ {TIER3_STARS}+ نجمة → 🕐 تخصيص وقت الإشعار\n"
-        )
-    elif tier == 2:
-        return (
-            "مزاياك الحالية:\n  ✅ 🔎 بحث بالموضوع\n  ✅ 💾 المفضلة\n\n"
-            "لفتح المزيد:\n"
-            f"  ⭐ {TIER3_STARS}+ نجمة → 🕐 تخصيص وقت الإشعار\n"
-        )
-    else:
-        return "مزاياك الحالية:\n  ✅ 🔎 بحث بالموضوع\n  ✅ 💾 المفضلة\n  ✅ 🕐 تخصيص وقت الإشعار\n"
-
+    return "✅ جميع المزايا متاحة للجميع مجاناً"
 def get_notif_time(user_id: int) -> tuple:
     """جلب وقت الإشعار المخصص للمستخدم"""
     try:
@@ -1362,6 +1340,27 @@ DAILY_QUESTIONS = [
     {"q": "ما هو المسجد الثالث الذي تُشدّ إليه الرحال؟", "options": ["مسجد قباء", "المسجد الأقصى", "مسجد الخيف", "مسجد النبي في منى"], "answer": "المسجد الأقصى", "explain": "لا تُشدّ الرحال إلا إلى ثلاثة مساجد: الحرام والنبوي والأقصى"},
     {"q": "ما هي السورة المكية التي تبدأ بحروف مقطعة ألم؟", "options": ["البقرة", "آل عمران", "لقمان", "العنكبوت"], "answer": "العنكبوت", "explain": "سورة العنكبوت مكية وتبدأ بـ ألم"},
     {"q": "كم حجة حجّها النبي ﷺ؟", "options": ["حجة واحدة", "حجتان", "ثلاث حجج", "لم يحج"], "answer": "حجة واحدة", "explain": "حجّ النبي ﷺ حجة واحدة وهي حجة الوداع عام 10هـ"},
+    {"q": "ما هو اسم جبل النور الذي نزل فيه الوحي؟", "options": ["جبل عرفات", "جبل ثور", "جبل حراء", "جبل أبي قبيس"], "answer": "جبل حراء", "explain": "في غار حراء بجبل النور نزل أول وحي على النبي ﷺ"},
+    {"q": "ما هي أول آية نزلت من القرآن؟", "options": ["بسم الله", "الحمد لله", "اقرأ باسم ربك", "يا أيها المدثر"], "answer": "اقرأ باسم ربك", "explain": "أول ما نزل: اقرأ باسم ربك الذي خلق"},
+    {"q": "ما هي آخر آية نزلت من القرآن؟", "options": ["اليوم أكملت لكم دينكم", "واتقوا يوماً ترجعون", "إذا جاء نصر الله", "قل أعوذ برب الناس"], "answer": "واتقوا يوماً ترجعون", "explain": "قيل إن آخر آية نزلت: واتقوا يوماً ترجعون فيه إلى الله"},
+    {"q": "ما هو أول ما خلق الله؟", "options": ["الماء", "العرش", "القلم", "النور"], "answer": "القلم", "explain": "قال النبي ﷺ: أول ما خلق الله القلم فقال له اكتب"},
+    {"q": "كم سنة بقي أصحاب الكهف في نومهم؟", "options": ["100 سنة", "200 سنة", "309 سنوات", "400 سنة"], "answer": "309 سنوات", "explain": "قال تعالى: ولبثوا في كهفهم ثلاث مئة سنين وازدادوا تسعاً"},
+    {"q": "ما هي السورة الوحيدة التي ليس فيها بسملة في أولها؟", "options": ["الفيل", "التوبة", "الإخلاص", "المعوذتان"], "answer": "التوبة", "explain": "سورة التوبة لم يُكتب في أولها بسملة لأنها نزلت بالسيف والبراءة"},
+    {"q": "ما هي السورة التي تُسمى عروس القرآن؟", "options": ["الرحمن", "يس", "الواقعة", "الكهف"], "answer": "الرحمن", "explain": "سورة الرحمن تُسمى عروس القرآن لجمالها وتكرار نعم الله"},
+    {"q": "ما هي الآية الأطول في القرآن؟", "options": ["آية الكرسي", "آية الدَّين", "آية النكاح", "أول البقرة"], "answer": "آية الدَّين", "explain": "آية الدَّين (البقرة 282) هي الأطول في القرآن وتتعلق بالتداين"},
+    {"q": "أي نبي سكن في مصر وأصبح عزيزها؟", "options": ["موسى", "يوسف", "إبراهيم", "إسحاق"], "answer": "يوسف", "explain": "يوسف عليه السلام أصبح عزيز مصر وخازناً على خزائنها"},
+    {"q": "من هو النبي الذي ابتلعه الحوت؟", "options": ["إلياس", "إدريس", "يونس", "أيوب"], "answer": "يونس", "explain": "يونس عليه السلام ذو النون التقمه الحوت فنادى في الظلمات"},
+    {"q": "ما هي مدة نوح عليه السلام في قومه؟", "options": ["300 سنة", "500 سنة", "950 سنة", "1000 سنة"], "answer": "950 سنة", "explain": "قال تعالى: فلبث فيهم ألف سنة إلا خمسين عاماً"},
+    {"q": "ما هي السورة التي تحتوي على آية الكرسي؟", "options": ["آل عمران", "البقرة", "النساء", "المائدة"], "answer": "البقرة", "explain": "آية الكرسي هي الآية 255 من سورة البقرة"},
+    {"q": "ما معنى كلمة السكينة في القرآن؟", "options": ["الغضب", "الطمأنينة والهدوء", "الخوف", "الحزن"], "answer": "الطمأنينة والهدوء", "explain": "السكينة هي الطمأنينة التي يُلقيها الله في قلوب المؤمنين"},
+    {"q": "من هو النبي الذي كان نجاراً؟", "options": ["داود", "سليمان", "زكريا", "يوسف"], "answer": "زكريا", "explain": "كان زكريا عليه السلام نجاراً يعمل بيده"},
+    {"q": "ما هو الفرق بين الزكاة والصدقة؟", "options": ["لا فرق", "الزكاة واجبة والصدقة تطوع", "الصدقة واجبة والزكاة تطوع", "الزكاة للفقراء والصدقة للأقارب"], "answer": "الزكاة واجبة والصدقة تطوع", "explain": "الزكاة ركن من أركان الإسلام واجبة، والصدقة تطوع مستحب"},
+    {"q": "ما هو النصاب الشرعي للفضة؟", "options": ["100 جرام", "595 جراماً", "700 جرام", "1000 جرام"], "answer": "595 جراماً", "explain": "نصاب الفضة 595 جراماً تقريباً أي 200 درهم"},
+    {"q": "ما هي اسم زوجة فرعون المؤمنة؟", "options": ["هاجر", "آسية", "مريم", "بلقيس"], "answer": "آسية", "explain": "آسية بنت مزاحم زوجة فرعون آمنت بالله وهي من أفضل نساء الجنة"},
+    {"q": "كم ركعة تُصلى صلاة العيد؟", "options": ["ركعتان", "أربع ركعات", "ثلاث ركعات", "ست ركعات"], "answer": "ركعتان", "explain": "صلاة العيد ركعتان مع تكبيرات زائدة"},
+    {"q": "أي من الصلوات لا يُجهر بها؟", "options": ["الفجر والمغرب", "الظهر والعصر", "المغرب والعشاء", "الفجر فقط"], "answer": "الظهر والعصر", "explain": "الظهر والعصر سرّيتان لا يُجهر فيهما بالقراءة"},
+    {"q": "ما حكم لحم الخنزير في الإسلام؟", "options": ["مكروه", "حرام", "مباح في الضرورة فقط", "حرام إلا عند الضرورة"], "answer": "حرام إلا عند الضرورة", "explain": "لحم الخنزير حرام بنص القرآن ويُباح عند الاضطرار الشديد"},
+    {"q": "من هو أول من جمع القرآن في مصحف واحد؟", "options": ["عمر بن الخطاب", "أبو بكر الصديق", "زيد بن ثابت", "علي بن أبي طالب"], "answer": "أبو بكر الصديق", "explain": "أبو بكر أمر بجمع القرآن في مصحف واحد بعد موقعة اليمامة"},
 ]
 
 # ==================== تحدي الأسبوع الجماعي ====================
@@ -1677,21 +1676,13 @@ async def send_friday_hadith(context: ContextTypes.DEFAULT_TYPE):
         except:
             pass
 
-def main_kb(is_admin=False, daily=True, adhkar=False, tier=0):
-    sub_adhkar = "🕌 الأذكار"
+def main_kb(is_admin=False, daily=True, adhkar=False, tier=3):
     keys = [
         [KeyboardButton("🔍 تحقق من حديث"), KeyboardButton("اقترح لي حديثا📜")],
         [KeyboardButton("✨ اسم الله اليوم"), KeyboardButton("❓ سؤال اليوم")],
         [KeyboardButton("🏆 تحدي الأسبوع"), KeyboardButton("💰 دعم البوت")],
         [KeyboardButton("⚠️ إبلاغ عن خطأ"), KeyboardButton("ℹ️ عن البوت")],
     ]
-    # Tier 1+: بحث بالموضوع + تاريخ بحثي
-    if tier >= 1:
-        keys.insert(2, [KeyboardButton("🔎 بحث بالموضوع"), KeyboardButton("📋 تاريخ بحثي")])
-    # Tier 2+: أضف المفضلة + حديث على قدك
-    if tier >= 2:
-        keys.insert(2, [KeyboardButton("🔎 بحث بالموضوع"), KeyboardButton("💾 مفضلتي"), KeyboardButton("📋 تاريخ بحثي")])
-        keys.insert(3, [KeyboardButton("📖 حديث على قدك")])
     if is_admin:
         keys.append([KeyboardButton("⚙️ لوحة التحكم")])
     return ReplyKeyboardMarkup(keys, resize_keyboard=True)
@@ -2152,7 +2143,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ النسخة: v3.2 - 2026-03-10")
+    await update.message.reply_text("✅ النسخة: v4.0 - 2026-03-10")
 
 async def cmd_asma(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """أسماء الله الحسنى - اسم اليوم"""
@@ -2293,7 +2284,7 @@ async def cmd_weekly_challenge(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ النسخة: v3.2 - 2026-03-10")
+    await update.message.reply_text("✅ النسخة: v4.0 - 2026-03-10")
 
 async def testchallenge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -2920,17 +2911,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await handle_report_message(update, context)
         return
 
-    # أزرار VIP - تاريخ البحث وإحصائياتي
-    if text == "📋 تاريخ بحثي":
-        history = get_search_history(user.id)
-        if not history:
-            await update.message.reply_text("🔍 ما أجريت أي بحث بعد!")
-        else:
-            msg = "📋 *آخر بحوثك:*\n\n"
-            for i, (query, count, date) in enumerate(history, 1):
-                msg += f"{i}. {query} — {count} نتيجة\n"
-            await update.message.reply_text(msg, parse_mode="Markdown")
-        return
+
 
         # أزرار الاشتراك
     if text in ("🔔 حديث اليوم", "🔕 حديث اليوم"):
@@ -2964,15 +2945,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # أوامر Premium من لوحة المفاتيح
-    if text == "💾 مفضلتي":
-        await cmd_favorites(update, context)
-        return
-    if text == "🔎 بحث بالموضوع":
-        await cmd_topics(update, context)
-        return
-    if text == "📖 حديث على قدك":
-        await cmd_mood_hadith(update, context)
-        return
+
+
+
     if text == "🧩 تحدي الآن":
         await cmd_challenge_now(update, context)
         return
@@ -3778,9 +3753,6 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif q.data.startswith("mood_"):
         mood = q.data.split("_")[1]
         await q.answer()
-        if get_tier(user.id) < 2:
-            await q.answer("⭐ هذه الميزة للداعمين من Tier 2+", show_alert=True)
-            return
         msg = await send_mood_hadith(user.id, mood, context)
         await q.message.reply_text(msg, parse_mode="Markdown")
 
@@ -4069,13 +4041,20 @@ def watchdog():
     """يراقب البوت ويسجل لو في مشكلة"""
     import time as _time
     import os as _os
+    import subprocess as _sub
     _time.sleep(60)
+    fails = 0
     while True:
         try:
             import urllib.request as _req
             _req.urlopen("http://localhost:8080", timeout=10)
+            fails = 0
         except Exception as e:
-            logger.warning(f"⚠️ Watchdog: البوت لا يستجيب - {e}")
+            fails += 1
+            logger.warning(f"⚠️ Watchdog: البوت لا يستجيب ({fails}/3) - {e}")
+            if fails >= 3:
+                logger.error("🔴 Watchdog: إعادة تشغيل...")
+                _os.execv(__import__('sys').executable, [__import__('sys').executable] + __import__('sys').argv)
         _time.sleep(60)
 
 def self_ping():
@@ -4356,13 +4335,6 @@ async def cmd_duel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_mood_hadith(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """حديث على قدك - Tier 2+"""
     user = update.effective_user
-    if get_tier(user.id) < 2:
-        await update.message.reply_text(
-            "📖 حديث على قدك متاح من 5 نجوم فأكثر\n"
-            f"تحتاج {max(0, TIER2_STARS - get_premium_stars(user.id))} نجمة إضافية!\n\n"
-            "اضغط /donate للدعم 🤍"
-        )
-        return
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton("😊 بخير والحمد لله", callback_data="mood_happy")],
         [InlineKeyboardButton("😔 متعب ومحتاج دعم", callback_data="mood_tired")],
