@@ -121,6 +121,13 @@ def init_db():
         search_id TEXT,
         updated_at TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS quiz_sessions (
+        user_id INTEGER PRIMARY KEY,
+        questions_json TEXT,
+        quiz_index INTEGER DEFAULT 0,
+        quiz_score INTEGER DEFAULT 0,
+        quiz_date TEXT
+    )""")
     conn.execute("""CREATE TABLE IF NOT EXISTS asma_progress (
         user_id INTEGER PRIMARY KEY,
         last_index INTEGER DEFAULT 0,
@@ -1056,6 +1063,32 @@ def get_weekly_scores(week: str) -> list:
     rows = cur.fetchall()
     conn.close()
     return rows
+
+def save_quiz_session(user_id: int, questions: list, idx: int, score: int, date: str):
+    import json as _j
+    conn = sqlite3.connect("bot.db")
+    conn.execute("INSERT OR REPLACE INTO quiz_sessions (user_id, questions_json, quiz_index, quiz_score, quiz_date) VALUES (?,?,?,?,?)",
+        (user_id, _j.dumps(questions, ensure_ascii=False), idx, score, date))
+    conn.commit()
+    conn.close()
+
+def load_quiz_session(user_id: int) -> dict:
+    import json as _j
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT questions_json, quiz_index, quiz_score, quiz_date FROM quiz_sessions WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row: return {}
+    try:
+        return {"questions": _j.loads(row[0]), "index": row[1], "score": row[2], "date": row[3]}
+    except: return {}
+
+def clear_quiz_session(user_id: int):
+    conn = sqlite3.connect("bot.db")
+    conn.execute("DELETE FROM quiz_sessions WHERE user_id=?", (user_id,))
+    conn.commit()
+    conn.close()
 
 def save_user_session(user_id: int, results: list, page: int, grade_filter: str, search_id: str):
     """حفظ نتائج البحث في قاعدة البيانات"""
@@ -2398,17 +2431,16 @@ async def handle_admin_actions(update: Update, context: ContextTypes.DEFAULT_TYP
         if not rows:
             await update.message.reply_text("📋 لا توجد فواتير بعد.")
             return
-        msg = "📋 *آخر 10 فواتير:*\n\n"
+        msg = "📋 آخر 10 فواتير:\n\n"
         buttons = []
         for i, (uid, name, uname, amount, charge_id, date) in enumerate(rows, 1):
             u = f"@{uname}" if uname else str(uid)
-            line = f"{i}. {name or 'مجهول'} ({u})\n   ⭐ {amount} | 🗓 {date[:10]}\n   🔑 `{charge_id}`\n\n"
-            msg += line
+            msg += f"{i}. {name or 'مجهول'} ({u})\n   ⭐ {amount} نجمة | 🗓 {date[:10]}\n   🔑 {charge_id}\n\n"
             buttons.append([InlineKeyboardButton(
                 f"↩️ استرداد {amount}⭐ — {name or uid}",
                 callback_data=f"refund_{uid}_{charge_id}"
             )])
-        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
         return
 
     elif text == "🗑️ حذف مستخدم":
@@ -3587,7 +3619,22 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         idx_q = context.user_data.get("quiz_index", 0)
         score = context.user_data.get("quiz_score", 0)
         date = context.user_data.get("quiz_date", "")
-        if not questions or idx_q >= len(questions):
+        if not questions:
+            # استرجع من DB
+            sess = load_quiz_session(user.id)
+            if sess and sess.get("questions"):
+                questions = sess["questions"]
+                idx_q = sess["index"]
+                score = sess["score"]
+                date = sess["date"]
+                context.user_data["quiz_questions"] = questions
+                context.user_data["quiz_index"] = idx_q
+                context.user_data["quiz_score"] = score
+                context.user_data["quiz_date"] = date
+            else:
+                await q.answer("انتهت الجلسة، ابدأ الاختبار من جديد", show_alert=True)
+                return
+        if idx_q >= len(questions):
             await q.answer("انتهت الجلسة", show_alert=True)
             return
         q_data = questions[idx_q]
@@ -3605,9 +3652,11 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         next_idx = idx_q + 1
         context.user_data["quiz_index"] = next_idx
+        save_quiz_session(user.id, questions, next_idx, score, date)
         if next_idx >= 5:
             # انتهى الاختبار
             context.user_data.pop("in_daily_quiz", None)
+            clear_quiz_session(user.id)
             conn = sqlite3.connect("bot.db")
             conn.execute("INSERT OR REPLACE INTO daily_question (user_id, date, q_index, answered, correct) VALUES (?,?,?,1,?)",
                          (user.id, date, 0, score))
