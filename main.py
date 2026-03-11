@@ -4065,17 +4065,30 @@ def run_web_server():
     server = HTTPServer(("0.0.0.0", 8080), Handler)
     server.serve_forever()
 
+def watchdog():
+    """يراقب البوت ويسجل لو في مشكلة"""
+    import time as _time
+    import os as _os
+    _time.sleep(60)
+    while True:
+        try:
+            import urllib.request as _req
+            _req.urlopen("http://localhost:8080", timeout=10)
+        except Exception as e:
+            logger.warning(f"⚠️ Watchdog: البوت لا يستجيب - {e}")
+        _time.sleep(60)
+
 def self_ping():
-    """يقرع البوت نفسه كل 4 دقائق لمنع النوم"""
+    """يقرع البوت نفسه كل دقيقتين لمنع النوم"""
     import urllib.request as _req
     import time as _time
-    _time.sleep(30)  # انتظر يشتغل البوت أولاً
+    _time.sleep(20)  # انتظر يشتغل البوت أولاً
     while True:
         try:
             _req.urlopen("http://localhost:8080", timeout=5)
         except:
             pass
-        _time.sleep(240)  # كل 4 دقائق
+        _time.sleep(120)  # كل دقيقتين
 
 def main():
     logger.info("🚀 بدء تشغيل بوت راوِي...")
@@ -4084,6 +4097,7 @@ def main():
     from threading import Thread
     Thread(target=run_web_server, daemon=True).start()
     Thread(target=self_ping, daemon=True).start()
+    Thread(target=watchdog, daemon=True).start()
     logger.info("🌐 Web server شغّال على port 8080 + self-ping كل 4 دقائق")
     app = Application.builder().token(BOT_TOKEN).build()
 
