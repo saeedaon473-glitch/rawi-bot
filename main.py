@@ -121,6 +121,40 @@ def init_db():
         search_id TEXT,
         updated_at TEXT
     )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS asma_progress (
+        user_id INTEGER PRIMARY KEY,
+        last_index INTEGER DEFAULT 0,
+        last_date TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS sahaba_quiz (
+        user_id INTEGER,
+        date TEXT,
+        sahabi TEXT,
+        correct INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, date)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS daily_question (
+        user_id INTEGER,
+        date TEXT,
+        q_index INTEGER,
+        answered INTEGER DEFAULT 0,
+        correct INTEGER DEFAULT 0,
+        PRIMARY KEY (user_id, date)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS weekly_challenge (
+        week TEXT PRIMARY KEY,
+        q_index INTEGER,
+        question TEXT,
+        answer TEXT,
+        hint TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS weekly_answers (
+        user_id INTEGER,
+        week TEXT,
+        correct INTEGER DEFAULT 0,
+        answer_text TEXT,
+        PRIMARY KEY (user_id, week)
+    )""")
     try:
         conn.execute("ALTER TABLE favorites ADD COLUMN note TEXT DEFAULT ''")
     except:
@@ -948,6 +982,81 @@ def streak_emoji(streak: int) -> str:
     return ""
 
 # ==================== Daily Challenge ====================
+def get_asma_of_day(user_id: int) -> dict:
+    """جلب اسم الله لهذا اليوم"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT last_index, last_date FROM asma_progress WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    if row and row[1] == today:
+        idx = row[0]
+    else:
+        idx = (row[0] + 1) % len(ASMA_ALLAH) if row else 0
+        conn.execute("INSERT OR REPLACE INTO asma_progress (user_id, last_index, last_date) VALUES (?,?,?)",
+                     (user_id, idx, today))
+        conn.commit()
+    conn.close()
+    return ASMA_ALLAH[idx]
+
+def get_sahaba_of_day() -> dict:
+    """جلب صحابي اليوم"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    day_num = sum(int(c) for c in today.replace("-","")) % len(SAHABA_QUIZ)
+    return SAHABA_QUIZ[day_num]
+
+def get_question_of_day() -> dict:
+    """جلب سؤال اليوم"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    day_num = sum(int(c) for c in today.replace("-","")) % len(DAILY_QUESTIONS)
+    return DAILY_QUESTIONS[day_num]
+
+def get_weekly_challenge() -> dict:
+    """جلب تحدي الأسبوع"""
+    today = _dt.datetime.now(AMMAN_TZ)
+    week = today.strftime("%Y-W%W")
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT question, answer, hint FROM weekly_challenge WHERE week=?", (week,))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return {"question": row[0], "answer": row[1], "hint": row[2], "week": week}
+    # اختر تحدي الأسبوع تلقائياً
+    week_num = int(today.strftime("%W")) % len(WEEKLY_CHALLENGES)
+    ch = WEEKLY_CHALLENGES[week_num]
+    conn = sqlite3.connect("bot.db")
+    conn.execute("INSERT OR IGNORE INTO weekly_challenge (week, q_index, question, answer, hint) VALUES (?,?,?,?,?)",
+                 (week, week_num, ch["q"], ch["answer"], ch["hint"]))
+    conn.commit()
+    conn.close()
+    return {"question": ch["q"], "answer": ch["answer"], "hint": ch["hint"], "week": week}
+
+def save_weekly_answer(user_id: int, week: str, answer: str, correct: bool):
+    conn = sqlite3.connect("bot.db")
+    conn.execute("INSERT OR IGNORE INTO weekly_answers (user_id, week, correct, answer_text) VALUES (?,?,?,?)",
+                 (user_id, week, 1 if correct else 0, answer))
+    conn.commit()
+    conn.close()
+
+def has_answered_weekly(user_id: int, week: str) -> bool:
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM weekly_answers WHERE user_id=? AND week=?", (user_id, week))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row)
+
+def get_weekly_scores(week: str) -> list:
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("""SELECT u.full_name, u.username, wa.correct, wa.answer_text
+                   FROM weekly_answers wa JOIN users u ON wa.user_id=u.user_id
+                   WHERE wa.week=? ORDER BY wa.correct DESC, wa.user_id ASC LIMIT 20""", (week,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
 def save_user_session(user_id: int, results: list, page: int, grade_filter: str, search_id: str):
     """حفظ نتائج البحث في قاعدة البيانات"""
     import json as _json
@@ -1027,6 +1136,85 @@ STATIC_CHALLENGE_HADITHS = [
     'كل سلامى من الناس عليه صدقة كل يوم تطلع فيه الشمس',
     'أحب الأعمال إلى الله أدومها وإن قل',
     'من نفس عن مؤمن كربة من كرب الدنيا نفس الله عنه كربة من كرب يوم القيامة',
+]
+
+
+# ==================== أسماء الله الحسنى ====================
+ASMA_ALLAH = [
+    {"name": "الرَّحْمَن", "meaning": "ذو الرحمة الواسعة لجميع الخلق", "dhikr": "يا رحمن ارحمني برحمتك"},
+    {"name": "الرَّحِيم", "meaning": "دائم الرحمة بعباده المؤمنين", "dhikr": "يا رحيم ارحمني"},
+    {"name": "الْمَلِك", "meaning": "المالك لكل شيء لا يزول ملكه", "dhikr": "يا ملك القلوب ثبّت قلبي"},
+    {"name": "الْقُدُّوس", "meaning": "المنزّه عن كل نقص وعيب", "dhikr": "يا قدوس طهّر قلبي"},
+    {"name": "السَّلَام", "meaning": "السالم من كل نقص ومصدر السلام", "dhikr": "يا سلام سلّمني"},
+    {"name": "الْمُؤْمِن", "meaning": "يمنح الأمن ويصدّق وعده", "dhikr": "يا مؤمن آمن خوفي"},
+    {"name": "الْمُهَيْمِن", "meaning": "الرقيب الحافظ على كل شيء", "dhikr": "يا مهيمن احفظني"},
+    {"name": "الْعَزِيز", "meaning": "الغالب الذي لا يُقهر", "dhikr": "يا عزيز أعزّني بطاعتك"},
+    {"name": "الْجَبَّار", "meaning": "الذي يجبر الكسير ويقهر العصاة", "dhikr": "يا جبار اجبر كسري"},
+    {"name": "الْخَالِق", "meaning": "الموجِد للأشياء من العدم", "dhikr": "يا خالق اخلق في قلبي الإيمان"},
+    {"name": "الْغَفَّار", "meaning": "كثير المغفرة لعباده", "dhikr": "يا غفار اغفر لي ذنوبي"},
+    {"name": "الْقَهَّار", "meaning": "الغالب فوق عباده", "dhikr": "يا قهار اقهر نفسي الأمارة بالسوء"},
+    {"name": "الْوَهَّاب", "meaning": "كثير العطاء بلا مقابل", "dhikr": "يا وهاب هب لي من عندك رحمة"},
+    {"name": "الرَّزَّاق", "meaning": "الذي يرزق جميع الخلق", "dhikr": "يا رزاق ارزقني من حيث لا أحتسب"},
+    {"name": "الْفَتَّاح", "meaning": "يفتح أبواب الرزق والرحمة والفرج", "dhikr": "يا فتاح افتح لي أبواب الخير"},
+    {"name": "الْعَلِيم", "meaning": "المحيط علمه بكل شيء", "dhikr": "يا عليم علّمني ما ينفعني"},
+    {"name": "الْحَكِيم", "meaning": "ذو الحكمة البالغة في كل أمر", "dhikr": "يا حكيم أحكم أموري"},
+    {"name": "الْوَدُود", "meaning": "يحب عباده المؤمنين", "dhikr": "يا ودود حبّب إليّ الطاعة"},
+    {"name": "الشَّكُور", "meaning": "يشكر القليل ويجازي عليه بالكثير", "dhikr": "يا شكور اجعلني من الشاكرين"},
+    {"name": "الْحَلِيم", "meaning": "لا يعجل بالعقوبة رغم القدرة", "dhikr": "يا حليم لا تعاجلني بذنوبي"},
+    {"name": "الْغَفُور", "meaning": "يغفر الذنوب مهما عظمت", "dhikr": "يا غفور اغفر لي ما علمت وما لم أعلم"},
+    {"name": "الشَّهِيد", "meaning": "يشهد على كل شيء لا يخفى عليه شيء", "dhikr": "يا شهيد أصلح سري وعلانيتي"},
+    {"name": "الْحَقّ", "meaning": "الثابت الوجود الدائم", "dhikr": "يا حق اهدني للحق"},
+    {"name": "الْقَرِيب", "meaning": "قريب من عباده يسمع دعاءهم", "dhikr": "يا قريب اسمع دعائي"},
+    {"name": "الْمُجِيب", "meaning": "يجيب دعاء من دعاه", "dhikr": "يا مجيب أجب دعائي"},
+    {"name": "الْوَاسِع", "meaning": "واسع الرحمة والعلم والقدرة", "dhikr": "يا واسع وسّع علينا رزقك"},
+    {"name": "الصَّبُور", "meaning": "لا يعجل بالعقوبة لمن عصاه", "dhikr": "يا صبور اجعلني من الصابرين"},
+    {"name": "التَّوَّاب", "meaning": "يقبل توبة عباده ويرجع إليهم برحمته", "dhikr": "يا تواب تب علينا"},
+    {"name": "الْكَرِيم", "meaning": "كثير الخير والعطاء", "dhikr": "يا كريم أكرمني بطاعتك"},
+    {"name": "الْعَظِيم", "meaning": "ذو العظمة الكاملة", "dhikr": "يا عظيم عظّم قدرك في قلبي"},
+]
+
+# ==================== من هو؟ (تخمين الصحابي) ====================
+SAHABA_QUIZ = [
+    {"name": "أبو بكر الصديق", "hints": ["أول الخلفاء الراشدين", "رفيق النبي ﷺ في الهجرة إلى المدينة", "لقّبه النبي ﷺ بالصديق"], "fact": "قال النبي ﷺ: لو كنت متخذاً خليلاً لاتخذت أبا بكر خليلاً"},
+    {"name": "عمر بن الخطاب", "hints": ["لقبه الفاروق", "ثاني الخلفاء الراشدين", "في عهده فُتحت القدس"], "fact": "قال النبي ﷺ: لو كان بعدي نبي لكان عمر"},
+    {"name": "عثمان بن عفان", "hints": ["لُقّب بذي النورين", "ثالث الخلفاء الراشدين", "جمع القرآن في مصحف واحد"], "fact": "قال النبي ﷺ: ما ضرّ عثمان ما عمل بعد اليوم"},
+    {"name": "علي بن أبي طالب", "hints": ["ابن عم النبي ﷺ", "رابع الخلفاء الراشدين", "أول من أسلم من الصبيان"], "fact": "قال النبي ﷺ: أنت مني وأنا منك"},
+    {"name": "أبو هريرة", "hints": ["أكثر الصحابة رواية للحديث", "أسلم عام خيبر", "كان يُلازم النبي ﷺ دائماً"], "fact": "روى أكثر من 5000 حديث عن النبي ﷺ"},
+    {"name": "بلال بن رباح", "hints": ["أول مؤذن في الإسلام", "كان عبداً فأعتقه أبو بكر", "صبر على العذاب وهو يقول أحد أحد"], "fact": "قال النبي ﷺ: سمعت خشخشة نعليك في الجنة يا بلال"},
+    {"name": "خالد بن الوليد", "hints": ["لُقّب بسيف الله المسلول", "لم يُهزم في معركة قط", "أسلم قبل فتح مكة"], "fact": "قال النبي ﷺ: نعم عبدالله وأخو العشيرة وسيف من سيوف الله"},
+    {"name": "عائشة بنت أبي بكر", "hints": ["أم المؤمنين", "ابنة أبي بكر الصديق", "رُوي عنها أكثر من 2000 حديث"], "fact": "قال النبي ﷺ: فضل عائشة على النساء كفضل الثريد على سائر الطعام"},
+    {"name": "سلمان الفارسي", "hints": ["أصله من فارس", "صاحب فكرة حفر الخندق", "قال عنه النبي ﷺ: سلمان منا آل البيت"], "fact": "رحل من فارس بحثاً عن الدين الحق حتى أسلم على يد النبي ﷺ"},
+    {"name": "معاذ بن جبل", "hints": ["أعلم الصحابة بالحلال والحرام", "بعثه النبي ﷺ إلى اليمن", "توفي في طاعون عمواس"], "fact": "قال النبي ﷺ: أعلم أمتي بالحلال والحرام معاذ بن جبل"},
+    {"name": "خديجة بنت خويلد", "hints": ["أول زوجات النبي ﷺ", "أول من آمن بالنبي ﷺ", "دعمت الدعوة بمالها"], "fact": "قال النبي ﷺ: آمنت بي إذ كفر بي الناس وصدّقتني إذ كذّبني الناس"},
+    {"name": "عبدالله بن مسعود", "hints": ["أول من جهر بتلاوة القرآن في مكة", "كان يشبه النبي ﷺ في هديه", "من أعلم الصحابة بالقرآن"], "fact": "قال النبي ﷺ: من أحب أن يقرأ القرآن غضاً فليقرأه على قراءة ابن أم عبد"},
+]
+
+# ==================== الأسئلة الدينية اليومية ====================
+DAILY_QUESTIONS = [
+    {"q": "كم عدد أركان الإسلام؟", "options": ["3", "4", "5", "6"], "answer": "5", "explain": "شهادة أن لا إله إلا الله، الصلاة، الزكاة، الصوم، الحج"},
+    {"q": "ما هي أطول سورة في القرآن؟", "options": ["آل عمران", "النساء", "البقرة", "المائدة"], "answer": "البقرة", "explain": "سورة البقرة هي أطول سور القرآن بـ 286 آية"},
+    {"q": "في أي شهر نزل القرآن الكريم؟", "options": ["رجب", "شعبان", "رمضان", "محرم"], "answer": "رمضان", "explain": "قال تعالى: شهر رمضان الذي أنزل فيه القرآن"},
+    {"q": "ما هو اسم والد النبي إبراهيم عليه السلام في القرآن؟", "options": ["آزر", "نوح", "يعقوب", "إسحاق"], "answer": "آزر", "explain": "قال تعالى: وإذ قال إبراهيم لأبيه آزر"},
+    {"q": "كم سنة دعا نوح عليه السلام قومه؟", "options": ["500", "750", "950", "1000"], "answer": "950", "explain": "قال تعالى: فلبث فيهم ألف سنة إلا خمسين عاماً"},
+    {"q": "ما هو أفضل الصيام بعد رمضان؟", "options": ["الاثنين والخميس", "ستة من شوال", "صيام المحرم", "عاشوراء"], "answer": "صيام المحرم", "explain": "قال النبي ﷺ: أفضل الصيام بعد رمضان شهر الله المحرم"},
+    {"q": "كم مرة تُكرر الفاتحة في الصلوات الخمس؟", "options": ["13", "15", "17", "19"], "answer": "17", "explain": "17 ركعة في اليوم × مرة في كل ركعة = 17 مرة"},
+    {"q": "ما هي نسبة زكاة المال؟", "options": ["2%", "2.5%", "5%", "10%"], "answer": "2.5%", "explain": "زكاة المال ربع العشر أي 2.5% بعد بلوغ النصاب وحولان الحول"},
+    {"q": "ما هو أكثر اسم نبي تكرر في القرآن؟", "options": ["محمد", "إبراهيم", "موسى", "عيسى"], "answer": "موسى", "explain": "ذُكر اسم موسى عليه السلام 136 مرة في القرآن الكريم"},
+    {"q": "كم عدد الأنبياء المذكورين بالاسم في القرآن؟", "options": ["20", "25", "30", "35"], "answer": "25", "explain": "ذُكر 25 نبياً بالاسم في القرآن الكريم"},
+    {"q": "ما هي الصلاة التي تفضل صلاة الفذ بـ 27 درجة؟", "options": ["صلاة الفجر", "صلاة الجمعة", "صلاة الجماعة", "صلاة الوتر"], "answer": "صلاة الجماعة", "explain": "قال النبي ﷺ: صلاة الجماعة تفضل صلاة الفذ بسبع وعشرين درجة"},
+    {"q": "ما هو أول واجب على المكلف؟", "options": ["الصلاة", "معرفة الله", "الصيام", "الزكاة"], "answer": "معرفة الله", "explain": "أول واجب على المكلف معرفة الله بالتوحيد والإيمان به"},
+    {"q": "كم عدد أركان الإيمان؟", "options": ["4", "5", "6", "7"], "answer": "6", "explain": "الإيمان بالله وملائكته وكتبه ورسله واليوم الآخر والقدر خيره وشره"},
+    {"q": "ما هو الركن الثاني من أركان الإسلام؟", "options": ["الزكاة", "الصيام", "الصلاة", "الحج"], "answer": "الصلاة", "explain": "الصلاة عماد الدين وهي الركن الثاني من أركان الإسلام"},
+    {"q": "في أي سنة من الهجرة فُرض الصيام؟", "options": ["السنة الأولى", "السنة الثانية", "السنة الثالثة", "السنة الرابعة"], "answer": "السنة الثانية", "explain": "فُرض صيام رمضان في السنة الثانية من الهجرة النبوية"},
+]
+
+# ==================== تحدي الأسبوع الجماعي ====================
+WEEKLY_CHALLENGES = [
+    {"q": "من هو أول من أذّن في الإسلام؟", "answer": "بلال", "hint": "صحابي من الحبشة"},
+    {"q": "في أي غزوة حُفر الخندق؟", "answer": "الأحزاب", "hint": "تُعرف أيضاً بغزوة الأحزاب"},
+    {"q": "ما هو اسم ناقة النبي ﷺ؟", "answer": "القصواء", "hint": "اسمها يبدأ بحرف القاف"},
+    {"q": "كم سنة استغرقت غزوات النبي ﷺ؟", "answer": "10", "hint": "من بعد الهجرة حتى الوفاة"},
+    {"q": "ما هي أول آية نزلت من القرآن؟", "answer": "اقرأ", "hint": "أول كلمة في سورة العلق"},
 ]
 
 async def send_daily_challenge(context):
@@ -1337,18 +1525,17 @@ def main_kb(is_admin=False, daily=True, adhkar=False, tier=0):
     sub_adhkar = "🕌 الأذكار"
     keys = [
         [KeyboardButton("🔍 تحقق من حديث"), KeyboardButton("اقترح لي حديثا📜")],
-        [KeyboardButton(sub_adhkar), KeyboardButton("ℹ️ عن البوت")],
-        [KeyboardButton("⚠️ إبلاغ عن خطأ"), KeyboardButton("💰 دعم البوت")],
+        [KeyboardButton("✨ اسم الله اليوم"), KeyboardButton("❓ سؤال اليوم")],
+        [KeyboardButton("🏆 تحدي الأسبوع"), KeyboardButton("💰 دعم البوت")],
+        [KeyboardButton("⚠️ إبلاغ عن خطأ"), KeyboardButton("ℹ️ عن البوت")],
     ]
-    # الجميع: تحدي مع صديق
-    keys.insert(2, [KeyboardButton("⚔️ تحدي مع صديق")])
     # Tier 1+: بحث بالموضوع + تاريخ بحثي
     if tier >= 1:
-        keys[2] = [KeyboardButton("🔎 بحث بالموضوع"), KeyboardButton("⚔️ تحدي مع صديق"), KeyboardButton("📋 تاريخ بحثي")]
+        keys.insert(2, [KeyboardButton("🔎 بحث بالموضوع"), KeyboardButton("📋 تاريخ بحثي")])
     # Tier 2+: أضف المفضلة + حديث على قدك
     if tier >= 2:
-        keys[2] = [KeyboardButton("🔎 بحث بالموضوع"), KeyboardButton("💾 مفضلتي"), KeyboardButton("📋 تاريخ بحثي")]
-        keys.insert(3, [KeyboardButton("📖 حديث على قدك"), KeyboardButton("⚔️ تحدي مع صديق")])
+        keys.insert(2, [KeyboardButton("🔎 بحث بالموضوع"), KeyboardButton("💾 مفضلتي"), KeyboardButton("📋 تاريخ بحثي")])
+        keys.insert(3, [KeyboardButton("📖 حديث على قدك")])
     if is_admin:
         keys.append([KeyboardButton("⚙️ لوحة التحكم")])
     return ReplyKeyboardMarkup(keys, resize_keyboard=True)
@@ -1496,10 +1683,10 @@ def admin_main_keyboard():
         [KeyboardButton("🏆 أنشط المستخدمين"), KeyboardButton("🆕 مستخدمون جدد")],
         [KeyboardButton("🔍 بحث مستخدم"), KeyboardButton("🌟 قائمة الداعمين")],
         [KeyboardButton("🎁 منح مستوى"), KeyboardButton("💰 استرداد نجوم")],
-        [KeyboardButton("🗑️ حذف مستخدم"), KeyboardButton("✉️ رسالة خاصة")],
-        [KeyboardButton("📢 إشعار لمستوى"), KeyboardButton("📢 إشعار متقدم")],
-        [KeyboardButton("⚠️ سجل الأخطاء"), KeyboardButton("🗑️ مسح سجل الأخطاء")],
-        [KeyboardButton("🔙 رجوع")],
+        [KeyboardButton("📋 سجل الفواتير"), KeyboardButton("🗑️ حذف مستخدم")],
+        [KeyboardButton("✉️ رسالة خاصة"), KeyboardButton("📢 إشعار لمستوى")],
+        [KeyboardButton("📢 إشعار متقدم"), KeyboardButton("⚠️ سجل الأخطاء")],
+        [KeyboardButton("🗑️ مسح سجل الأخطاء"), KeyboardButton("🔙 رجوع")],
     ]
     return ReplyKeyboardMarkup(keys, resize_keyboard=True)
 
@@ -1809,7 +1996,110 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ النسخة: v3.1 - 2026-03-10")
+    await update.message.reply_text("✅ النسخة: v3.2 - 2026-03-10")
+
+async def cmd_asma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أسماء الله الحسنى - اسم اليوم"""
+    user = update.effective_user
+    asma = get_asma_of_day(user.id)
+    msg = (
+        "✨ اسم الله اليوم\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"🌟 {asma['name']}\n\n"
+        f"📖 المعنى: {asma['meaning']}\n\n"
+        f"🤲 الدعاء: {asma['dhikr']}\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🤖 {BOT_NAME} | {BOT_USERNAME}"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✨ اسم آخر", callback_data="asma_next"),
+        InlineKeyboardButton("📋 كل الأسماء", callback_data="asma_list"),
+    ]])
+    await update.message.reply_text(msg, reply_markup=kb)
+
+async def cmd_sahaba(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحدي من هو؟"""
+    user = update.effective_user
+    sahabi = get_sahaba_of_day()
+    context.user_data["sahaba_answer"] = sahabi["name"]
+    context.user_data["sahaba_fact"] = sahabi["fact"]
+    context.user_data["sahaba_hints"] = sahabi["hints"]
+    context.user_data["sahaba_hint_idx"] = 0
+    context.user_data["in_sahaba_quiz"] = True
+    hint = sahabi["hints"][0]
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💡 تلميح إضافي", callback_data="sahaba_hint"),
+        InlineKeyboardButton("🏳️ أظهر الجواب", callback_data="sahaba_reveal"),
+    ]])
+    await update.message.reply_text(
+        "🎯 من هو هذا الصحابي؟\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"📌 التلميح: {hint}\n\n"
+        "أرسل اسمه الآن 👇",
+        reply_markup=kb
+    )
+
+async def cmd_daily_question(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """السؤال الديني اليومي"""
+    user = update.effective_user
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    # تحقق إذا أجاب اليوم
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT correct FROM daily_question WHERE user_id=? AND date=?", (user.id, today))
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        result = "✅ أجبت صح" if row[0] else "❌ أجبت خطأ"
+        await update.message.reply_text(f"📝 أجبت على سؤال اليوم مسبقاً! {result}\nتعال غداً لسؤال جديد 🌙")
+        return
+    q = get_question_of_day()
+    context.user_data["daily_q"] = q
+    context.user_data["daily_q_date"] = today
+    opts = q["options"]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton(opts[0], callback_data=f"dq_{opts[0]}"),
+         InlineKeyboardButton(opts[1], callback_data=f"dq_{opts[1]}")],
+        [InlineKeyboardButton(opts[2], callback_data=f"dq_{opts[2]}"),
+         InlineKeyboardButton(opts[3], callback_data=f"dq_{opts[3]}")],
+    ])
+    await update.message.reply_text(
+        "❓ سؤال ديني اليوم\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"📌 {q['q']}\n\n"
+        "اختر الإجابة الصحيحة 👇",
+        reply_markup=kb
+    )
+
+async def cmd_weekly_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحدي الأسبوع الجماعي"""
+    user = update.effective_user
+    ch = get_weekly_challenge()
+    week = ch["week"]
+    if has_answered_weekly(user.id, week):
+        scores = get_weekly_scores(week)
+        msg = "🏆 تحدي الأسبوع\n━━━━━━━━━━━━━━━\n\nأجبت مسبقاً! 🎉\n\n📊 نتائج هذا الأسبوع:\n"
+        correct_count = sum(1 for s in scores if s[2] == 1)
+        msg += f"✅ أجاب صح: {correct_count} مستخدم\n"
+        msg += f"👥 إجمالي المشاركين: {len(scores)}\n"
+        await update.message.reply_text(msg)
+        return
+    context.user_data["in_weekly_challenge"] = True
+    context.user_data["weekly_answer"] = ch["answer"]
+    context.user_data["weekly_week"] = week
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("💡 تلميح", callback_data="weekly_hint"),
+    ]])
+    await update.message.reply_text(
+        "🏆 تحدي الأسبوع الجماعي\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"❓ {ch['question']}\n\n"
+        "أرسل إجابتك الآن 👇",
+        reply_markup=kb
+    )
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ النسخة: v3.2 - 2026-03-10")
 
 async def testchallenge_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
@@ -1935,6 +2225,33 @@ async def handle_admin_actions(update: Update, context: ContextTypes.DEFAULT_TYP
             u = f"@{uname}" if uname else "بدون يوزر"
             msg += f"• {name or 'مجهول'} ({u}) — {joined[:10]}\n"
         await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    elif text == "📋 سجل الفواتير":
+        conn = sqlite3.connect("bot.db")
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT d.user_id, u.full_name, u.username, d.amount, d.charge_id, d.date
+            FROM donations d
+            LEFT JOIN users u ON d.user_id = u.user_id
+            ORDER BY d.date DESC LIMIT 10
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            await update.message.reply_text("📋 لا توجد فواتير بعد.")
+            return
+        msg = "📋 *آخر 10 فواتير:*\n\n"
+        buttons = []
+        for i, (uid, name, uname, amount, charge_id, date) in enumerate(rows, 1):
+            u = f"@{uname}" if uname else str(uid)
+            line = f"{i}. {name or 'مجهول'} ({u})\n   ⭐ {amount} | 🗓 {date[:10]}\n   🔑 `{charge_id}`\n\n"
+            msg += line
+            buttons.append([InlineKeyboardButton(
+                f"↩️ استرداد {amount}⭐ — {name or uid}",
+                callback_data=f"refund_{uid}_{charge_id}"
+            )])
+        await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
         return
 
     elif text == "🗑️ حذف مستخدم":
@@ -2224,6 +2541,52 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     register_user(user.id, user.username or "", user.full_name)
 
+    # معالج إجابة من هو؟
+    if context.user_data.get("in_sahaba_quiz") and text:
+        context.user_data.pop("in_sahaba_quiz", None)
+        answer = context.user_data.pop("sahaba_answer", "")
+        fact = context.user_data.pop("sahaba_fact", "")
+        context.user_data.pop("sahaba_hints", None)
+        user_ans = text.strip()
+        correct = answer.split()[0] in user_ans or user_ans in answer
+        if correct:
+            await update.message.reply_text(
+                f"✅ إجابة صحيحة! 🎉\n\n"
+                f"الصحابي: {answer}\n\n"
+                f"💡 {fact}"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ إجابة خاطئة\n\n"
+                f"الجواب الصحيح: {answer}\n\n"
+                f"💡 {fact}"
+            )
+        return
+
+    # معالج إجابة تحدي الأسبوع
+    if context.user_data.get("in_weekly_challenge") and text:
+        context.user_data.pop("in_weekly_challenge", None)
+        correct_answer = context.user_data.pop("weekly_answer", "")
+        week = context.user_data.pop("weekly_week", "")
+        user_ans = text.strip()
+        correct = correct_answer.lower() in user_ans.lower() or user_ans.lower() in correct_answer.lower()
+        save_weekly_answer(user.id, week, user_ans, correct)
+        scores = get_weekly_scores(week)
+        correct_count = sum(1 for s in scores if s[2] == 1)
+        if correct:
+            await update.message.reply_text(
+                f"✅ إجابة صحيحة! 🎉\n\n"
+                f"الجواب: {correct_answer}\n\n"
+                f"📊 {correct_count} مستخدم أجاب صح من {len(scores)} مشارك"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ إجابة خاطئة\n\n"
+                f"الجواب الصحيح: {correct_answer}\n\n"
+                f"📊 {correct_count} مستخدم أجاب صح من {len(scores)} مشارك"
+            )
+        return
+
     # معالج إجابة التحدي
     if context.user_data.get("in_challenge") and text:
         context.user_data.pop("in_challenge", None)
@@ -2386,6 +2749,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اختر نوع الأذكار 👇", reply_markup=kb)
         return
 
+    if text == "✨ اسم الله اليوم":
+        await cmd_asma(update, context)
+        return
+
+    if text == "🎯 من هو؟":
+        await cmd_sahaba(update, context)
+        return
+
+    if text == "❓ سؤال اليوم":
+        await cmd_daily_question(update, context)
+        return
+
+    if text == "🏆 تحدي الأسبوع":
+        await cmd_weekly_challenge(update, context)
+        return
+
     # أوامر Premium من لوحة المفاتيح
     if text == "💾 مفضلتي":
         await cmd_favorites(update, context)
@@ -2506,6 +2885,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 بحث مستخدم", "🌟 قائمة الداعمين", "🎁 منح مستوى",
         "🗑️ حذف مستخدم", "✉️ رسالة خاصة",
         "📢 إشعار متقدم", "📢 إشعار لمستوى",
+        "📋 سجل الفواتير",
         "📝 نص", "🖼️ صورة", "🎤 صوت", "🎥 فيديو", "📁 ملف",
         "⚠️ سجل الأخطاء", "🗑️ مسح سجل الأخطاء",
         "💰 استرداد نجوم", "❌ إلغاء الإشعار",
@@ -2942,6 +3322,98 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("broadcast_content_text", None)
         await q.message.edit_text("✏️ أرسل النص الجديد للإشعار:", reply_markup=None)
 
+    elif q.data == "asma_next":
+        await q.answer()
+        # اسم عشوائي مختلف
+        import random as _r2
+        asma = _r2.choice(ASMA_ALLAH)
+        msg = (
+            "✨ اسم الله\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            f"🌟 {asma['name']}\n\n"
+            f"📖 المعنى: {asma['meaning']}\n\n"
+            f"🤲 الدعاء: {asma['dhikr']}\n\n"
+            "━━━━━━━━━━━━━━━"
+        )
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✨ اسم آخر", callback_data="asma_next"),
+        ]])
+        try:
+            await q.message.edit_text(msg, reply_markup=kb)
+        except:
+            await q.message.reply_text(msg, reply_markup=kb)
+
+    elif q.data == "asma_list":
+        await q.answer()
+        msg = "📋 أسماء الله الحسنى\n━━━━━━━━━━━━━━━\n\n"
+        for i, a in enumerate(ASMA_ALLAH, 1):
+            msg += f"{i}. {a['name']}\n"
+        await q.message.reply_text(msg)
+
+    elif q.data == "sahaba_hint":
+        await q.answer()
+        hints = context.user_data.get("sahaba_hints", [])
+        idx = context.user_data.get("sahaba_hint_idx", 0) + 1
+        if idx >= len(hints):
+            await q.answer("لا يوجد تلميحات إضافية", show_alert=True)
+            return
+        context.user_data["sahaba_hint_idx"] = idx
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("💡 تلميح إضافي", callback_data="sahaba_hint"),
+            InlineKeyboardButton("🏳️ أظهر الجواب", callback_data="sahaba_reveal"),
+        ]])
+        try:
+            await q.message.edit_text(
+                f"🎯 من هو هذا الصحابي؟\n━━━━━━━━━━━━━━━\n\n"
+                + "\n".join(f"📌 {h}" for h in hints[:idx+1])
+                + "\n\nأرسل اسمه الآن 👇",
+                reply_markup=kb
+            )
+        except:
+            pass
+
+    elif q.data == "sahaba_reveal":
+        await q.answer()
+        answer = context.user_data.get("sahaba_answer", "")
+        fact = context.user_data.get("sahaba_fact", "")
+        context.user_data.pop("in_sahaba_quiz", None)
+        await q.message.edit_text(
+            f"🎯 الجواب: {answer}\n\n"
+            f"💡 {fact}"
+        )
+
+    elif q.data.startswith("dq_"):
+        chosen = q.data[3:]
+        q_data = context.user_data.get("daily_q")
+        date = context.user_data.get("daily_q_date", "")
+        if not q_data:
+            await q.answer("انتهت الجلسة", show_alert=True)
+            return
+        correct = chosen == q_data["answer"]
+        # حفظ الإجابة
+        conn = sqlite3.connect("bot.db")
+        conn.execute("INSERT OR IGNORE INTO daily_question (user_id, date, q_index, answered, correct) VALUES (?,?,?,1,?)",
+                     (user.id, date, 0, 1 if correct else 0))
+        conn.commit()
+        conn.close()
+        context.user_data.pop("daily_q", None)
+        if correct:
+            await q.message.edit_text(
+                f"✅ إجابة صحيحة! 🎉\n\n"
+                f"📖 {q_data['explain']}"
+            )
+        else:
+            await q.message.edit_text(
+                f"❌ إجابة خاطئة\n\n"
+                f"الجواب الصحيح: {q_data['answer']}\n\n"
+                f"📖 {q_data['explain']}"
+            )
+
+    elif q.data == "weekly_hint":
+        await q.answer()
+        ch = get_weekly_challenge()
+        await q.answer(f"💡 تلميح: {ch['hint']}", show_alert=True)
+
     elif q.data == "cancel_broadcast_cb":
         await q.answer("تم الإلغاء")
         context.user_data.pop("pending_broadcast", None)
@@ -3143,6 +3615,26 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"spell callback: {e}")
             await wait2.edit_text("⚠️ خطأ في البحث، حاول لاحقاً.")
 
+    elif q.data.startswith("refund_") and user.id in ADMIN_IDS:
+        await q.answer()
+        parts = q.data.split("_", 2)
+        if len(parts) == 3:
+            target_uid = int(parts[1])
+            charge_id = parts[2]
+            try:
+                await context.bot.refund_star_payment(
+                    user_id=target_uid,
+                    telegram_payment_charge_id=charge_id
+                )
+                # احذف من donations
+                conn = sqlite3.connect("bot.db")
+                conn.execute("DELETE FROM donations WHERE user_id=? AND charge_id=?", (target_uid, charge_id))
+                conn.commit()
+                conn.close()
+                await q.message.reply_text(f"✅ تم استرداد النجوم للمستخدم {target_uid}")
+            except Exception as e:
+                await q.message.reply_text(f"❌ فشل الاسترداد: {e}")
+
     elif q.data == "confirm_report":
         await q.answer()
         report_text = context.user_data.pop("pending_report_text", "")
@@ -3287,13 +3779,26 @@ def run_web_server():
     server = HTTPServer(("0.0.0.0", 8080), Handler)
     server.serve_forever()
 
+def self_ping():
+    """يقرع البوت نفسه كل 4 دقائق لمنع النوم"""
+    import urllib.request as _req
+    import time as _time
+    _time.sleep(30)  # انتظر يشتغل البوت أولاً
+    while True:
+        try:
+            _req.urlopen("http://localhost:8080", timeout=5)
+        except:
+            pass
+        _time.sleep(240)  # كل 4 دقائق
+
 def main():
     logger.info("🚀 بدء تشغيل بوت راوِي...")
     init_db()
     # شغّل web server في thread منفصل عشان Replit ما ينام
     from threading import Thread
     Thread(target=run_web_server, daemon=True).start()
-    logger.info("🌐 Web server شغّال على port 8080")
+    Thread(target=self_ping, daemon=True).start()
+    logger.info("🌐 Web server شغّال على port 8080 + self-ping كل 4 دقائق")
     app = Application.builder().token(BOT_TOKEN).build()
 
     # جدولة الإشعارات اليومية
@@ -3312,6 +3817,10 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("testchallenge", testchallenge_command))
+    app.add_handler(CommandHandler("asma", cmd_asma))
+    app.add_handler(CommandHandler("sahaba", cmd_sahaba))
+    app.add_handler(CommandHandler("question", cmd_daily_question))
+    app.add_handler(CommandHandler("weekly", cmd_weekly_challenge))
     app.add_handler(CommandHandler("random", random_hadith))
     app.add_handler(CommandHandler("donate", donate_command))
     app.add_handler(CommandHandler("balance", cmd_balance))
