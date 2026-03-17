@@ -1,0 +1,6263 @@
+import os
+import asyncio
+import logging
+import sqlite3
+import re
+import random
+import urllib.parse
+import json
+import aiohttp
+import traceback
+import random as _random
+import uuid as _uuid
+from datetime import datetime, date, timedelta, time
+from collections import Counter
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, InlineQueryHandler, filters, ContextTypes
+from telegram import InlineQueryResultArticle, InputTextMessageContent
+
+# ==================== إعدادات البوت ====================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+if not BOT_TOKEN:
+    logger.error("❌ BOT_TOKEN غير موجود.")
+    exit(1)
+
+admin_ids_str = os.environ.get("ADMIN_IDS", "")
+ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
+
+BOT_NAME = "راوِي"
+BOT_USERNAME = "@G4bGN_bot"
+
+# ==================== أزرار ملونة — Bot API 9.4 ====================
+def colored_btn(text: str, callback_data: str = None, url: str = None,
+                switch_inline_query: str = None, style: str = None) -> InlineKeyboardButton:
+    """
+    إنشاء زر ملون باستخدام Bot API 9.4
+    style: 'primary' (أزرق) | 'success' (أخضر) | 'danger' (أحمر)
+    """
+    kwargs = {}
+    if callback_data is not None:
+        kwargs["callback_data"] = callback_data
+    if url is not None:
+        kwargs["url"] = url
+    if switch_inline_query is not None:
+        kwargs["switch_inline_query"] = switch_inline_query
+    api_kw = {}
+    if style:
+        api_kw["style"] = style
+    return InlineKeyboardButton(
+        text=text,
+        api_kwargs=api_kw if api_kw else None,
+        **kwargs
+    )
+
+
+
+# توقيت الأردن UTC+3
+import datetime as _dt
+AMMAN_TZ = _dt.timezone(_dt.timedelta(hours=3))
+
+# ===== Cache للبحث - 5 دقائق =====
+import time as _time
+_search_cache = {}
+CACHE_TTL = 1800  # 30 دقيقة
+
+# ===== Rate Limiting =====
+_rate_limit = {}   # {user_id: [timestamps]}
+RATE_MAX = 5       # أقصى عدد طلبات
+RATE_WINDOW = 10   # في ثواني
+
+def is_rate_limited(user_id: int) -> bool:
+    now = _time.time()
+    timestamps = _rate_limit.get(user_id, [])
+    timestamps = [t for t in timestamps if now - t < RATE_WINDOW]
+    _rate_limit[user_id] = timestamps
+    if len(timestamps) >= RATE_MAX:
+        return True
+    timestamps.append(now)
+    _rate_limit[user_id] = timestamps
+    return False
+
+def cache_get(query: str):
+    key = query.strip().lower()
+    if key in _search_cache:
+        results, ts = _search_cache[key]
+        if _time.time() - ts < CACHE_TTL:
+            return results
+        del _search_cache[key]
+    return None
+
+def cache_set(query: str, results: list):
+    key = query.strip().lower()
+    _search_cache[key] = (results, _time.time())
+    # أزل القديم لو تجاوز 200 مدخلة
+    if len(_search_cache) > 200:
+        oldest = min(_search_cache, key=lambda k: _search_cache[k][1])
+        del _search_cache[oldest]
+
+# الكتب الستة - تُعرَّف هنا عشان تكون متاحة لكل الدوال
+KUTUB_SITTA_FULL = [
+    "صحيح البخاري", "صحيح مسلم",
+    "سنن أبي داود", "سنن الترمذي",
+    "سنن النسائي", "سنن ابن ماجه",
+]
+
+
+
+# ==================== قاعدة البيانات ====================
+def init_db():
+    conn = sqlite3.connect("bot.db")
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        username TEXT,
+        full_name TEXT,
+        searches INTEGER DEFAULT 0,
+        joined_at TEXT DEFAULT (datetime('now')),
+        daily_hadith INTEGER DEFAULT 1,
+        adhkar_sub INTEGER DEFAULT 0
+    )""")
+    # جدول المفضلة
+    conn.execute("""CREATE TABLE IF NOT EXISTS favorites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        hadith_text TEXT,
+        rawi TEXT,
+        source TEXT,
+        grade TEXT,
+        note TEXT DEFAULT '',
+        saved_at TEXT DEFAULT (datetime('now')),
+        UNIQUE(user_id, hadith_text)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS share_counts (
+        hadith_text TEXT PRIMARY KEY,
+        count INTEGER DEFAULT 0
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS bot_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS user_sessions (
+        user_id INTEGER PRIMARY KEY,
+        results_json TEXT,
+        page INTEGER DEFAULT 0,
+        grade_filter TEXT DEFAULT 'all',
+        search_id TEXT,
+        updated_at TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS quiz_sessions (
+        user_id INTEGER PRIMARY KEY,
+        questions_json TEXT,
+        quiz_index INTEGER DEFAULT 0,
+        quiz_score INTEGER DEFAULT 0,
+        quiz_date TEXT
+    )""")
+    try:
+        conn.execute("ALTER TABLE favorites ADD COLUMN note TEXT DEFAULT ''")
+    except:
+        pass
+    # جدول Premium
+    conn.commit()
+    # أضف الأعمدة الجديدة إذا كانت قاعدة البيانات قديمة
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN daily_hadith INTEGER DEFAULT 1")
+    except:
+        pass
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN adhkar_sub INTEGER DEFAULT 0")
+    except:
+        pass
+    conn.execute("""CREATE TABLE IF NOT EXISTS searches (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        query TEXT,
+        date TEXT DEFAULT (datetime('now'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS search_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        query TEXT,
+        results_count INTEGER DEFAULT 0,
+        date TEXT DEFAULT (datetime('now'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS ahadith (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        text TEXT UNIQUE,
+        rawi TEXT,
+        source TEXT,
+        grade TEXT
+    )""")
+
+    conn.execute("""CREATE TABLE IF NOT EXISTS error_logs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp TEXT DEFAULT (datetime('now')),
+        error_type TEXT,
+        error_message TEXT,
+        user_id INTEGER,
+        traceback TEXT
+    )""")
+
+    # جدول لتسجيل التبرعات مع إضافة charge_id
+    conn.execute("""CREATE TABLE IF NOT EXISTS donations (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        amount INTEGER,
+        currency TEXT,
+        charge_id TEXT,
+        date TEXT DEFAULT (datetime('now'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS streaks (
+        user_id INTEGER PRIMARY KEY,
+        streak INTEGER DEFAULT 0,
+        max_streak INTEGER DEFAULT 0,
+        last_date TEXT DEFAULT ''
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS daily_challenge (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT UNIQUE,
+        hadith_text TEXT,
+        answer TEXT,
+        full_text TEXT
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS challenge_answers (
+        user_id INTEGER,
+        date TEXT,
+        correct INTEGER DEFAULT 0,
+        answered_at TEXT DEFAULT (datetime('now')),
+        PRIMARY KEY (user_id, date)
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS friend_challenges (
+        challenge_id TEXT PRIMARY KEY,
+        creator_id INTEGER,
+        creator_name TEXT,
+        opponent_id INTEGER,
+        opponent_name TEXT,
+        questions_json TEXT,
+        creator_score INTEGER DEFAULT -1,
+        opponent_score INTEGER DEFAULT -1,
+        created_at TEXT,
+        status TEXT DEFAULT 'waiting'
+    )""")
+    conn.commit()
+    conn.close()
+    logger.info("✅ تم إنشاء قاعدة البيانات.")
+    # جداول ختمة
+    with sqlite3.connect("bot.db") as _c:
+        _c.execute("""CREATE TABLE IF NOT EXISTS qa_usage (
+            user_id INTEGER,
+            date TEXT,
+            count INTEGER DEFAULT 0,
+            extra_questions INTEGER DEFAULT 0,
+            PRIMARY KEY (user_id, date)
+        )""")
+        _c.execute("""CREATE TABLE IF NOT EXISTS khatma (
+            user_id INTEGER PRIMARY KEY,
+            current_page INTEGER DEFAULT 0,
+            target_days INTEGER DEFAULT 30,
+            start_date TEXT,
+            last_read TEXT
+        )""")
+        _c.execute("""CREATE TABLE IF NOT EXISTS tasbih_log (
+            user_id INTEGER,
+            dhikr TEXT,
+            count INTEGER,
+            date TEXT,
+            PRIMARY KEY (user_id, date, dhikr)
+        )""")
+
+def log_donation(user_id, amount, charge_id):
+    """تسجيل تبرع في قاعدة البيانات مع معرف المعاملة"""
+    try:
+        conn = sqlite3.connect("bot.db")
+        cur = conn.cursor()
+        cur.execute("INSERT INTO donations (user_id, amount, currency, charge_id) VALUES (?,?,?,?)",
+                    (user_id, amount, "XTR", charge_id))
+        conn.commit()
+        conn.close()
+        logger.info(f"💰 تبرع جديد: المستخدم {user_id} بمبلغ {amount} نجمة، charge_id: {charge_id}")
+        return True
+    except Exception as e:
+        logger.error(f"خطأ في تسجيل التبرع: {e}")
+        return False
+
+def get_donation(user_id, charge_id):
+    """البحث عن تبرع معين"""
+    try:
+        conn = sqlite3.connect("bot.db")
+        cur = conn.cursor()
+        cur.execute("SELECT amount FROM donations WHERE user_id=? AND charge_id=?", (user_id, charge_id))
+        row = cur.fetchone()
+        conn.close()
+        return row
+    except Exception as e:
+        logger.error(f"خطأ في البحث عن التبرع: {e}")
+        return None
+
+def log_error(error_type, error_message, user_id=None, tb=None):
+    try:
+        conn = sqlite3.connect("bot.db")
+        cur = conn.cursor()
+        cur.execute("INSERT INTO error_logs (error_type, error_message, user_id, traceback) VALUES (?,?,?,?)",
+                    (error_type, error_message[:500], user_id, tb[:1000] if tb else None))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"فشل تسجيل الخطأ: {e}")
+
+def register_user(user_id, username, full_name):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if not cur.fetchone():
+        cur.execute("INSERT INTO users (user_id, username, full_name) VALUES (?,?,?)",
+                    (user_id, username, full_name))
+        conn.commit()
+        conn.close()
+        return True
+    else:
+        cur.execute("UPDATE users SET username=? WHERE user_id=?", (username, user_id))
+        conn.commit()
+        conn.close()
+        return False
+
+def log_search(user_id, query):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET searches = searches + 1 WHERE user_id = ?", (user_id,))
+    cur.execute("INSERT INTO searches (user_id, query) VALUES (?,?)", (user_id, query[:200]))
+    conn.commit()
+    conn.close()
+
+def get_global_stats():
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    searches = cur.execute("SELECT COUNT(*) FROM searches").fetchone()[0]
+    hadiths = cur.execute("SELECT COUNT(*) FROM ahadith").fetchone()[0]
+    recent = cur.execute("SELECT full_name, username, joined_at FROM users ORDER BY joined_at DESC LIMIT 5").fetchall()
+    conn.close()
+    return users, searches, hadiths, recent
+
+
+
+def get_error_logs(limit=10):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT timestamp, error_type, error_message, user_id FROM error_logs ORDER BY timestamp DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def clear_error_logs():
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("DELETE FROM error_logs")
+    conn.commit()
+    conn.close()
+
+def parse_dorar_html(html: str) -> list:
+    """استخراج الأحاديث من HTML الدرر — يرجع الكتب الستة فقط"""
+    import re as _re
+
+    SITTA = [
+        "صحيح البخاري", "صحيح مسلم",
+        "سنن أبي داود", "سنن الترمذي",
+        "سنن النسائي", "سنن ابن ماجه",
+    ]
+
+    def extract_field(chunk, label):
+        """استخراج قيمة حقل معين بشكل مباشر"""
+        m = _re.search(
+            r'<span class="info-subtitle">' + _re.escape(label) + r'[^<]*</span>(.*?)(?=<span class="info-subtitle"|</div>)',
+            chunk, _re.DOTALL
+        )
+        if m:
+            return _re.sub(r'<[^>]+>', '', m.group(1)).strip()
+        return ""
+
+    results = []
+    chunks = _re.split(r'(?=<div class="hadith" )', html)
+    chunks = [c for c in chunks if '<div class="hadith" ' in c]
+
+    for i, chunk in enumerate(chunks[:30]):
+        # نص الحديث - نأخذ كل النص داخل div class="hadith" حتى لو في divs داخلية
+        m = _re.search(r'<div class="hadith" [^>]*>(.*)', chunk, _re.DOTALL)
+        if not m:
+            continue
+        raw_full = m.group(1)
+        # أزل كل الـ HTML tags وخذ النص الكامل قبل div التالية
+        raw_text = _re.sub(r'<[^>]+>', ' ', raw_full)
+        # نظّف الأرقام والمسافات الزائدة
+        raw_text = _re.sub(r'^\s*\d+\s*[-–]\s*', '', raw_text.strip())
+        raw_text = _re.sub(r'\s+', ' ', raw_text)
+        text = raw_text.strip().strip('.').strip()
+        # أزل أي نص بعد خط الراوي (يبدأ عادة بالراوي:)
+        if 'الراوي:' in text:
+            text = text[:text.find('الراوي:')].strip()
+        if not text or len(text) < 10:
+            continue
+
+        # استخراج كل حقل بشكل مباشر حسب التسمية
+        rawi    = extract_field(chunk, "الراوي:")
+        mohdith = extract_field(chunk, "المحدث:")
+        source  = extract_field(chunk, "المصدر:")
+        grade   = extract_field(chunk, "خلاصة حكم المحدث:")
+
+        # فحص في حقل المصدر فقط (الفحص في الـ chunk كاملاً يعطي نتائج غلط)
+        in_sitta = any(k in source for k in SITTA)
+        # لو المصدر فارغ نفحص في منطقة الـ info فقط بدل الـ chunk كله
+        if not in_sitta and not source:
+            info_m = _re.search(r'class="info"[^>]*>(.*?)(?=<div class="hadith"|$)', chunk, _re.DOTALL)
+            if info_m:
+                info_text = info_m.group(1)
+                in_sitta = any(k in info_text for k in SITTA)
+
+        results.append({
+            "id": f"api_{i}",
+            "text": text,
+            "rawi": rawi,
+            "source": source,
+            "grade": grade,
+            "mohdith": mohdith,
+            "hadith_id": str(i),
+            "sharh_id": None,
+            "_in_sitta": in_sitta,
+        })
+
+    # أولوية الترتيب: صحيح مسلم > البخاري > بقية الستة
+    PRIORITY = {
+        "صحيح مسلم": 0,
+        "صحيح البخاري": 1,
+        "سنن أبي داود": 2,
+        "سنن الترمذي": 3,
+        "سنن النسائي": 4,
+        "سنن ابن ماجه": 5,
+    }
+
+    def sort_key(r):
+        src = r.get("source", "")
+        for name, rank in PRIORITY.items():
+            if name in src:
+                return rank
+        return 9
+
+    # فلتر: الكتب الستة فقط
+    sitta = [r for r in results if r["_in_sitta"]]
+    final = sitta if sitta else results  # لو ما في نتائج من الستة خذ كل شي
+
+    final.sort(key=sort_key)
+
+    for r in final:
+        r.pop("_in_sitta", None)
+
+    return final
+
+# ==================== تحسينات البحث ====================
+
+# كلمات تُحذف من الـ query
+SEARCH_STOP_WORDS = [
+    "حديث عن", "حديث", "قال النبي", "قال رسول الله",
+    "قال النبي صلى الله عليه وسلم", "عن النبي", "روى",
+    "ما قاله النبي عن", "ما قال النبي عن",
+]
+
+# قاموس تصحيح إملائي وتوسيع
+SPELL_SUGGESTIONS = {
+    "الوزغ": "الوزغة الفويسق",
+    "وزغ": "الوزغة الفويسق",
+    "الفأر": "الفأرة الفويسقة",
+    "النملة": "النمل",
+    "الغيبه": "الغيبة",
+    "الصبر": "الصبر",
+    "الصله": "صلة الرحم",
+    "الصلة": "صلة الرحم",
+    "الحسد": "الحسد",
+    "التوبه": "التوبة",
+    "الاستغفار": "الاستغفار",
+    "النيه": "النية",
+    "الامانه": "الأمانة",
+    "الكذب": "الكذب",
+    "الصدق": "الصدق",
+    "الصلاه": "الصلاة",
+    "الزكاه": "الزكاة",
+    "الصيام": "الصوم",
+    "الجنه": "الجنة",
+    "النار": "النار",
+    "الاخلاق": "الأخلاق",
+    "القران": "القرآن",
+    "الدعا": "الدعاء",
+    "الذكر": "الذكر",
+}
+
+# أسماء رواة معروفين للبحث المباشر
+KNOWN_RAWIS = [
+    "أبو هريرة", "ابن عمر", "ابن عباس", "عائشة", "أنس بن مالك",
+    "جابر بن عبدالله", "أبو سعيد الخدري", "ابن مسعود", "علي بن أبي طالب",
+    "عمر بن الخطاب", "أبو بكر الصديق", "عثمان بن عفان", "معاذ بن جبل",
+    "أبو موسى الأشعري", "البراء بن عازب", "حذيفة بن اليمان",
+]
+
+def clean_search_query(query: str) -> str:
+    """تنظيف الـ query من الكلمات غير المفيدة"""
+    q = query.strip()
+    for phrase in SEARCH_STOP_WORDS:
+        q = q.replace(phrase, "").strip()
+    # أزل علامات الترقيم من البداية والنهاية
+    q = q.strip(".,،؟!؟")
+    return q.strip() or query.strip()
+
+def get_spell_suggestion(query: str) -> str:
+    """هل في اقتراح إملائي أو توسيع للكلمة؟ يرجع الاقتراح أو فارغ"""
+    q = query.strip()
+    for word, suggestion in SPELL_SUGGESTIONS.items():
+        if word in q and suggestion != q:
+            return suggestion
+    return ""
+
+def is_rawi_search(query: str) -> str:
+    """هل يبحث المستخدم باسم راوٍ؟ يرجع اسم الراوي أو فارغ"""
+    q = query.strip()
+    for rawi in KNOWN_RAWIS:
+        if rawi in q or q in rawi:
+            return rawi
+    return ""
+
+# ترتيب مصادر الحديث حسب الأولوية
+_SOURCE_PRIORITY = {
+    "مسلم": 1,
+    "صحيح مسلم": 1,
+    "البخاري": 2,
+    "صحيح البخاري": 2,
+    "أبو داود": 3,
+    "سنن أبي داود": 3,
+    "الترمذي": 4,
+    "سنن الترمذي": 4,
+    "النسائي": 5,
+    "سنن النسائي": 5,
+    "ابن ماجه": 6,
+    "سنن ابن ماجه": 6,
+}
+
+_KUTUB_SITTA = {"مسلم", "صحيح مسلم", "البخاري", "صحيح البخاري",
+                "أبو داود", "سنن أبي داود", "الترمذي", "سنن الترمذي",
+                "النسائي", "سنن النسائي", "ابن ماجه", "سنن ابن ماجه"}
+
+
+def _source_priority(h: dict) -> int:
+    """أعطِ أولوية للمصدر — كلما قل الرقم كلما كان أولوية أعلى"""
+    src = h.get("source", "") or ""
+    for key, pri in _SOURCE_PRIORITY.items():
+        if key in src:
+            return pri
+    return 99  # مصادر أخرى آخراً
+
+
+def _grade_priority(h: dict) -> int:
+    """صحيح أولاً ثم حسن"""
+    grade = (h.get("grade") or "").strip()
+    if "صحيح" in grade:
+        return 1
+    if "حسن" in grade:
+        return 2
+    return 3
+
+
+def sort_results(results: list) -> list:
+    """رتّب النتائج: مسلم ← البخاري ← الكتب الستة ← غيرها، ثم صحيح ← حسن"""
+    return sorted(results, key=lambda h: (_source_priority(h), _grade_priority(h)))
+
+
+def filter_kutub_sitta(results: list) -> list:
+    """فلتر الكتب الستة فقط"""
+    filtered = [h for h in results if any(k in (h.get("source") or "") for k in _KUTUB_SITTA)]
+    return filtered if filtered else results  # لو ما في نتائج ارجع الكل
+
+
+# ==================== تحدي الصديق ====================
+
+import uuid as _uuid_fc
+import json as _json_fc
+
+def create_friend_challenge(creator_id: int, creator_name: str, questions: list) -> str:
+    """أنشئ تحدياً جديداً وارجع challenge_id"""
+    challenge_id = _uuid_fc.uuid4().hex[:10]
+    with sqlite3.connect("bot.db") as conn:
+        conn.execute(
+            "INSERT INTO friend_challenges (challenge_id, creator_id, creator_name, questions_json, created_at, status) VALUES (?,?,?,?,?,?)",
+            (challenge_id, creator_id, creator_name,
+             _json_fc.dumps(questions, ensure_ascii=False),
+             _dt.datetime.now(AMMAN_TZ).isoformat(), "waiting")
+        )
+    return challenge_id
+
+
+def get_friend_challenge(challenge_id: str) -> dict | None:
+    with sqlite3.connect("bot.db") as conn:
+        row = conn.execute(
+            "SELECT challenge_id, creator_id, creator_name, opponent_id, opponent_name, questions_json, creator_score, opponent_score, status FROM friend_challenges WHERE challenge_id=?",
+            (challenge_id,)
+        ).fetchone()
+    if not row:
+        return None
+    return {
+        "challenge_id": row[0], "creator_id": row[1], "creator_name": row[2],
+        "opponent_id": row[3], "opponent_name": row[4],
+        "questions": _json_fc.loads(row[5]),
+        "creator_score": row[6], "opponent_score": row[7], "status": row[8],
+    }
+
+
+def save_fc_score(challenge_id: str, user_id: int, user_name: str, score: int):
+    """احفظ نتيجة لاعب"""
+    ch = get_friend_challenge(challenge_id)
+    if not ch:
+        return
+    with sqlite3.connect("bot.db") as conn:
+        if ch["creator_id"] == user_id:
+            conn.execute(
+                "UPDATE friend_challenges SET creator_score=?, status=? WHERE challenge_id=?",
+                (score, "in_progress", challenge_id)
+            )
+        else:
+            conn.execute(
+                "UPDATE friend_challenges SET opponent_id=?, opponent_name=?, opponent_score=? WHERE challenge_id=?",
+                (user_id, user_name, score, challenge_id)
+            )
+        ch2 = get_friend_challenge(challenge_id)
+        if ch2 and ch2["creator_score"] >= 0 and ch2["opponent_score"] >= 0:
+            conn.execute(
+                "UPDATE friend_challenges SET status=? WHERE challenge_id=?",
+                ("finished", challenge_id)
+            )
+
+
+def build_fc_result(ch: dict) -> str:
+    """رسالة النتيجة النهائية للتحدي"""
+    total = len(ch["questions"])
+    c_score = ch["creator_score"]
+    o_score = ch["opponent_score"]
+    c_name = ch["creator_name"]
+    o_name = ch["opponent_name"] or "صديقك"
+    c_stars = "⭐" * c_score + "☆" * (total - c_score)
+    o_stars = "⭐" * o_score + "☆" * (total - o_score)
+    if c_score > o_score:
+        winner = f"🏆 الفائز: *{c_name}*"
+    elif o_score > c_score:
+        winner = f"🏆 الفائز: *{o_name}*"
+    else:
+        winner = "🤝 *تعادل!* كلاكما رائع!"
+    return (
+        "🎯 *نتيجة التحدي*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"👤 {c_name}: {c_score}/{total} {c_stars}\n"
+        f"👤 {o_name}: {o_score}/{total} {o_stars}\n\n"
+        f"{winner}"
+    )
+
+
+# ==================== دوال الاستريك ====================
+
+def get_streak(user_id: int) -> dict:
+    """ارجع بيانات الاستريك كـ dict"""
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            row = conn.execute(
+                "SELECT streak, max_streak FROM streaks WHERE user_id=?", (user_id,)
+            ).fetchone()
+        if row:
+            return {"streak": row[0], "max": row[1]}
+        return {"streak": 0, "max": 0}
+    except Exception:
+        return {"streak": 0, "max": 0}
+
+
+def update_streak(user_id: int):
+    """حدّث الاستريك للمستخدم"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            row = conn.execute(
+                "SELECT streak, max_streak, last_date FROM streaks WHERE user_id=?",
+                (user_id,)
+            ).fetchone()
+            if not row:
+                conn.execute(
+                    "INSERT INTO streaks (user_id, streak, max_streak, last_date) VALUES (?,1,1,?)",
+                    (user_id, today)
+                )
+            else:
+                streak, max_s, last_date = row
+                yesterday = (_dt.datetime.now(AMMAN_TZ) - _dt.timedelta(days=1)).strftime("%Y-%m-%d")
+                if last_date == today:
+                    return
+                elif last_date == yesterday:
+                    streak += 1
+                else:
+                    streak = 1
+                max_s = max(max_s, streak)
+                conn.execute(
+                    "UPDATE streaks SET streak=?, max_streak=?, last_date=? WHERE user_id=?",
+                    (streak, max_s, today, user_id)
+                )
+    except Exception as e:
+        logger.error(f"update_streak error: {e}")
+
+
+# ==================== دوال تحدي اليوم ====================
+def get_today_challenge() -> dict | None:
+    """ارجع تحدي اليوم إن وُجد"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            row = conn.execute(
+                "SELECT hadith_text, answer, full_text FROM daily_challenge WHERE date=?",
+                (today,)
+            ).fetchone()
+        if row:
+            return {"text": row[0], "answer": row[1], "full": row[2]}
+        return None
+    except Exception:
+        return None
+
+
+def save_today_challenge(text: str, answer: str, full_text: str):
+    """احفظ تحدي اليوم"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO daily_challenge (date, hadith_text, answer, full_text) VALUES (?,?,?,?)",
+                (today, text, answer, full_text)
+            )
+    except Exception as e:
+        logger.error(f"save_today_challenge error: {e}")
+
+
+# ==================== دوال الاختبار ====================
+
+def save_quiz_session(user_id: int, questions: list, index: int, score: int, date: str):
+    """احفظ حالة الاختبار في قاعدة البيانات"""
+    try:
+        import json as _j
+        with sqlite3.connect("bot.db") as conn:
+            conn.execute(
+                """INSERT OR REPLACE INTO quiz_sessions
+                   (user_id, questions_json, quiz_index, quiz_score, quiz_date)
+                   VALUES (?,?,?,?,?)""",
+                (user_id, _j.dumps(questions, ensure_ascii=False), index, score, date)
+            )
+    except Exception as e:
+        logger.error(f"save_quiz_session error: {e}")
+
+
+# ══════════════════════════════════════════════
+# بيانات أسماء الله الحسنى
+# ══════════════════════════════════════════════
+ASMA_ALLAH = [
+    {"name": "الله", "meaning": "الاسم الجامع لجميع صفات الكمال والجلال والجمال، وهو الاسم الأعظم الذي تتضمنه جميع الأسماء", "dua": "اللهم أنت الله لا إله إلا أنت، أسألك بكل اسم هو لك", "benefit": "من داوم على ذكره افتقر قلبه إلى الله وأنس به"},
+    {"name": "الرحمن", "meaning": "ذو الرحمة الواسعة التي تشمل جميع المخلوقات في الدنيا مؤمنهم وكافرهم", "dua": "يا رحمن ارحمني برحمتك الواسعة", "benefit": "الرحمة الواسعة التي تسبق الغضب، وهو لا يُسمى به غير الله"},
+    {"name": "الرحيم", "meaning": "ذو الرحمة الخاصة بالمؤمنين يوم القيامة، رحمته خاصة تنال من يستحقها", "dua": "يا رحيم ارحمني يوم لا ينفع مال ولا بنون", "benefit": "قراءة بسم الله الرحمن الرحيم في أول كل أمر تجلب البركة"},
+    {"name": "الملك", "meaning": "المالك لكل شيء والمتصرف في ملكه كما يشاء بلا منازع ولا شريك", "dua": "يا ملك الملوك أعزني بطاعتك وأذلني لأمرك", "benefit": "من قرأه بعد الفجر مئة مرة أغناه الله وجعله ذا هيبة"},
+    {"name": "القدوس", "meaning": "المنزّه عن كل عيب ونقص وما لا يليق بجلاله، الطاهر من كل سوء", "dua": "يا قدوس طهر قلبي من الذنوب والأدناس", "benefit": "تلاوته تطهر القلب وتنزهه عن الأوساخ المعنوية"},
+    {"name": "السلام", "meaning": "السالم من كل عيب ونقص، المسلّم لعباده السلامة في الدين والدنيا والآخرة", "dua": "اللهم أنت السلام ومنك السلام تباركت يا ذا الجلال والإكرام", "benefit": "من قرأه على مريض شُفي بإذن الله"},
+    {"name": "المؤمن", "meaning": "المصدّق لأنبيائه ورسله ولعباده المؤمنين، المؤمّن لخلقه من عذابه لمن أطاعه", "dua": "يا مؤمن آمن روعتي وأمّن خوفي", "benefit": "ذكره يورث الأمان ويطرد الوحشة والخوف"},
+    {"name": "المهيمن", "meaning": "الرقيب الحافظ الشاهد على كل شيء، المتولي أمور خلقه وأحوالهم", "dua": "يا مهيمن احفظني بعينك التي لا تنام", "benefit": "من داوم على ذكره حُفظ من شرور الإنس والجن"},
+    {"name": "العزيز", "meaning": "الغالب الذي لا يُغلب، القوي الذي يعز من يشاء ويذل من يشاء", "dua": "يا عزيز أعزني بطاعتك وعزّ دينك", "benefit": "ذكره يمنح العزة ويدفع الذل والمهانة"},
+    {"name": "الجبار", "meaning": "الذي جبر الكسير وأغنى الفقير وأعز الذليل، وقهر العصاة والظالمين", "dua": "يا جبار اجبر كسري وأصلح حالي", "benefit": "ذكره يجبر المكسور ويشفي الجراح"},
+    {"name": "المتكبر", "meaning": "المتعالي عن صفات النقص وعن كل ما لا يليق بجلاله، الكبير الشأن وحده", "dua": "يا متكبر تكبّر على من ظلمني وانتقم لي ممن بغى عليّ", "benefit": "لا يحق التكبر لأحد سوى الله، ومن تكبّر على الظالم نصره الله"},
+    {"name": "الخالق", "meaning": "المُوجِد للأشياء من العدم بلا مثال سابق ولا حاجة إلى أحد", "dua": "يا خالق خلق في قلبي الإيمان وفي نفسي التقوى", "benefit": "التأمل في الخلق يعظم الإيمان ويزيد اليقين"},
+    {"name": "البارئ", "meaning": "المُميِّز للمخلوقات بعضها عن بعض بالأشكال والصفات المختلفة بلا حساب", "dua": "يا بارئ أصلح فطرتي وبارئ قلبي من الغل والحسد", "benefit": "البارئ الخالق البارئ المصور — الثلاثة متلازمة في الخلق والتصوير"},
+    {"name": "المصور", "meaning": "الذي يُعطي كل مخلوق صورته وشكله المميز له بحكمته وإتقانه", "dua": "يا مصور صوّر حياتي على أجمل ما تحب", "benefit": "من تأمل تصوير الوجوه والصور أيقن بعظمة الله"},
+    {"name": "الغفار", "meaning": "الكثير المغفرة والعفو الذي يغفر الذنوب مرة بعد مرة لمن تاب", "dua": "يا غفار اغفر لي ذنوبي كلها دقها وجلها", "benefit": "من أكثر من الاستغفار جعل الله له من كل ضيق مخرجاً"},
+    {"name": "القهار", "meaning": "الغالب على كل شيء، الذي قهر الخلق بسلطانه وذلّت له الرقاب", "dua": "يا قهار اقهر نفسي الأمارة بالسوء واقهر أعدائي", "benefit": "ذكره يقهر شياطين الإنس والجن ويذل النفس الأمارة"},
+    {"name": "الوهاب", "meaning": "كثير العطاء الذي يهب بلا سبب ولا مقابل، هبته لا تنقطع ولا تحصى", "dua": "يا وهاب هب لي من فضلك ما يُغنيني عمن سواك", "benefit": "من دعا به عند الشدة فتح الله عليه أبواب العطاء"},
+    {"name": "الرزاق", "meaning": "الذي يرزق جميع خلقه ظاهراً وباطناً، لا ينقطع رزقه ولا ينفد عطاؤه", "dua": "يا رزاق ارزقني رزقاً حلالاً طيباً واسعاً بلا تعب ولا منّة", "benefit": "من قرأه بعد صلاة الفجر وسّع الله له في رزقه"},
+    {"name": "الفتاح", "meaning": "الذي يفتح لعباده أبواب الرزق والرحمة والخير ويفصل بين الحق والباطل", "dua": "يا فتاح افتح لي أبواب رحمتك وفرجك ويسرك", "benefit": "ذكره يفتح المغلقات ويفرج الضيقات ويزيل الهموم"},
+    {"name": "العليم", "meaning": "المحيط علمه بكل شيء ظاهر وخفي، علمه سابق لوجود الأشياء لا يعزب عنه شيء", "dua": "يا عليم علّمني ما ينفعني وانفعني بما علمتني", "benefit": "من سأل الله العلم بهذا الاسم فتح الله له أبواب الفهم والحفظ"},
+    {"name": "القابض", "meaning": "الذي يقبض الأرزاق والأرواح بحكمته وعدله لا بظلم ولا نقص", "dua": "يا قابض لا تقبض رحمتك ولا نعمتك ولا عافيتك عني", "benefit": "تذكر أن القبض بحكمة يورث الرضا والصبر"},
+    {"name": "الباسط", "meaning": "الذي يبسط الأرزاق لمن يشاء بفضله وتوسعه بغير حساب", "dua": "يا باسط ابسط لي من رزقك وفرجك وخيرك", "benefit": "ذكره يجلب سعة الرزق وانشراح الصدر"},
+    {"name": "الخافض", "meaning": "الذي يخفض الجبابرة والطغاة ويذل الأعداء بقدرته وعدله", "dua": "يا خافض اخفض كل عدو ظالم وكل شيطان مريد", "benefit": "ذكره يدفع كيد الأعداء وشر الحاسدين"},
+    {"name": "الرافع", "meaning": "الذي يرفع أولياءه بطاعته وينعم عليهم في الدنيا والآخرة", "dua": "يا رافع ارفع درجتي عندك وارفع ذكري في الناس", "benefit": "ذكره يرفع الدرجات ويُعلي الشأن"},
+    {"name": "المعز", "meaning": "الذي يُعزّ من يشاء بحكمته فيعزه بالإيمان والطاعة", "dua": "يا معز أعزني بطاعتك وعزّ بي دينك", "benefit": "العزة الحقيقية لا تُنال إلا بالله، فمن طلبها منه أعطاه إياها"},
+    {"name": "المذل", "meaning": "الذي يُذلّ من يشاء بعدله وحكمته وإن كان ذا قوة وسلطان", "dua": "يا مذل أذلّ نفسي بين يديك وأذلّ كل من يؤذيني بغير حق", "benefit": "من تذلل لله رفعه، ومن تكبر أذله"},
+    {"name": "السميع", "meaning": "الذي يسمع كل صوت دقيق وجليل سراً وعلناً، لا يغيب عنه شيء", "dua": "يا سميع اسمع دعائي وأجب نداء قلبي", "benefit": "من دعاه بهذا الاسم مع اليقين سمع الله دعاءه وأجابه"},
+    {"name": "البصير", "meaning": "الذي يرى كل شيء صغيراً وكبيراً ظاهراً وخفياً لا يخفى عليه شيء", "dua": "يا بصير أبصرني بعيوبي وأرني الحق حقاً", "benefit": "التأمل في هذا الاسم يورث الحياء من الله والمراقبة له"},
+    {"name": "الحكم", "meaning": "الفاصل بين الحق والباطل بعدله وقضائه النافذ الذي لا يُردّ", "dua": "يا حكم احكم لي بالحق وأنصفني ممن ظلمني", "benefit": "ذكره عند المظلمة يُعجّل النصر من الله"},
+    {"name": "العدل", "meaning": "الموصوف بالعدل التام في جميع أحكامه وأفعاله لا يظلم أحداً", "dua": "يا عدل أعطني حقي وأنصفني ممن بغى عليّ", "benefit": "ذكره يمنح صاحبه العدل في معاملاته وحكمه"},
+    {"name": "اللطيف", "meaning": "الذي يعلم بدقائق الأمور ويوصل العبد إلى خيره من حيث لا يحتسب", "dua": "يا لطيف ألطف بي في أمري كله ويسّر لي ما أشكل عليّ", "benefit": "اللطف الخفي من الله يأتي حيث لا يُنتظر ولا يُحتسب"},
+    {"name": "الخبير", "meaning": "العالم بخفايا الأمور وبواطنها كعلمه بظواهرها وجليّها", "dua": "يا خبير أخبرني بما ينفعني وأعنّي على ما يُرضيك", "benefit": "من استشار الله باستخارة صادقة أخبره الله بالأصلح له"},
+    {"name": "الحليم", "meaning": "الذي يتأنى ولا يعجل بالعقوبة رغم قدرته، يمهل ولا يهمل", "dua": "يا حليم لا تعاقبني بذنبي وتجاوز عن جهلي", "benefit": "التحلي بالحلم من أخلاق الله المحبوبة — من حلم نصره الله"},
+    {"name": "العظيم", "meaning": "ذو العظمة التامة التي لا تُدرك وتفوق كل عظيم، جامع للصفات العلى", "dua": "يا عظيم عظّم في قلبي خشيتك وعظّم حظي من رحمتك", "benefit": "تعظيم الله في القلب يطرد الخوف من غيره"},
+    {"name": "الغفور", "meaning": "الذي يغفر الذنوب العظيمة لمن جاء تائباً مستغفراً مهما بلغت", "dua": "يا غفور اغفر لي ما تعلمه مني من السوء كله", "benefit": "لو أخطأ العبد حتى بلغت ذنوبه عنان السماء ثم استغفر غفر الله له"},
+    {"name": "الشكور", "meaning": "الذي يجزي على العمل القليل أضعافاً مضاعفة ولا يضيع عنده شيء", "dua": "يا شكور تقبّل مني عملي القليل وعوّضني عليه خيراً كثيراً", "benefit": "الله يشكر العبد على قليل عمله فيضاعفه أضعافاً"},
+    {"name": "العلي", "meaning": "المرتفع فوق جميع مخلوقاته بذاته وصفاته وقهره وعلو شأنه", "dua": "يا علي ارفعني إليك وارفع درجتي عندك", "benefit": "التوجه إلى العلي الأعلى يجعل القلب لا يخشى أحداً سواه"},
+    {"name": "الكبير", "meaning": "الكبير في ذاته وصفاته الذي لا أكبر منه ولا أعظم في كل شيء", "dua": "يا كبير كبّر نفسي عن الدنيا وصغّر الدنيا في عيني", "benefit": "من عظّم الله في قلبه صغر في عينه كل شيء سواه"},
+    {"name": "الحفيظ", "meaning": "الذي يحفظ عباده من الشرور والمهالك ويحفظ أعمالهم في الدنيا والآخرة", "dua": "يا حفيظ احفظني بحفظك من كل شر ومكروه", "benefit": "بسم الله الذي لا يضر مع اسمه شيء — حفظ عظيم"},
+    {"name": "المقيت", "meaning": "الذي يُقيت عباده ويُوصل إليهم أقواتهم ويدبر أرزاقهم كفاية لكل واحد", "dua": "يا مقيت أقِت قلبي بالإيمان وجسدي بالحلال", "benefit": "الله يتكفل برزق كل مخلوق صغيره وكبيره"},
+    {"name": "الحسيب", "meaning": "الذي يحاسب العباد على أعمالهم ويكفيهم ويكفي من توكل عليه", "dua": "يا حسيب حاسبني حساباً يسيراً وكن لي كافياً", "benefit": "من محاسبة النفس في الدنيا خف حسابه في الآخرة"},
+    {"name": "الجليل", "meaning": "ذو الجلال والعظمة والكبرياء الذي تخضع له الرقاب وتخشع له القلوب", "dua": "يا جليل أجلّ قدري عندك وأدم علي فضلك", "benefit": "ذكره يملأ القلب بالهيبة والإجلال لله"},
+    {"name": "الكريم", "meaning": "الكثير الخير الذي يُعطي بلا سبب ولا طلب ويزيد على ما يُسأل", "dua": "يا كريم تكرّم عليّ بعفوك وجودك وعطائك", "benefit": "الله كريم يُحب الكرم ويجزي المتكرمين"},
+    {"name": "الرقيب", "meaning": "الحافظ المطّلع على أحوال عباده لا يغيب عنه شيء من أعمالهم وأفعالهم", "dua": "يا رقيب اجعلني أراقبك في السر والعلن", "benefit": "المراقبة لله مقام عظيم تجعل العبد في إحسان دائم"},
+    {"name": "المجيب", "meaning": "الذي يجيب المضطر ويُجيب دعاء كل داعٍ إذا دعاه على الوجه الصحيح", "dua": "يا مجيب أجب دعائي وحقق رجائي فيك", "benefit": "الله يجيب الدعاء ولو بعد حين، فلا يُستعجل الإجابة"},
+    {"name": "الواسع", "meaning": "الواسع الرحمة والفضل والعطاء والعلم الذي لا يضيق على أحد", "dua": "يا واسع وسّع عليّ في رزقي وفرجي وعلمي", "benefit": "رحمة الله وسعت كل شيء فمن طلبها وجدها"},
+    {"name": "الحكيم", "meaning": "الذي يضع الأشياء في مواضعها بعلمه وإتقانه لا يخطئ ولا يُبدّل", "dua": "يا حكيم أُحكم أمري وأصلح شأني بحكمتك", "benefit": "ما يصيب المؤمن فيه حكمة بالغة وإن لم يدركها"},
+    {"name": "الودود", "meaning": "الذي يُحب عباده المؤمنين ويُحبّبهم إلى الناس ويضع لهم القبول", "dua": "يا ودود اجعلني محبوباً في قلوب عبادك", "benefit": "من أحب الله أحبه الله ووضع له القبول في قلوب الناس"},
+    {"name": "المجيد", "meaning": "ذو المجد والشرف الواسع الذي له العظمة والسؤدد وجلال المقام", "dua": "يا مجيد مجّد ذكري بطاعتك واجعل عملي خالصاً لك", "benefit": "ذكره في الصلاة على النبي ﷺ يجلب البركة والفضل"},
+    {"name": "الباعث", "meaning": "الذي يبعث الخلق يوم القيامة من قبورهم للحساب والجزاء", "dua": "يا باعث ابعثني يوم القيامة مع الصالحين", "benefit": "اليقين بالبعث يعصم العبد من الغرور بالدنيا"},
+    {"name": "الشهيد", "meaning": "الشاهد على كل شيء لا يغيب عنه شيء في الأرض ولا في السماء", "dua": "يا شهيد اشهد أني أحبك وأشهد أن لا إله إلا أنت", "benefit": "من علم أن الله شاهد عليه هابه وتجنب المعاصي"},
+    {"name": "الحق", "meaning": "الثابت الوجود المتحقق الألوهية الذي لا إله غيره ولا رب سواه", "dua": "يا حق ثبّتني على الحق حتى ألقاك", "benefit": "الله هو الحق وما سواه باطل، فمن تعلق به وجد الحق"},
+    {"name": "الوكيل", "meaning": "الكافي لمن توكل عليه ويتولى أمور من فوّض أمره إليه", "dua": "يا وكيل إليك أُفوّض أمري فاكفني ما همّني", "benefit": "حسبنا الله ونعم الوكيل — كلمة تفتح أبواب الكفاية"},
+    {"name": "القوي", "meaning": "ذو القوة التامة التي لا تُضعف ولا تُغلب وهو على كل شيء قدير", "dua": "يا قوي قوّني على طاعتك وأعنّي على أمري", "benefit": "القوة الحقيقية منه وحده، فمن استمد القوة من الله أيّده"},
+    {"name": "المتين", "meaning": "ذو القوة الشديدة الرصينة التي لا تنفد ولا تزول بمرور الزمن", "dua": "يا متين متّن إيماني وثبّت قلبي على دينك", "benefit": "من اتكأ على الله المتين لم يضعف ولم تزعزعه الشدائد"},
+    {"name": "الولي", "meaning": "الناصر لعباده المؤمنين يتولاهم بعنايته ويُدبّر أمورهم برعايته", "dua": "يا ولي كن وليّي وناصري في الدنيا والآخرة", "benefit": "الله ولي المؤمنين يخرجهم من الظلمات إلى النور"},
+    {"name": "الحميد", "meaning": "المحمود في جميع أفعاله وأسمائه وصفاته يحمده كل مخلوق بلسانه وحاله", "dua": "يا حميد اجعلني من الحامدين الشاكرين لك", "benefit": "الحمد يجلب النعم ويديمها ويزيد في فضل الله على العبد"},
+    {"name": "المحصي", "meaning": "الذي أحصى كل شيء وعلمه ولا يفوته دقيق ولا جليل من أعمال العباد", "dua": "يا محصي لا تحصِ عليّ ذنوبي واحصِ لي حسناتي", "benefit": "علم الله بكل صغيرة وكبيرة يدعو إلى مراقبته دوماً"},
+    {"name": "المبدئ", "meaning": "الذي ابتدأ الخلق من غير مثال سابق ولا حاجة إليهم", "dua": "يا مبدئ ابدأ بي بالتوفيق والهداية في كل أمر", "benefit": "التأمل في بدء الخلق يزيد الإيمان بعظمة الله"},
+    {"name": "المعيد", "meaning": "الذي يُعيد الخلق بعد الفناء كما بدأهم لا يصعب عليه الإعادة", "dua": "يا معيد أعِد عليّ رحمتك وأعِد إليّ ما أضعته من طاعتك", "benefit": "إعادة الخلق يوم القيامة أهون على الله من ابتدائهم"},
+    {"name": "المحيي", "meaning": "الذي يُحيي الأموات ويُحيي الأرض بالمطر وأحيا القلوب بالإيمان", "dua": "يا محيي أحيِ قلبي بالإيمان والقرآن والذكر", "benefit": "الله يحيي القلوب الميتة بالهداية كما يحيي الأرض الموات بالمطر"},
+    {"name": "المميت", "meaning": "الذي يُميت الأحياء حين يشاء، الموت بيده وحده لا بيد أحد سواه", "dua": "يا مميت أمتني مسلماً وأحيِني مسلماً وألحقني بالصالحين", "benefit": "تذكر الموت يزهّد في الدنيا ويُرغّب في الآخرة"},
+    {"name": "الحي", "meaning": "الدائم الحياة الذي لا يموت ولا يزول، حياته كاملة واجبة لا أول لها ولا آخر", "dua": "يا حي يا قيوم برحمتك أستغيث أصلح لي شأني كله", "benefit": "يا حي يا قيوم من أعظم الأدعية وأجمعها في الكرب"},
+    {"name": "القيوم", "meaning": "القائم بذاته المُقيم لغيره الذي تقوم به السماوات والأرض ومن فيهن", "dua": "يا قيوم لا تكلني إلى نفسي طرفة عين وأصلح لي شأني", "benefit": "آية الكرسي أعظم آية وفيها الحي القيوم"},
+    {"name": "الواجد", "meaning": "الغني الذي لا يفتقر إلى أحد ويجد كل ما يريد لا يعجزه شيء", "dua": "يا واجد أغنني بك عمن سواك وأفقرني إليك", "benefit": "الغنى الحقيقي هو غنى النفس بالافتقار إلى الله"},
+    {"name": "الماجد", "meaning": "ذو المجد الواسع والكرم الشامل والشرف العظيم في ذاته وصفاته", "dua": "يا ماجد امنحني من مجدك نوراً يضيء قلبي", "benefit": "التبارك بأسماء الله المجيدة يورث البهجة والسعادة"},
+    {"name": "الواحد", "meaning": "المنفرد بالوحدانية في ذاته وصفاته وأفعاله لا شريك له ولا نظير", "dua": "يا واحد وحّد قلبي عليك ولا تجعل له ميلاً لسواك", "benefit": "شهادة التوحيد مبنية على هذا الاسم، وهي أعظم الأقوال"},
+    {"name": "الأحد", "meaning": "الواحد الفرد الصمد الذي لا ثاني له ولا مثيل في شيء من الأشياء", "dua": "يا أحد لا أشرك بك شيئاً ولا أبتغي العزة من سواك", "benefit": "سورة الإخلاص تعدل ثلث القرآن لأنها في توحيد الأحد"},
+    {"name": "الصمد", "meaning": "الذي يُصمد إليه في الحاجات والمصائب لأنه المستغني عن كل أحد", "dua": "يا صمد إليك أصمد في كل حاجتي ولا ملجأ إلا إليك", "benefit": "من صمد إلى الله وحده في حاجته كفاه الله وأغناه"},
+    {"name": "القادر", "meaning": "المتمكن من فعل كل شيء بقدرته التامة لا يعجزه شيء في السماء والأرض", "dua": "يا قادر قدّر لي الخير حيث كان وأعنّي على أخذه", "benefit": "الثقة بقدرة الله تمنح العبد الطمأنينة في كل أحواله"},
+    {"name": "المقتدر", "meaning": "البالغ القدرة التامة النافذة في كل الأمور لا يُردّ حكمه ولا يُغلب", "dua": "يا مقتدر لا يعجزك شيء فاقتدر لي على ما أعجزني", "benefit": "إذا عجز العبد عن الأمر فالله المقتدر يُيسّره له"},
+    {"name": "المقدم", "meaning": "الذي يُقدّم من يشاء من خلقه بفضله ويُرتّب الأمور وفق حكمته", "dua": "يا مقدم قدّمني بين يديك وقدّمني في الدنيا والآخرة", "benefit": "من قدّمه الله كان في المقدمة ومن أخّره كان في المؤخرة"},
+    {"name": "المؤخر", "meaning": "الذي يُؤخّر من يشاء بحكمته وعدله ويُسوف العقوبة للظالمين", "dua": "يا مؤخر أخّر عني السوء وأخّر موتي إلى توبة", "benefit": "إمهال الله للظالم حكمة وليس إهمالاً"},
+    {"name": "الأول", "meaning": "الذي لا ابتداء لوجوده ولا أول له سبق كل شيء وليس قبله شيء", "dua": "يا أول يا آخر يا ظاهر يا باطن اغفر لي وارحمني", "benefit": "الجمع بين الأول والآخر والظاهر والباطن من أجمع الأدعية"},
+    {"name": "الآخر", "meaning": "الذي لا انتهاء لوجوده ولا آخر له يبقى بعد فناء كل شيء", "dua": "يا آخر اجعل خاتمة حياتي خيراً من بدايتها", "benefit": "من تذكر أن الله الآخر الباقي هانت عليه الدنيا الفانية"},
+    {"name": "الظاهر", "meaning": "الغالب الذي ظهر فوق كل شيء بقدرته ودلت عليه مخلوقاته", "dua": "يا ظاهر أظهر لي من آيات قدرتك ما يزيد يقيني", "benefit": "كل مخلوق دليل على الخالق الظاهر بحججه وآياته"},
+    {"name": "الباطن", "meaning": "العالم بكل خفيّ ودقيق، الذي احتجب عن الأبصار وأحاط بكل شيء علماً", "dua": "يا باطن أصلح باطني كما أظهرت ظاهري", "benefit": "الله أعلم بالنيات والسرائر فمن أصلح باطنه أصلح الله ظاهره"},
+    {"name": "الوالي", "meaning": "المالك لكل شيء المتولي لأمور الخلق يدبّرها بعلمه وقدرته", "dua": "يا والي تولَّ أمري ولا تكلني إلى نفسي", "benefit": "من استولى الله على أمره أحسن تدبيره"},
+    {"name": "المتعالي", "meaning": "المتنزّه عن صفات الخلق العالي علواً مطلقاً في ذاته وصفاته", "dua": "يا متعالي لا حول ولا قوة إلا بك أنت العلي العظيم", "benefit": "لا حول ولا قوة إلا بالله — كنز من كنوز الجنة"},
+    {"name": "البر", "meaning": "كثير الإحسان والبر بعباده يبرّ بهم في الدنيا والآخرة بلا حساب", "dua": "يا بر أحسن إليّ كما أحسنت إلى من قبلي", "benefit": "الله برّ رحيم يبرّ بعباده أكثر مما تبرّ الأمهات بأولادهم"},
+    {"name": "التواب", "meaning": "الذي يقبل توبة عباده مهما تكررت ذنوبهم إذا صدقوا في رجوعهم", "dua": "يا تواب تب عليّ إنك أنت التواب الرحيم", "benefit": "باب التوبة مفتوح حتى تطلع الشمس من مغربها"},
+    {"name": "المنتقم", "meaning": "الذي ينتقم من الظالمين والمجرمين بعدله حين تحق عليهم كلمة العذاب", "dua": "يا منتقم انتقم لي ممن ظلمني وآذاني", "benefit": "الله ينتقم للمظلوم ولو بعد حين فلا ييأس المظلوم"},
+    {"name": "العفو", "meaning": "الذي يمحو الذنوب ويعفو عنها حتى كأنها لم تكن عفواً كاملاً", "dua": "اللهم إنك عفو تحب العفو فاعف عني", "benefit": "هذا الدعاء أوصى به النبي ﷺ في ليلة القدر وهو جامع"},
+    {"name": "الرؤوف", "meaning": "ذو الرأفة الشديدة التي فوق الرحمة العادية يعطف على عباده بلطفه", "dua": "يا رؤوف ارأف بي وارفع عني ما لا أطيق", "benefit": "الرأفة بالخلق من أخلاق الله التي يُحب أن يراها في عباده"},
+    {"name": "مالك الملك", "meaning": "المالك الحقيقي لجميع الملك والسلطان يتصرف فيه كما يشاء لا معقب لحكمه", "dua": "يا مالك الملك آتِ ملكي منك واجعله في طاعتك", "benefit": "الملك حقاً لله وما أُعطي العبد منه فأمانة"},
+    {"name": "ذو الجلال والإكرام", "meaning": "المستحق للتعظيم والإكرام المتصف بالجلال والجمال والكمال المطلق", "dua": "يا ذا الجلال والإكرام لا تحرمني ولا تُخذلني", "benefit": "النبي ﷺ قال: ألظّوا بيا ذا الجلال والإكرام"},
+    {"name": "المقسط", "meaning": "العادل في حكمه الذي يُقسط بين عباده ولا يظلم أحداً شيئاً", "dua": "يا مقسط أقسط لي حقي وأعدل بيني وبين من ظلمني", "benefit": "الله يُحب المقسطين ويُعلي منزلتهم عنده"},
+    {"name": "الجامع", "meaning": "الذي يجمع الخلائق ليوم الحساب ويجمع ما شاء من شيء في شيء", "dua": "يا جامع اجمع شملي وشمل أسرتي على طاعتك", "benefit": "ذكره يجمع ما تفرق ويُوحّد ما تشتت بإذن الله"},
+    {"name": "الغني", "meaning": "الذي لا يحتاج لأحد وغناه ذاتي لا يزول ولا ينقص وكل شيء فقير إليه", "dua": "يا غني أغنني بحلالك عن حرامك وبطاعتك عن معصيتك", "benefit": "الغنى الحقيقي غنى النفس بالله لا غنى المال والثروة"},
+    {"name": "المغني", "meaning": "الذي يُغني من يشاء من عباده بفضله ويزيل الفقر عمن يشاء برحمته", "dua": "يا مغني أغنني من فضلك الواسع واجعل غناي في قلبي", "benefit": "سل الله الغنى فمن أعطاه الغنى أغناه عن الناس"},
+    {"name": "المانع", "meaning": "الذي يمنع عن عباده ما يشاء بحكمته ويحمي من يشاء من الشرور", "dua": "يا مانع امنع عني كل سوء وكل مكروه", "benefit": "ما منع الله عبده فيه خير لم يره العبد بعد"},
+    {"name": "الضار", "meaning": "الذي يضر من يشاء من خلقه بحكمته وعدله وليس الضر بيد غيره", "dua": "يا ضار لا تسلّط عليّ من يؤذيني وادفع عني شر الخلق", "benefit": "الضر والنفع كلاهما بيد الله فلا يُستعاذ إلا به"},
+    {"name": "النافع", "meaning": "الذي يُنفع من يشاء من خلقه بإرادته ورحمته وكل نفع من عنده", "dua": "يا نافع انفعني بما علمتني وانفع بي", "benefit": "من أراد النفع لنفسه وللناس استمد ذلك من الله النافع"},
+    {"name": "النور", "meaning": "الذي يُنير الكون بنوره ويهدي قلوب عباده بنور الإيمان والهداية", "dua": "يا نور أنر قلبي بالإيمان وأنر طريقي بهداك", "benefit": "الله نور السماوات والأرض ومن استنار بنوره لم يضل"},
+    {"name": "الهادي", "meaning": "الذي يهدي من يشاء إلى الحق والصواب ويُوفّق لخيري الدنيا والآخرة", "dua": "يا هادي اهدني صراطك المستقيم وثبّتني عليه", "benefit": "الهداية أعظم نعمة سلها الله في كل صلاة بالفاتحة"},
+    {"name": "البديع", "meaning": "الذي ابتدع الخلق على غير مثال سابق وأبدع في كل ما صنع", "dua": "يا بديع السماوات والأرض أبدع في حياتي وأعمالي", "benefit": "النظر في بديع خلق الله يملأ القلب بالإعجاب والشكر"},
+    {"name": "الباقي", "meaning": "الدائم الذي لا يفنى ويبقى بعد فناء كل شيء لا زوال لوجوده", "dua": "يا باقي أبقِ إيماني وأبقِ حبك في قلبي", "benefit": "كل شيء فانٍ وهو الباقي — الاستمساك بالباقي نجاة"},
+    {"name": "الوارث", "meaning": "الذي يرث الأرض ومن عليها بعد فنائهم وإليه يرجع الأمر كله", "dua": "يا وارث أورثني الفردوس الأعلى وأورث قلبي التقوى", "benefit": "ما بقي من الأعمال الصالحة يرثه العبد يوم القيامة"},
+    {"name": "الرشيد", "meaning": "الذي يُرشد خلقه إلى ما فيه صلاحهم ويُدبّر أمورهم بالحكمة والصواب", "dua": "يا رشيد أرشدني إلى ما فيه رضاك في كل أمري", "benefit": "من طلب الرشد من الله أرشده، ومن طلبه من نفسه ضل"},
+    {"name": "الصبور", "meaning": "الذي يُمهل العصاة ولا يُعجّل بعقوبتهم رغم قدرته رحمةً وحلماً", "dua": "يا صبور علّمني الصبر واجعلني من الصابرين الشاكرين", "benefit": "صبر الله على عصيان العباد درس في الحلم والرحمة"},
+]
+
+
+# ==================== قدوتي اليوم ====================
+QUDWATI_STORIES = [
+    {
+        "name": "نوح عليه السلام",
+        "type": "نبي",
+        "story": "لبث في قومه ألف سنة إلا خمسين عاماً يدعوهم إلى الله، فما آمن معه إلا قليل. صنع السفينة بأمر الله، وحمل فيها من كل زوجين اثنين، ونجا الله المؤمنين وأغرق الكافرين. كان نوح صبوراً عظيماً، لم ييأس من دعوة قومه رغم طول المدة وقسوة التكذيب.",
+        "ayah": "قَالَ رَبِّ إِنِّي دَعَوْتُ قَوْمِي لَيْلًا وَنَهَارًا",
+        "ayah_ref": "نوح: 5",
+        "lesson": "الصبر على الدعوة وعدم اليأس من رحمة الله، مهما طال الزمن.",
+        "question": "كم سنة لبث نوح في قومه يدعوهم؟",
+        "answer": "950 سنة — ألف سنة إلا خمسين عاماً",
+        "source": "سورة نوح وسورة هود",
+    },
+    {
+        "name": "أبو بكر الصديق رضي الله عنه",
+        "type": "صحابي",
+        "story": "أول الخلفاء الراشدين، وأول من أسلم من الرجال. رفيق النبي ﷺ في الهجرة، ودفع عمره وماله لنصرة الإسلام. قال فيه النبي ﷺ: لو كنت متخذاً خليلاً لاتخذت أبا بكر خليلاً. أنفق ماله كله في سبيل الله، وثبت يوم الردة بكل قوة.",
+        "ayah": "إِذْ يَقُولُ لِصَاحِبِهِ لَا تَحْزَنْ إِنَّ اللَّهَ مَعَنَا",
+        "ayah_ref": "التوبة: 40",
+        "lesson": "الصدق في الإيمان والتضحية بالنفس والمال في سبيل الله.",
+        "question": "من هو أول الخلفاء الراشدين؟",
+        "answer": "أبو بكر الصديق رضي الله عنه",
+        "source": "السيرة النبوية، صحيح البخاري",
+    },
+    {
+        "name": "إبراهيم عليه السلام",
+        "type": "نبي",
+        "story": "خليل الرحمن، الذي حطم الأصنام بيده، وأُلقي في النار فكانت برداً وسلاماً. أمره الله بذبح ابنه إسماعيل ففداه بذبح عظيم، وبنى الكعبة مع ابنه، ودعا الناس للحج. كان حنيفاً مسلماً وما كان من المشركين.",
+        "ayah": "وَإِذِ ابْتَلَىٰ إِبْرَاهِيمَ رَبُّهُ بِكَلِمَاتٍ فَأَتَمَّهُنَّ",
+        "ayah_ref": "البقرة: 124",
+        "lesson": "التسليم الكامل لأمر الله والثقة به حتى في أشد الابتلاءات.",
+        "question": "بماذا لُقّب إبراهيم عليه السلام؟",
+        "answer": "خليل الرحمن",
+        "source": "سورة البقرة، سورة الصافات",
+    },
+    {
+        "name": "عمر بن الخطاب رضي الله عنه",
+        "type": "صحابي",
+        "story": "الفاروق، ثاني الخلفاء الراشدين. أسلم فكان فتحاً للمسلمين، وعدل في خلافته حتى نام على الحصى واهتم بأمور الرعية. وسع الله به الإسلام وقوى به الدين. كان شديداً في الحق، رحيماً بالضعفاء.",
+        "ayah": "إِنَّ اللَّهَ جَعَلَ الْحَقَّ عَلَى لِسَانِ عُمَرَ وَقَلْبِهِ",
+        "ayah_ref": "رواه الترمذي",
+        "lesson": "العدل والاهتمام بالرعية، والصرامة في الحق مع الرحمة بالضعفاء.",
+        "question": "من هو الصحابي الملقب بالفاروق؟",
+        "answer": "عمر بن الخطاب رضي الله عنه",
+        "source": "السيرة النبوية، صحيح البخاري",
+    },
+    {
+        "name": "موسى عليه السلام",
+        "type": "نبي",
+        "story": "كليم الله، أرسله الله إلى فرعون الطاغية، وأيده بمعجزات: العصا واليد البيضاء. أخرج بني إسرائيل من مصر، وشق لهم البحر، وأنزل عليهم التوراة. صبر على أذى قومه وتوكل على الله.",
+        "ayah": "وَلَمَّا جَاءَ مُوسَىٰ لِمِيقَاتِنَا وَكَلَّمَهُ رَبُّهُ",
+        "ayah_ref": "الأعراف: 143",
+        "lesson": "التوكل على الله في مواجهة الطغاة، والصبر على قيادة الأمة.",
+        "question": "بماذا لُقّب موسى عليه السلام؟",
+        "answer": "كليم الله",
+        "source": "سورة طه، سورة القصص",
+    },
+    {
+        "name": "عثمان بن عفان رضي الله عنه",
+        "type": "صحابي",
+        "story": "ذو النورين، ثالث الخلفاء الراشدين. تزوج بنتي النبي ﷺ، وجهز جيش العسرة بماله، واشترى بئر رومة للمسلمين. جمع القرآن الكريم في مصحف واحد وأرسل النسخ إلى الأمصار.",
+        "ayah": "إِنَّ اللَّهَ يَأْمُرُكُمْ أَن تُؤَدُّوا الْأَمَانَاتِ إِلَىٰ أَهْلِهَا",
+        "ayah_ref": "النساء: 58",
+        "lesson": "الحياء والسخاء في سبيل الله، والاهتمام بكتاب الله.",
+        "question": "لماذا لُقّب عثمان بذي النورين؟",
+        "answer": "لأنه تزوج بنتين من بنات النبي ﷺ",
+        "source": "السيرة النبوية، صحيح البخاري",
+    },
+    {
+        "name": "يوسف عليه السلام",
+        "type": "نبي",
+        "story": "النبي الصديق، ابتلي بإخوته فألقوه في الجب، ثم بيع عبداً في مصر، ثم راودته امرأة العزيز عن نفسه فامتنع وآثر السجن على المعصية. صبر فمكن الله له في الأرض وأصبح عزيز مصر.",
+        "ayah": "إِنَّهُ مَن يَتَّقِ وَيَصْبِرْ فَإِنَّ اللَّهَ لَا يُضِيعُ أَجْرَ الْمُحْسِنِينَ",
+        "ayah_ref": "يوسف: 90",
+        "lesson": "العفة والصبر على البلاء يؤديان إلى التمكين في الأرض.",
+        "question": "ما الذي آثره يوسف عليه السلام على الاستجابة لامرأة العزيز؟",
+        "answer": "آثر السجن على المعصية",
+        "source": "سورة يوسف",
+    },
+    {
+        "name": "علي بن أبي طالب رضي الله عنه",
+        "type": "صحابي",
+        "story": "ابن عم النبي ﷺ، رابع الخلفاء الراشدين، وأول من أسلم من الصبيان. كان بطلاً شجاعاً في المعارك، وعالماً قاضياً حكيماً بين الناس. نام في فراش النبي ﷺ ليلة الهجرة فداءً له.",
+        "ayah": "وَمِنَ النَّاسِ مَن يَشْرِي نَفْسَهُ ابْتِغَاءَ مَرْضَاتِ اللَّهِ",
+        "ayah_ref": "البقرة: 207",
+        "lesson": "الشجاعة في الحق والعلم النافع ركيزتا القائد المؤمن.",
+        "question": "من هو أول من أسلم من الصبيان؟",
+        "answer": "علي بن أبي طالب رضي الله عنه",
+        "source": "السيرة النبوية، سنن الترمذي",
+    },
+    {
+        "name": "أيوب عليه السلام",
+        "type": "نبي",
+        "story": "النبي الصابر، ابتلي بفقد المال والولد والمرض الشديد سنوات طويلة، فصبر ولم يتذمر. دعا ربه: أني مسني الضر وأنت أرحم الراحمين. فرفع الله عنه الضر وأعاده إلى صحته وماله وأهله.",
+        "ayah": "وَاذْكُرْ عَبْدَنَا أَيُّوبَ إِذْ نَادَىٰ رَبَّهُ أَنِّي مَسَّنِيَ الضُّرُّ",
+        "ayah_ref": "ص: 41",
+        "lesson": "الصبر على البلاء وعدم اليأس من رحمة الله.",
+        "question": "كم لبث أيوب في مرضه؟",
+        "answer": "قيل ثماني عشرة سنة أو أكثر",
+        "source": "سورة ص، سورة الأنبياء",
+    },
+    {
+        "name": "خالد بن الوليد رضي الله عنه",
+        "type": "صحابي",
+        "story": "سيف الله المسلول، قائد عسكري عظيم لم يهزم في معركة قط. أسلم عام الفتح، وقاد جيوش المسلمين في حروب الردة وفتح العراق والشام. كان بارعاً في التخطيط الحربي.",
+        "ayah": "\"نعم عبد الله خالد بن الوليد سيف من سيوف الله\"",
+        "ayah_ref": "رواه الترمذي",
+        "lesson": "الشجاعة والإخلاص في الجهاد، واستخدام الموهبة في نصرة الدين.",
+        "question": "من هو الصحابي الملقب بسيف الله المسلول؟",
+        "answer": "",
+        "source": "السيرة النبوية، تاريخ الطبري",
+    },
+    {
+        "name": "يونس عليه السلام",
+        "type": "نبي",
+        "story": "النبي الذي ابتلعه الحوت عندما ترك قومه غاضباً، فدعا في بطن الحوت: لا إله إلا أنت سبحانك إني كنت من الظالمين. فاستجاب الله له ونجاه من الغم.",
+        "ayah": "وَذَا النُّونِ إِذ ذَّهَبَ مُغَاضِبًا فَظَنَّ أَن لَّن نَّقْدِرَ عَلَيْهِ فَنَادَىٰ فِي الظُّلُمَاتِ",
+        "ayah_ref": "الأنبياء: 87",
+        "lesson": "سرعة التوبة والاستغفار، وأن الله ينجي المكروبين.",
+        "question": "ما هو دعاء يونس في بطن الحوت؟",
+        "answer": "",
+        "source": "سورة الأنبياء، سورة الصافات",
+    },
+    {
+        "name": "بلال بن رباح رضي الله عنه",
+        "type": "صحابي",
+        "story": "أول مؤذن في الإسلام، عبد حبشي اشتراه أبو بكر وأعتقه. عذب في الله حتى ظنوا أنه مات، لكنه ثبت على الإيمان. كان يحب النبي ﷺ حباً شديداً.",
+        "ayah": "\"يا بلال حدثني بأرجى عمل عملته عندك في الإسلام، فإني سمعت دف نعليك بين يدي في الجنة\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "ثبات المؤمن مهما كان ضعيفاً، وأن التقوى هي المعيار.",
+        "question": "من هو أول مؤذن في الإسلام؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "يحيى عليه السلام",
+        "type": "نبي",
+        "story": "النبي الزاهد، آتاه الله الحكمة صبياً، وكان حصوراً لا يأتي النساء. دعا قومه إلى التوبة والبر، واستشهد في سبيل الدعوة.",
+        "ayah": "يَا يَحْيَىٰ خُذِ الْكِتَابَ بِقُوَّةٍ وَآتَيْنَاهُ الْحُكْمَ صَبِيًّا",
+        "ayah_ref": "مريم: 12",
+        "lesson": "الزهد في الدنيا والتفرغ لعبادة الله.",
+        "question": "كيف كانت حياة يحيى عليه السلام؟",
+        "answer": "",
+        "source": "سورة مريم",
+    },
+    {
+        "name": "الزبير بن العوام رضي الله عنه",
+        "type": "صحابي",
+        "story": "حواري رسول الله، ابن عمة النبي ﷺ. شهد المشاهد كلها، وكان من أشجع الفرسان. قُتل مظلوماً في معركة الجمل، لكنه من العشرة المبشرين بالجنة.",
+        "ayah": "\"إن لكل نبي حوارياً، وإن حواري الزبير بن العوام\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "الوفاء والصحبة الصادقة للنبي ﷺ.",
+        "question": "من هو حواري رسول الله؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "زكريا عليه السلام",
+        "type": "نبي",
+        "story": "النبي الذي كبر سنه ووهن عظمه، فدعا ربه بخشية أن يرثه أقاربه، فوهب له يحيى بعد أن كان عاقراً. كان نجاراً يعمل بيده.",
+        "ayah": "هُنَالِكَ دَعَا زَكَرِيَّا رَبَّهُ قَالَ رَبِّ هَبْ لِي مِن لَّدُنكَ ذُرِّيَّةً طَيِّبَةً",
+        "ayah_ref": "آل عمران: 38",
+        "lesson": "الدعاء والثقة بالله مهما بدت الأسباب مستحيلة.",
+        "question": "كم كان عمر زكريا عندما رزق بيحيى؟",
+        "answer": "قيل 120 سنة",
+        "source": "سورة مريم، سورة آل عمران",
+    },
+    {
+        "name": "سعد بن أبي وقاص رضي الله عنه",
+        "type": "صحابي",
+        "story": "أول من رمى بسهم في الإسلام، وأحد العشرة المبشرين بالجنة. فاتح الفرس، وقائد المسلمين في معركة القادسية. كان مستجاب الدعوة.",
+        "ayah": "\"اللهم سدد رميته وأجب دعوته\"",
+        "ayah_ref": "رواه أحمد",
+        "lesson": "الجهاد في سبيل الله بإخلاص، والدعاء المستجاب.",
+        "question": "من هو أول من رمى بسهم في الإسلام؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "عيسى عليه السلام",
+        "type": "نبي",
+        "story": "نبي الله وكلمته ألقاها إلى مريم، أيده الله بالمعجزات: يخلق من الطين كهيئة الطير فينفخ فيه فيكون طيراً بإذن الله، ويبرئ الأكمه والأبرص ويحيي الموتى. دعا قومه إلى عبادة الله وحده.",
+        "ayah": "إِذْ قَالَ اللَّهُ يَا عِيسَى ابْنَ مَرْيَمَ اذْكُرْ نِعْمَتِي عَلَيْكَ وَعَلَىٰ وَالِدَتِكَ",
+        "ayah_ref": "المائدة: 110",
+        "lesson": "الإيمان بآيات الله والتوكل عليه في نشر الدعوة.",
+        "question": "من هو النبي الذي ولد بلا أب؟",
+        "answer": "",
+        "source": "سورة آل عمران، سورة المائدة",
+    },
+    {
+        "name": "عبدالرحمن بن عوف رضي الله عنه",
+        "type": "صحابي",
+        "story": "أحد العشرة المبشرين بالجنة، وأغنى تجار قريش. هاجر بماله كله، وتاجر فربح. تصدق بأموال طائلة في سبيل الله، ووقف ماله في وجوه الخير.",
+        "ayah": "\"إنك من الأغنياء الشاكرين\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "المال نعمة إذا استخدم في طاعة الله وخدمة المسلمين.",
+        "question": "من هو الصحابي الغني الشاكر؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "سليمان عليه السلام",
+        "type": "نبي",
+        "story": "النبي الملك، ورث ملك أبيه داود، وسخر الله له الريح والجن والطير. كان يفهم لغة النمل، وأوتي ملكاً لا ينبغي لأحد من بعده. كان عبداً شكوراً.",
+        "ayah": "قَالَ رَبِّ اغْفِرْ لِي وَهَبْ لِي مُلْكًا لَّا يَنبَغِي لِأَحَدٍ مِّن بَعْدِي",
+        "ayah_ref": "ص: 35",
+        "lesson": "شكر النعم واستخدام السلطة في نشر الخير.",
+        "question": "ماذا سخر الله لسليمان؟",
+        "answer": "",
+        "source": "سورة النمل، سورة ص",
+    },
+    {
+        "name": "أبو عبيدة بن الجراح رضي الله عنه",
+        "type": "صحابي",
+        "story": "أمين هذه الأمة، وأحد العشرة المبشرين بالجنة. قاد جيوش المسلمين في فتح الشام، وعُرف بالزهد والتواضع. قال فيه النبي ﷺ: \"لكل أمة أمين، وأمين هذه الأمة أبو عبيدة\".",
+        "ayah": "\"نعم الرجل أبو عبيدة بن الجراح\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "الأمانة والزهد في الدنيا مع علو المنزلة.",
+        "question": "من هو أمين هذه الأمة؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "داود عليه السلام",
+        "type": "نبي",
+        "story": "النبي الملك، آتاه الله الزبور، وسخر له الجبال تسبح معه والطير. كان يصوم يوماً ويفطر يوماً، ولا ينام نصف الليل، وكان يأكل من عمل يده.",
+        "ayah": "وَآتَيْنَا دَاوُودَ زَبُورًا",
+        "ayah_ref": "الإسراء: 55",
+        "lesson": "الجمع بين العبادة والعمل، وشكر النعم.",
+        "question": "ما هو الكتاب الذي أنزل على داود؟",
+        "answer": "",
+        "source": "سورة ص، سورة سبأ",
+    },
+    {
+        "name": "مصعب بن عمير رضي الله عنه",
+        "type": "صحابي",
+        "story": "كان من أغنى شباب مكة وأجملهم، فلما أسلم تخلّى عن كل شيء في سبيل الله. أول سفير في الإسلام، أُرسل إلى المدينة ليعلم الأنصار الدين. استشهد في غزوة أحد.",
+        "ayah": "\"كان مصعب بن عمير خير الناس\"",
+        "ayah_ref": "رواه الحاكم",
+        "lesson": "التضحية بالدنيا في سبيل الدين.",
+        "question": "من هو أول سفير في الإسلام؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "إدريس عليه السلام",
+        "type": "نبي",
+        "story": "نبي من أنبياء الله، كان صديقاً نبياً، رفعه الله مكاناً علياً. كان أول من خط بالقلم، وأول من خاط الثياب.",
+        "ayah": "وَاذْكُرْ فِي الْكِتَابِ إِدْرِيسَ ۚ إِنَّهُ كَانَ صِدِّيقًا نَّبِيًّا وَرَفَعْنَاهُ مَكَانًا عَلِيًّا",
+        "ayah_ref": "مريم: 56-57",
+        "lesson": "الاجتهاد في العلم والعمل.",
+        "question": "ما هي أول مهنة علمها الله لإدريس؟",
+        "answer": "الخياطة والكتابة",
+        "source": "سورة مريم",
+    },
+    {
+        "name": "جعفر بن أبي طالب رضي الله عنه",
+        "type": "صحابي",
+        "story": "ابن عم النبي ﷺ، وأخو علي. هاجر إلى الحبشة وقاد المسلمين هناك، ورد على النجاشي ببلاغة عظيمة. استشهد في غزوة مؤتة، وقطعت يداه فحصل على جناحين في الجنة.",
+        "ayah": "\"رأيت جعفراً يطير في الجنة بجناحين\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "الهجرة في سبيل الله والثبات على الحق.",
+        "question": "من هو ذو الجناحين؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "هود عليه السلام",
+        "type": "نبي",
+        "story": "نبي أرسله الله إلى عاد الذين كانوا يعبدون الأصنام. دعاهم إلى الله فاستكبروا، فأهلكهم الله بريح صرصر عاتية.",
+        "ayah": "وَإِلَىٰ عَادٍ أَخَاهُمْ هُودًا ۚ قَالَ يَا قَوْمِ اعْبُدُوا اللَّهَ مَا لَكُم مِّنْ إِلَٰهٍ غَيْرُهُ",
+        "ayah_ref": "الأعراف: 65",
+        "lesson": "التواضع لله وترك الكبر.",
+        "question": "من هو نبي قوم عاد؟",
+        "answer": "",
+        "source": "سورة هود",
+    },
+    {
+        "name": "معاذ بن جبل رضي الله عنه",
+        "type": "صحابي",
+        "story": "أعلم الصحابة بالحلال والحرام، بعثه النبي ﷺ إلى اليمن قاضياً ومعلمأ. كان شديد التواضع، رغم علمه الغزير.",
+        "ayah": "\"أعلم أمتي بالحلال والحرام معاذ بن جبل\"",
+        "ayah_ref": "رواه أحمد",
+        "lesson": "العلم النافع مع العمل به.",
+        "question": "من هو أعلم الصحابة بالحلال والحرام؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "صالح عليه السلام",
+        "type": "نبي",
+        "story": "نبي أرسله الله إلى ثمود الذين كانوا ينحتون الجبال بيوتاً. دعاهم إلى الله فطلبوا آية، فأخرج الله لهم ناقة من الصخرة، فعقروها فأهلكهم الله.",
+        "ayah": "وَإِلَىٰ ثَمُودَ أَخَاهُمْ صَالِحًا ۚ قَالَ يَا قَوْمِ اعْبُدُوا اللَّهَ",
+        "ayah_ref": "الأعراف: 73",
+        "lesson": "لا نعمة تدوم مع الكفر والعصيان.",
+        "question": "ما هي آية نبي الله صالح؟",
+        "answer": "الناقة",
+        "source": "سورة هود",
+    },
+    {
+        "name": "أبو الدرداء رضي الله عنه",
+        "type": "صحابي",
+        "story": "كان تاجراً قبل الإسلام، فلما أسلم ترك التجارة وتفرغ للعبادة والعلم. كان حكيماً زاهداً، يقول: \"إني لأحتسب نومتي كما أحتسب قومتي\".",
+        "ayah": "\"اللهم إني أسألك علماً نافعاً\"",
+        "ayah_ref": "كان يكثر من هذا الدعاء",
+        "lesson": "الاجتهاد في العبادة وطلب العلم.",
+        "question": "من هو الصحابي الزاهد الحكيم؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "لوط عليه السلام",
+        "type": "نبي",
+        "story": "نبي أرسله الله إلى قوم يأتون الفاحشة. دعاهم إلى الله فكذبوه، فأنجاه الله ومن آمن معه، وأهلك القوم بحجارة من سجيل.",
+        "ayah": "وَلُوطًا إِذْ قَالَ لِقَوْمِهِ أَتَأْتُونَ الْفَاحِشَةَ مَا سَبَقَكُم بِهَا مِنْ أَحَدٍ مِّنَ الْعَالَمِينَ",
+        "ayah_ref": "الأعراف: 80",
+        "lesson": "الأمر بالمعروف والنهي عن المنكر مهما كانت البيئة فاسدة.",
+        "question": "ما الذي أهلك به قوم لوط؟",
+        "answer": "",
+        "source": "سورة هود",
+    },
+    {
+        "name": "سلمان الفارسي رضي الله عنه",
+        "type": "صحابي",
+        "story": "صحابي من فارس، بحث عن الدين الحق حتى وصل إلى المدينة وآمن. كان عابداً زاهداً، اشتهر بفكرة حفر الخندق في غزوة الأحزاب.",
+        "ayah": "\"سلمان منا آل البيت\"",
+        "ayah_ref": "رواه الحاكم",
+        "lesson": "صدق البحث عن الحق، والإخلاص لله.",
+        "question": "من هو صاحب فكرة حفر الخندق؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "شعيب عليه السلام",
+        "type": "نبي",
+        "story": "نبي أرسله الله إلى أهل مدين، كانوا يبخسون الميزان ويفسدون في الأرض. دعاهم إلى التوحيد والعدل، فكذبوه فأهلكهم الله بعذاب يوم الظلة.",
+        "ayah": "وَإِلَىٰ مَدْيَنَ أَخَاهُمْ شُعَيْبًا ۚ قَالَ يَا قَوْمِ اعْبُدُوا اللَّهَ",
+        "ayah_ref": "الأعراف: 85",
+        "lesson": "إتقان العمل والعدل في الميزان.",
+        "question": "ما هو عذاب قوم شعيب؟",
+        "answer": "يوم الظلة",
+        "source": "سورة هود",
+    },
+    {
+        "name": "أبو ذر الغفاري رضي الله عنه",
+        "type": "صحابي",
+        "story": "صحابي جليل، كان من السابقين إلى الإسلام، معروفاً بالزهد والصدق في القول. كان يردد: \"يا من لا يزول ملكه، ارحم من قد زال ملكه\".",
+        "ayah": "\"ما أظلت الخضراء ولا أقلت الغبراء أصدق لهجة من أبي ذر\"",
+        "ayah_ref": "رواه الترمذي",
+        "lesson": "الصدق والصراحة في الحق.",
+        "question": "من هو الصحابي الذي اشتهر بالصدق؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "يعقوب عليه السلام",
+        "type": "نبي",
+        "story": "نبي الله، ابن إسحاق، أبو يوسف. صبر على فراق ابنه يوسف حتى ابيضت عيناه من الحزن، لكنه لم ييأس من روح الله.",
+        "ayah": "إِنَّمَا أَشْكُو بَثِّي وَحُزْنِي إِلَى اللَّهِ وَأَعْلَمُ مِنَ اللَّهِ مَا لَا تَعْلَمُونَ",
+        "ayah_ref": "يوسف: 86",
+        "lesson": "الصبر على البلاء وحسن الظن بالله.",
+        "question": "كم سنة مكث يعقوب حزيناً على يوسف؟",
+        "answer": "قيل 40 سنة",
+        "source": "سورة يوسف",
+    },
+    {
+        "name": "حذيفة بن اليمان رضي الله عنه",
+        "type": "صحابي",
+        "story": "صاحب سر النبي ﷺ، عرف المنافقين بأسمائهم. كان حكيماً عالماً، واهتم بالفتن وكيفية النجاة منها.",
+        "ayah": "\"لو شئت أن أقول إنه يعلم ما في نفس أحدكم لقلت\"",
+        "ayah_ref": "إشارة إلى حذيفة",
+        "lesson": "حفظ الأسرار والوعي بالفتن.",
+        "question": "من هو صاحب سر النبي ﷺ؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "إسماعيل عليه السلام",
+        "type": "نبي",
+        "story": "ابن إبراهيم، الذبيح على الأرجح. ساعد أباه في بناء الكعبة، وكان صادق الوعد، وأمر أهله بالصلاة والزكاة.",
+        "ayah": "وَاذْكُرْ فِي الْكِتَابِ إِسْمَاعِيلَ ۚ إِنَّهُ كَانَ صَادِقَ الْوَعْدِ وَكَانَ رَسُولًا نَّبِيًّا",
+        "ayah_ref": "مريم: 54",
+        "lesson": "الوفاء بالوعد، والتعاون على البر والتقوى.",
+        "question": "من هو النبي الذي بنى الكعبة مع أبيه؟",
+        "answer": "",
+        "source": "سورة البقرة، سورة مريم",
+    },
+    {
+        "name": "عمرو بن الجموح رضي الله عنه",
+        "type": "صحابي",
+        "story": "صحابي كبير من الأنصار، كان أعرجاً شديد العرج. لما جاء يوم أحد، أراد أبناؤه منعه من الخروج، فقال: إني لأرجو أن أطأ بعرجتي هذه الجنة. فاستشهد في أحد.",
+        "ayah": "\"إنك لست بأعرج، إنما أنت ساعي إلى الجنة\"",
+        "ayah_ref": "رواه ابن إسحاق",
+        "lesson": "الجهاد في سبيل الله مهما كانت الظروف.",
+        "question": "من هو الصحابي الأعرج الذي استشهد في أحد؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "إسحاق عليه السلام",
+        "type": "نبي",
+        "story": "ابن إبراهيم، وأبو يعقوب. بشره الله بإسحاق نبياً من الصالحين، فكان من الأنبياء الذين أكرمهم الله.",
+        "ayah": "وَبَشَّرْنَاهُ بِإِسْحَاقَ نَبِيًّا مِّنَ الصَّالِحِينَ",
+        "ayah_ref": "الصافات: 112",
+        "lesson": "بركة دعاء إبراهيم وذريته.",
+        "question": "من هو والد يعقوب عليه السلام؟",
+        "answer": "",
+        "source": "سورة الصافات",
+    },
+    {
+        "name": "عبدالله بن عمر رضي الله عنه",
+        "type": "صحابي",
+        "story": "ابن الخليفة عمر، كان شديد الورع والتقوى، كثير الاتباع للسنة. كان إذا فقد شيئاً من سنن النبي ﷺ بكى.",
+        "ayah": "\"نعم الرجل عبدالله لو كان يصلي من الليل\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "الورع واتباع السنة.",
+        "question": "من هو الصحابي الذي اشتهر باتباع السنة؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "إلياس عليه السلام",
+        "type": "نبي",
+        "story": "نبي من أنبياء بني إسرائيل، أرسله الله إلى قوم يعبدون بعل. دعاهم إلى الله فكذبوه، فأهلكهم الله.",
+        "ayah": "وَإِنَّ إِلْيَاسَ لَمِنَ الْمُرْسَلِينَ",
+        "ayah_ref": "الصافات: 123",
+        "lesson": "الصبر على تبليغ الرسالة مهما كذب القوم.",
+        "question": "من هو النبي الذي دعا قومه لترك عبادة بعل؟",
+        "answer": "",
+        "source": "سورة الصافات",
+    },
+    {
+        "name": "أنس بن مالك رضي الله عنه",
+        "type": "صحابي",
+        "story": "خادم النبي ﷺ عشر سنين، كان أحب الناس إلى النبي. دعا له النبي بكثرة المال والولد وطول العمر.",
+        "ayah": "\"اللهم أكثر ماله وولده وأدخله الجنة\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "خدمة النبي ﷺ شرف عظيم.",
+        "question": "كم سنة خدم أنس بن مالك النبي ﷺ؟",
+        "answer": "عشر سنين",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "اليسع عليه السلام",
+        "type": "نبي",
+        "story": "نبي من أنبياء بني إسرائيل، خلف إلياس في النبوة. كان قومه يعصونه فصبر.",
+        "ayah": "وَاذْكُرْ إِسْمَاعِيلَ وَالْيَسَعَ وَذَا الْكِفْلِ ۖ وَكُلٌّ مِّنَ الْأَخْيَارِ",
+        "ayah_ref": "ص: 48",
+        "lesson": "الاستمرار في الدعوة والصبر على الأذى.",
+        "question": "من هو النبي الذي ذكر بعد إلياس في القرآن؟",
+        "answer": "",
+        "source": "سورة ص",
+    },
+    {
+        "name": "زيد بن ثابت رضي الله عنه",
+        "type": "صحابي",
+        "story": "كاتب الوحي، وأحد كبار علماء الصحابة. جمع القرآن في عهد أبي بكر، وكتبه في مصحف واحد. كان ماهراً في الفرائض والقضاء.",
+        "ayah": "\"أفرض أمتي زيد بن ثابت\"",
+        "ayah_ref": "رواه الترمذي",
+        "lesson": "العلم والعمل على حفظ كتاب الله.",
+        "question": "من هو الصحابي الذي جمع القرآن لأول مرة؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "ذو الكفل عليه السلام",
+        "type": "نبي",
+        "story": "نبي من أنبياء بني إسرائيل، قيل إنه تكفل بصيام النهار وقيام الليل. كان صابراً على القضاء بين الناس.",
+        "ayah": "وَإِسْمَاعِيلَ وَإِدْرِيسَ وَذَا الْكِفْلِ ۖ كُلٌّ مِّنَ الصَّابِرِينَ",
+        "ayah_ref": "الأنبياء: 85",
+        "lesson": "الوفاء بالعهد والصبر في القضاء.",
+        "question": "من هو النبي الذي تكفل بالعمل الصالح؟",
+        "answer": "",
+        "source": "سورة الأنبياء",
+    },
+    {
+        "name": "عبدالله بن عباس رضي الله عنه",
+        "type": "صحابي",
+        "story": "ترجمان القرآن، وابن عم النبي ﷺ. دعا له النبي: \"اللهم فقهه في الدين وعلمه التأويل\". كان عالماً بالتفسير حتى سمي البحر.",
+        "ayah": "\"نعم ترجمان القرآن ابن عباس\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "العلم والفهم في كتاب الله.",
+        "question": "من هو حبر الأمة وترجمان القرآن؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "يوشع بن نون عليه السلام",
+        "type": "نبي",
+        "story": "فتى موسى، وقائد بني إسرائيل بعد موسى. دخل بهم الأرض المقدسة، وقاتل الجبارين، وانتصر. ثبتت له معجزة توقف الشمس.",
+        "ayah": "إِذْ قَالَ مُوسَىٰ لِفَتَاهُ",
+        "ayah_ref": "الكهف: 60",
+        "lesson": "الثبات على الحق وقيادة الأمة بعد الأنبياء.",
+        "question": "من هو فتى موسى عليه السلام؟",
+        "answer": "",
+        "source": "سورة الكهف",
+    },
+    {
+        "name": "أبو موسى الأشعري رضي الله عنه",
+        "type": "نبي",
+        "story": "صحابي جليل، بعثه النبي ﷺ إلى اليمن مع معاذ. كان حسن الصوت بالقرآن، حتى قال له النبي ﷺ: \"لقد أوتيت مزماراً من مزامير آل داود\".",
+        "ayah": "\"لقد أوتي هذا مزماراً من مزامير آل داود\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "تحسين الصوت بالقرآن.",
+        "question": "من هو الصحابي الذي كان حسن الصوت بالقرآن؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "حزقيل عليه السلام (ابن العجوز)",
+        "type": "نبي",
+        "story": "قيل إنه النبي الذي مر على قرية خاوية، فأماتها الله ثم أحياهم بعد مائة عام، فكان عبرة للقوم.",
+        "ayah": "أَوْ كَالَّذِي مَرَّ عَلَىٰ قَرْيَةٍ وَهِيَ خَاوِيَةٌ عَلَىٰ عُرُوشِهَا",
+        "ayah_ref": "البقرة: 259",
+        "lesson": "قدرة الله على البعث بعد الموت.",
+        "question": "من هو النبي الذي أماته الله مائة سنة ثم أحياه؟",
+        "answer": "",
+        "source": "سورة البقرة",
+    },
+    {
+        "name": "سعد بن معاذ رضي الله عنه",
+        "type": "صحابي",
+        "story": "سيد الأوس، حكم في بني قريظة بحكم الله، فاستجاب الله لحكمه. اهتز عرش الرحمن لموته.",
+        "ayah": "\"اهتز عرش الرحمن لموت سعد بن معاذ\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "العدل في الحكم والإيمان العميق.",
+        "question": "من هو الصحابي الذي اهتز لموته عرش الرحمن؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "شمويل عليه السلام",
+        "type": "نبي",
+        "story": "نبي لبني إسرائيل، طلبوا منه أن يبعث لهم ملكاً يقاتلون في سبيل الله، فبعث لهم طالوت.",
+        "ayah": "أَلَمْ تَرَ إِلَى الْمَلَإِ مِن بَنِي إِسْرَائِيلَ مِن بَعْدِ مُوسَىٰ",
+        "ayah_ref": "البقرة: 246",
+        "lesson": "السمع والطاعة للقائد في الجهاد.",
+        "question": "من هو النبي الذي ملك عليهم طالوت؟",
+        "answer": "",
+        "source": "سورة البقرة",
+    },
+    {
+        "name": "عكرمة بن أبي جهل رضي الله عنه",
+        "type": "صحابي",
+        "story": "ابن عدو الإسلام أبي جهل، أسلم يوم الفتح، وحسن إسلامه. قاتل في الردة واستشهد في اليرموك.",
+        "ayah": "\"ابن عكرمة جاء مسلماً مهاجراً\"",
+        "ayah_ref": "رواه الطبراني",
+        "lesson": "لا يضر المرء ما كان عليه أهله إذا هداه الله.",
+        "question": "من هو ابن أبي جهل الذي حسن إسلامه؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "دَانِيَال عليه السلام",
+        "type": "صحابي",
+        "story": "نبي من بني إسرائيل، ألقي في جب الأسود فلم يضروه. كان صابراً شكوراً.",
+        "ayah": "",
+        "ayah_ref": "لم يذكر في القرآن لكن في الإسرائيليات",
+        "lesson": "الثقة بالله وحفظه لمن يتوكل عليه.",
+        "question": "من هو النبي الذي ألقي في جب الأسود؟",
+        "answer": "",
+        "source": "قصص الأنبياء لابن كثير",
+    },
+    {
+        "name": "ثمامة بن أثال رضي الله عنه",
+        "type": "صحابي",
+        "story": "سيد اليمامة، أسره المسلمون ثم أسلم، ومنع الطعام عن قريش حتى أذن لهم النبي. كان شجاعاً كريماً.",
+        "ayah": "\"أسلم ثمامة فأسلم الناس\"",
+        "ayah_ref": "رواه البخاري",
+        "lesson": "قوة الإيمان تغير المواقف.",
+        "question": "من هو الصحابي الذي منع الطعام عن قريش بعد إسلامه؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "حَنظلة بن صفوان عليه السلام",
+        "type": "صحابي",
+        "story": "نبي أرسله الله إلى أصحاب الرس (قوم كذبوا نبي الله).",
+        "ayah": "وَعَادًا وَثَمُودَ وَأَصْحَابَ الرَّسِّ",
+        "ayah_ref": "الفرقان: 38",
+        "lesson": "الاستمرار في الدعوة وإن كذب القوم.",
+        "question": "إلى من أرسل نبي الله حنظلة؟",
+        "answer": "أصحاب الرس",
+        "source": "سورة الفرقان",
+    },
+    {
+        "name": "عمار بن ياسر رضي الله عنه",
+        "type": "صحابي",
+        "story": "من السابقين إلى الإسلام، عُذب هو وأبواه في الله. قال له النبي ﷺ: \"ويحك يا عمار، تقتلك الفئة الباغية\".",
+        "ayah": "\"عمار مع الحق والحق مع عمار\"",
+        "ayah_ref": "رواه الحاكم",
+        "lesson": "الثبات على الحق مهما كانت التضحيات.",
+        "question": "من هو الصحابي الذي قتلته الفئة الباغية؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "أرمياء عليه السلام (إرميا)",
+        "type": "نبي",
+        "story": "نبي من بني إسرائيل، عاصر خراب بيت المقدس، وكان ينذر قومه.",
+        "ayah": "",
+        "ayah_ref": "لم يذكر في القرآن لكن في كتب التاريخ",
+        "lesson": "الصبر على خراب الأمة والعمل على إصلاحها.",
+        "question": "من هو النبي الذي عاصر خراب بيت المقدس؟",
+        "answer": "",
+        "source": "قصص الأنبياء",
+    },
+    {
+        "name": "صهيب الرومي رضي الله عنه",
+        "type": "صحابي",
+        "story": "صحابي من الروم، اشترى نفسه بماله كله عندما أراد المشركون منعه من الهجرة. قال له النبي ﷺ: \"ربح البيع أبا يحيى\".",
+        "ayah": "\"ربح البيع أبا يحيى\"",
+        "ayah_ref": "رواه ابن ماجه",
+        "lesson": "التضحية بالمال في سبيل الدين.",
+        "question": "من هو الصحابي الذي تاجر مع الله فربح؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "يوشع عليه السلام",
+        "type": "نبي",
+        "story": "(مكرر، ولكن نضيف قصة فتح أريحا) بعد موسى قاد بني إسرائيل لفتح الأرض المقدسة، وحاصر أريحا ستة أيام، وفي اليوم السابع داروا بالتابوت سبع مرات فسقط السور.",
+        "ayah": "النصر يأتي بعد الصبر والطاعة.",
+        "ayah_ref": "",
+        "lesson": "",
+        "question": "من هو النبي الذي فتح أريحا؟",
+        "answer": "",
+        "source": "التوراة والقرآن",
+    },
+    {
+        "name": "خبيب بن عدي رضي الله عنه",
+        "type": "صحابي",
+        "story": "صحابي أسرته قريش وقتلوه صبراً، لكنه رفض أن يمس شعره أحد. قال قبل مقتله: \"وَلَسْتُ أُبَالِي حِينَ أُقْتَلُ مُسْلِمًا ... عَلَى أَيِّ شِقٍّ كَانَ لِلَّهِ مَصْرَعِي\"",
+        "ayah": "\"اللهم أحصهم عدداً واقتلهم بدداً\"",
+        "ayah_ref": "دعا على قاتليه",
+        "lesson": "الثبات على العقيدة حتى آخر رمق.",
+        "question": "من هو الصحابي الذي قتل صبراً في الحرم؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+    {
+        "name": "لقمان الحكيم عليه السلام",
+        "type": "نبي",
+        "story": "رجل صالح آتاه الله الحكمة، كان يعظ ابنه بأجمل المواعظ: التوحيد، بر الوالدين، الصلاة، الأمر بالمعروف.",
+        "ayah": "يَا بُنَيَّ لَا تُشْرِكْ بِاللَّهِ ۖ إِنَّ الشِّرْكَ لَظُلْمٌ عَظِيمٌ",
+        "ayah_ref": "لقمان: 13",
+        "lesson": "الحكمة في تربية الأبناء.",
+        "question": "من هو الحكيم الذي ذكرت مواعظه في القرآن؟",
+        "answer": "",
+        "source": "سورة لقمان",
+    },
+    {
+        "name": "أبو أيوب الأنصاري رضي الله عنه",
+        "type": "نبي",
+        "story": "صحابي نزل عنده النبي ﷺ لما هاجر إلى المدينة. شارك في الفتوحات، واستشهد في القسطنطينية ودفن عند أسوارها.",
+        "ayah": "\"اللهم اغفر لأبي أيوب\"",
+        "ayah_ref": "كان النبي يدعو له",
+        "lesson": "حب النبي ﷺ وخدمته.",
+        "question": "من هو الصحابي الذي استضاف النبي في بيته؟",
+        "answer": "",
+        "source": "السيرة النبوية",
+    },
+]
+
+def get_qudwati_of_day() -> dict:
+    """قصة قدوتي اليوم — ترتيب ثابت يومياً"""
+    # نستخدم رقم اليوم في السنة للحصول على قصة مختلفة كل يوم بترتيب القائمة
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    # نحسب رقم اليوم من بداية عام 2025 حتى نحافظ على الترتيب
+    base = _dt.date(2025, 1, 1)
+    current = _dt.datetime.now(AMMAN_TZ).date()
+    day_num = (current - base).days
+    return QUDWATI_STORIES[day_num % len(QUDWATI_STORIES)]
+
+def build_qudwati_msg(story: dict) -> str:
+    type_icon = "🕌" if story["type"] == "نبي" else ("🌸" if story["type"] == "صحابية" else "⭐")
+
+    # تحديد نوع النص: آية أو حديث
+    ayah_ref = story.get("ayah_ref", "")
+    ayah_text = story.get("ayah", "")
+    # إذا كان المرجع يحتوي رقم سورة (مثل "البقرة: 124") فهو آية
+    # وإذا كان يحتوي "رواه" أو "صحيح" أو "السيرة" فهو حديث
+    hadith_keywords = ["رواه", "صحيح", "السيرة", "سنن", "مسند", "الترمذي", "البخاري", "مسلم", "أحمد", "الطبراني", "الحاكم"]
+    is_hadith = any(kw in ayah_ref or kw in ayah_text for kw in hadith_keywords)
+
+    if is_hadith:
+        ref_label = "📜 *الحديث الشريف:*"
+        ref_text = f'"{ayah_text}"'
+        ref_line = f"{ref_label}\n{ref_text}\n_{ayah_ref}_"
+    else:
+        ref_label = "📖 *الآية الكريمة:*"
+        ref_line = f"{ref_label}\n_{{{ayah_text}}}_ [{ayah_ref}]"
+
+    msg = (
+        f"🌟 *قدوتي اليوم: {story['name']}*\n"
+        f"{type_icon} _{story['type']}_\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"{story['story']}\n\n"
+        f"{ref_line}\n\n"
+        f"💡 *العبرة:*\n{story['lesson']}\n\n"
+        f"❓ *سؤال التفاعل:*\n{story['question']}\n"
+        "_أرسل إجابتك وسأخبرك إن كانت صحيحة!_ 👇\n\n"
+        f"📚 *المصدر:* {story['source']}"
+    )
+    return msg
+
+async def cmd_qudwati(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قدوتي اليوم - قصة يومية من سير الأنبياء والصحابة"""
+    user = update.effective_user
+    story = get_qudwati_of_day()
+    msg = build_qudwati_msg(story)
+    # احفظ سؤال القصة للإجابة
+    context.user_data["qudwati_question"] = story["question"]
+    context.user_data["qudwati_answer"] = story["answer"]
+    context.user_data["qudwati_answer_saved"] = story["answer"]  # backup للـ reveal
+    context.user_data["current_qudwati"] = story  # للـ TTS
+    context.user_data["qudwati_waiting"] = True
+    bot_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}"
+    share_text = urllib.parse.quote(
+        f"🌟 قدوتي اليوم: {story['name']}\n\n"
+        f"{story['story'][:200]}...\n\n"
+        f"💡 العبرة: {story['lesson']}\n\n"
+        f"تعرّف على قصص الأنبياء والصحابة يومياً عبر بوت راوِي:\n{bot_link}"
+    )
+    share_url = f"https://t.me/share/url?url={bot_link}&text={share_text}"
+    kb = InlineKeyboardMarkup([
+        [colored_btn("🔄 قدوة أخرى", callback_data="qudwati_next", style="primary"),
+         colored_btn("📤 شارك القصة", switch_inline_query=f"qudwati_{story['name'][:30]}")],
+        [colored_btn("✅ أظهر الإجابة", callback_data="qudwati_reveal", style="success")],
+    ])
+    await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+def main_kb(is_admin=False, **kwargs):
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    buttons = [
+        [KeyboardButton("🔍 تحقق من حديث"), KeyboardButton("📖 باحث القرآن")],
+        [KeyboardButton("📜 اقترح لي حديثاً"), KeyboardButton("🤲 دعاء اليوم")],
+        [KeyboardButton("🌟 قدوتي اليوم"), KeyboardButton("🎯 اختبر معلوماتك")],
+        [KeyboardButton("📿 ختمة"), KeyboardButton("❓ سؤال ديني")],
+        [KeyboardButton("⚔️ تحدي صديق"), KeyboardButton("📤 مشاركة")],
+        [KeyboardButton("💰 دعم البوت"), KeyboardButton("ℹ️ عن البوت")],
+    ]
+    if is_admin:
+        buttons.append([KeyboardButton("⚙️ لوحة التحكم")])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def admin_main_keyboard():
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    buttons = [
+        [KeyboardButton("📢 إشعار عام"), KeyboardButton("📢 إشعار متقدم")],
+        [KeyboardButton("📊 إحصائيات"), KeyboardButton("📅 إحصائيات الأسبوع")],
+        [KeyboardButton("📈 نمو يومي"), KeyboardButton("⏰ أوقات النشاط")],
+        [KeyboardButton("🏆 أنشط المستخدمين"), KeyboardButton("🆕 مستخدمون جدد")],
+        [KeyboardButton("🌟 قائمة الداعمين"), KeyboardButton("🔍 بحث مستخدم")],
+        [KeyboardButton("🗑️ حذف مستخدم"), KeyboardButton("🎁 منح مستوى")],
+        [KeyboardButton("✏️ رسالة الترحيب"), KeyboardButton("⏸ إيقاف البحث")],
+        [KeyboardButton("💰 استرداد نجوم"), KeyboardButton("🔙 القائمة الرئيسية")],
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def cancel_broadcast_keyboard():
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    return ReplyKeyboardMarkup([[KeyboardButton("❌ إلغاء الإشعار")]], resize_keyboard=True)
+
+def advanced_broadcast_keyboard():
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("📝 نص"), KeyboardButton("🖼️ صورة")],
+        [KeyboardButton("🎤 صوت"), KeyboardButton("🎥 فيديو")],
+        [KeyboardButton("📁 ملف"), KeyboardButton("❌ إلغاء الإشعار")],
+    ], resize_keyboard=True)
+
+def donation_keyboard():
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    return ReplyKeyboardMarkup([
+        [KeyboardButton("⭐ 1 نجمة"), KeyboardButton("⭐ 5 نجوم")],
+        [KeyboardButton("⭐ 10 نجوم"), KeyboardButton("⭐ 25 نجمة")],
+        [KeyboardButton("⭐ 50 نجمة")],
+        [KeyboardButton("🔙 رجوع")],
+    ], resize_keyboard=True)
+
+def get_weekly_stats():
+    try:
+        week_ago = (_dt.datetime.now(AMMAN_TZ) - _dt.timedelta(days=7)).strftime("%Y-%m-%d")
+        with sqlite3.connect("bot.db") as conn:
+            new_users = conn.execute("SELECT COUNT(*) FROM users WHERE joined_at >= ?", (week_ago,)).fetchone()[0]
+            searches = conn.execute("SELECT COUNT(*) FROM search_history WHERE searched_at >= ?", (week_ago,)).fetchone()[0]
+        return {"new_users": new_users, "searches": searches}
+    except Exception:
+        return {"new_users": 0, "searches": 0}
+
+def get_daily_growth():
+    try:
+        result = []
+        with sqlite3.connect("bot.db") as conn:
+            for i in range(6, -1, -1):
+                day = (_dt.datetime.now(AMMAN_TZ) - _dt.timedelta(days=i)).strftime("%Y-%m-%d")
+                count = conn.execute("SELECT COUNT(*) FROM users WHERE joined_at LIKE ?", (f"{day}%",)).fetchone()[0]
+                result.append((day, count))
+        return result
+    except Exception:
+        return []
+
+def get_peak_hours():
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            rows = conn.execute(
+                "SELECT strftime('%H', searched_at) as hr, COUNT(*) as cnt FROM search_history "
+                "WHERE searched_at >= date('now', '-7 days') GROUP BY hr ORDER BY cnt DESC LIMIT 5"
+            ).fetchall()
+        return [(int(r[0]), r[1]) for r in rows]
+    except Exception:
+        return []
+
+def get_top_searchers(limit=10):
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            rows = conn.execute(
+                "SELECT u.full_name, u.username, COUNT(s.id) as total FROM users u "
+                "JOIN search_history s ON u.user_id=s.user_id GROUP BY u.user_id ORDER BY total DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return rows
+    except Exception:
+        return []
+
+def get_recent_users(limit=10):
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            rows = conn.execute("SELECT full_name, username, joined_at FROM users ORDER BY joined_at DESC LIMIT ?", (limit,)).fetchall()
+        return rows
+    except Exception:
+        return []
+
+def has_answered_today(user_id):
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            row = conn.execute("SELECT 1 FROM challenge_answers WHERE user_id=? AND date=?", (user_id, today)).fetchone()
+        return bool(row)
+    except Exception:
+        return False
+
+def save_challenge_answer(user_id, is_correct):
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            conn.execute("INSERT OR IGNORE INTO challenge_answers (user_id, date, correct) VALUES (?,?,?)", (user_id, today, int(is_correct)))
+    except Exception as e:
+        logger.error(f"save_challenge_answer: {e}")
+
+def get_setting(key, default=""):
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            row = conn.execute("SELECT value FROM bot_settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+def save_setting(key, value):
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            conn.execute("INSERT OR REPLACE INTO bot_settings (key, value) VALUES (?,?)", (key, value))
+    except Exception as e:
+        logger.error(f"save_setting: {e}")
+
+def get_user_info(query):
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            if query.startswith("@"):
+                row = conn.execute("SELECT user_id, full_name, username, joined_at FROM users WHERE username=?", (query[1:],)).fetchone()
+            else:
+                row = conn.execute("SELECT user_id, full_name, username, joined_at FROM users WHERE user_id=?", (int(query),)).fetchone()
+        if row:
+            return {"id": row[0], "name": row[1], "username": row[2], "joined": row[3]}
+        return None
+    except Exception:
+        return None
+
+def get_all_donors():
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            rows = conn.execute(
+                "SELECT u.full_name, u.username, p.stars FROM premium p JOIN users u ON p.user_id=u.user_id ORDER BY p.stars DESC"
+            ).fetchall()
+        return rows
+    except Exception:
+        return []
+
+def streak_emoji(streak):
+    if streak >= 365: return "👑"
+    elif streak >= 100: return "💎"
+    elif streak >= 30: return "⭐"
+    elif streak >= 14: return "🔥"
+    elif streak >= 7: return "✨"
+    elif streak >= 3: return "🌱"
+    else: return "🌟"
+
+async def _fetch_dorar(query: str) -> list:
+    """طلب واحد لـ API الدرر"""
+    url = "https://dorar.net/dorar_api.json"
+    params = {"skey": query}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; HadithBot/1.0)",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://dorar.net/"
+    }
+    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=12)) as session:
+        async with session.get(url, params=params, headers=headers) as resp:
+            if resp.status != 200:
+                return []
+            data = json.loads(await resp.text())
+            ahadith = data.get("ahadith", {})
+            html = ahadith.get("result", "") if isinstance(ahadith, dict) else ""
+            if not html:
+                return []
+            return parse_dorar_html(html)
+
+async def search_dorar_api(query: str) -> list:
+    """البحث في API الدرر مع Cache و Retry"""
+    # تنظيف الـ query
+    clean_q = clean_search_query(query)
+
+    # تحقق من الـ cache
+    cached = cache_get(clean_q)
+    if cached is not None:
+        logger.info(f"[CACHE] hit: {clean_q[:30]}")
+        return cached
+
+    # حاول مرتين مع انتظار بينهما
+    results = []
+    for attempt in range(2):
+        try:
+            results = await _fetch_dorar(clean_q)
+            if results:
+                break
+            if attempt == 0:
+                logger.info(f"[DORAR] retry for: {clean_q[:30]}")
+                await asyncio.sleep(2)
+        except Exception as e:
+            logger.warning(f"[DORAR] attempt {attempt+1} error: {e}")
+            if attempt == 0:
+                await asyncio.sleep(2)
+
+    if results:
+        results = sort_results(results)  # رتّب: مسلم أولاً ثم البخاري
+        logger.info(f"[DORAR] {len(results)} نتيجة لـ: {clean_q[:30]}")
+        cache_set(clean_q, results)
+        return results
+
+    # fallback: cache قديم
+    old = _search_cache.get(clean_q.strip().lower())
+    return old[0] if old else []
+
+
+
+
+
+def get_random_hadith(book_name: str = None):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT text, source, grade FROM ahadith ORDER BY RANDOM() LIMIT 1")
+    row = cur.fetchone()
+    conn.close()
+    if row:
+        return row
+    return ("إنما الأعمال بالنيات", "صحيح البخاري (1)", "صحيح")
+
+# ==================== الإشعارات المجدولة ====================
+
+ADHKAR_SABAH = [
+    ("سُبْحَانَ اللهِ وَبِحَمْدِهِ", "100 مرة صباحاً تحط الخطايا وإن كانت مثل زبد البحر", "صحيح مسلم"),
+    ("اللَّهُمَّ أَنْتَ رَبِّي لَا إِلَهَ إِلَّا أَنْتَ، خَلَقْتَنِي وَأَنَا عَبْدُكَ", "سيد الاستغفار - من قاله موقناً فمات من يومه دخل الجنة", "صحيح البخاري"),
+    ("اللَّهُمَّ بِكَ أَصْبَحْنَا وَبِكَ أَمْسَيْنَا وَبِكَ نَحْيَا وَبِكَ نَمُوتُ وَإِلَيْكَ النُّشُورُ", "يقال صباحاً", "سنن الترمذي"),
+    ("أَصْبَحْنَا وَأَصْبَحَ الْمُلْكُ لِلَّهِ وَالْحَمْدُ لِلَّهِ", "يقال صباحاً", "صحيح مسلم"),
+    ("اللَّهُمَّ إِنِّي أَسْأَلُكَ الْعَفْوَ وَالْعَافِيَةَ فِي الدُّنْيَا وَالْآخِرَةِ", "من الأذكار المأثورة صباحاً ومساءً", "سنن أبي داود"),
+    ("بِسْمِ اللهِ الَّذِي لَا يَضُرُّ مَعَ اسْمِهِ شَيْءٌ فِي الْأَرْضِ وَلَا فِي السَّمَاءِ وَهُوَ السَّمِيعُ الْعَلِيمُ", "3 مرات - لم يضره شيء", "سنن أبي داود"),
+    ("رَضِيتُ بِاللهِ رَبَّاً، وَبِالإِسْلَامِ دِيناً، وَبِمُحَمَّدٍ ﷺ نَبِيَّاً", "3 مرات - حق على الله أن يرضيه", "سنن أبي داود"),
+    ("اللَّهُمَّ عَافِنِي فِي بَدَنِي، اللَّهُمَّ عَافِنِي فِي سَمْعِي، اللَّهُمَّ عَافِنِي فِي بَصَرِي", "3 مرات", "سنن أبي داود"),
+]
+
+ADHKAR_MASAA = [
+    ("سُبْحَانَ اللهِ وَبِحَمْدِهِ", "100 مرة مساءً تحط الخطايا وإن كانت مثل زبد البحر", "صحيح مسلم"),
+    ("اللَّهُمَّ بِكَ أَمْسَيْنَا وَبِكَ أَصْبَحْنَا وَبِكَ نَحْيَا وَبِكَ نَمُوتُ وَإِلَيْكَ الْمَصِيرُ", "يقال مساءً", "سنن الترمذي"),
+    ("أَمْسَيْنَا وَأَمْسَى الْمُلْكُ لِلَّهِ وَالْحَمْدُ لِلَّهِ", "يقال مساءً", "صحيح مسلم"),
+    ("اللَّهُمَّ إِنِّي أَمْسَيْتُ أُشْهِدُكَ وَأُشْهِدُ حَمَلَةَ عَرْشِكَ وَمَلَائِكَتَكَ وَجَمِيعَ خَلْقِكَ أَنَّكَ أَنْتَ اللهُ لَا إِلَهَ إِلَّا أَنْتَ", "4 مرات - أعتقه الله من النار", "سنن أبي داود"),
+    ("اللَّهُمَّ إِنِّي أَسْأَلُكَ الْعَفْوَ وَالْعَافِيَةَ فِي الدُّنْيَا وَالْآخِرَةِ", "من الأذكار المأثورة صباحاً ومساءً", "سنن أبي داود"),
+    ("بِسْمِ اللهِ الَّذِي لَا يَضُرُّ مَعَ اسْمِهِ شَيْءٌ فِي الْأَرْضِ وَلَا فِي السَّمَاءِ وَهُوَ السَّمِيعُ الْعَلِيمُ", "3 مرات - لم يضره شيء", "سنن أبي داود"),
+    ("أَعُوذُ بِكَلِمَاتِ اللهِ التَّامَّاتِ مِنْ شَرِّ مَا خَلَقَ", "3 مرات مساءً - لا يضره لدغة", "صحيح مسلم"),
+    ("اللَّهُمَّ عَافِنِي فِي بَدَنِي، اللَّهُمَّ عَافِنِي فِي سَمْعِي، اللَّهُمَّ عَافِنِي فِي بَصَرِي", "3 مرات", "سنن أبي داود"),
+]
+
+# ==================== نظام Premium ====================
+# ===== نظام التيرات =====
+# ⭐ Tier 1: 1+ نجمة  → بحث بالموضوع
+# ⭐ Tier 2: 5+ نجوم  → المفضلة
+# ⭐ Tier 3: 25+ نجمة → تخصيص وقت الإشعار + كل المزايا
+TIER2_STARS = 5
+
+def save_favorite(user_id: int, h: dict) -> bool:
+    """حفظ حديث في المفضلة - يرجع True لو نجح"""
+    try:
+        conn = sqlite3.connect("bot.db")
+        conn.execute("""
+            INSERT OR IGNORE INTO favorites (user_id, hadith_text, rawi, source, grade)
+            VALUES (?,?,?,?,?)
+        """, (user_id, h["text"], h.get("rawi",""), h.get("source",""), h.get("grade","")))
+        changed = conn.total_changes
+        conn.commit()
+        conn.close()
+        return changed > 0
+    except:
+        return False
+
+def remove_favorite(user_id: int, hadith_text: str):
+    conn = sqlite3.connect("bot.db")
+    conn.execute("DELETE FROM favorites WHERE user_id=? AND hadith_text=?", (user_id, hadith_text))
+    conn.commit()
+    conn.close()
+
+def get_favorites(user_id: int) -> list:
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT hadith_text, rawi, source, grade, saved_at FROM favorites WHERE user_id=? ORDER BY saved_at DESC", (user_id,))
+    rows = cur.fetchall()
+    conn.close()
+    return [{"text":r[0],"rawi":r[1],"source":r[2],"grade":r[3],"id":f"fav_{i}","hadith_id":str(i),"mohdith":"","sharh_id":None} for i,r in enumerate(rows)]
+
+def count_favorites(user_id: int) -> int:
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM favorites WHERE user_id=?", (user_id,))
+    count = cur.fetchone()[0]
+    conn.close()
+    return count
+
+def log_search_history(user_id: int, query: str, count: int):
+    """تسجيل البحث في تاريخ المستخدم"""
+    try:
+        conn = sqlite3.connect("bot.db")
+        conn.execute("INSERT INTO search_history (user_id, query, results_count) VALUES (?,?,?)",
+                     (user_id, query[:200], count))
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+def get_user_stats(user_id: int) -> dict:
+    """إحصائيات شخصية للمستخدم"""
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM searches WHERE user_id=?", (user_id,))
+    total = cur.fetchone()[0]
+    cur.execute("SELECT query FROM searches WHERE user_id=? ORDER BY id DESC LIMIT 100", (user_id,))
+    words = []
+    for (q,) in cur.fetchall():
+        words.extend(w for w in q.split() if len(w) > 2)
+    from collections import Counter
+    top = Counter(words).most_common(3)
+    cur.execute("SELECT joined_at FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    joined = row[0][:10] if row else "غير محدد"
+    fav_count = count_favorites(user_id)
+    conn.close()
+    return {"total": total, "top": top, "joined": joined, "favs": fav_count}
+
+def increment_share(hadith_text: str):
+    """زيادة عداد المشاركات"""
+    try:
+        conn = sqlite3.connect("bot.db")
+        conn.execute("""
+            INSERT INTO share_counts (hadith_text, count) VALUES (?,1)
+            ON CONFLICT(hadith_text) DO UPDATE SET count=count+1
+        """, (hadith_text[:500],))
+        conn.commit()
+        conn.close()
+    except:
+        pass
+
+def get_top_shared(limit=10) -> list:
+    """أكثر الأحاديث مشاركةً"""
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute("SELECT hadith_text, count FROM share_counts ORDER BY count DESC LIMIT ?", (limit,))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def save_favorite_note(user_id: int, hadith_text: str, note: str):
+    """حفظ ملاحظة على حديث في المفضلة"""
+    conn = sqlite3.connect("bot.db")
+    conn.execute("UPDATE favorites SET note=? WHERE user_id=? AND hadith_text=?",
+                 (note[:300], user_id, hadith_text))
+    conn.commit()
+    conn.close()
+
+def get_subscribers(col: str) -> list:
+    """جلب المشتركين في خدمة معينة"""
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute(f"SELECT user_id FROM users WHERE {col} = 1")
+    rows = cur.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def toggle_subscription(user_id: int, col: str) -> bool:
+    """تبديل الاشتراك - يرجع القيمة الجديدة"""
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    cur.execute(f"SELECT {col} FROM users WHERE user_id=?", (user_id,))
+    row = cur.fetchone()
+    current = row[0] if row else 0
+    new_val = 0 if current else 1
+    cur.execute(f"UPDATE users SET {col}=? WHERE user_id=?", (new_val, user_id))
+    conn.commit()
+    conn.close()
+    return bool(new_val)
+
+
+def get_user_id_by_username(username: str):
+    conn = sqlite3.connect("bot.db")
+    cur = conn.cursor()
+    uname = username.lstrip("@")
+    cur.execute("SELECT user_id FROM users WHERE username=?", (uname,))
+    row = cur.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+# ==================== Mood Hadith (حديث على قدك) ====================
+DAILY_QUESTIONS = [
+    {"q": 'كم عدد أركان الإسلام؟', "options": ['5', '4', '3', '6'], "answer": '5', "explain": 'الشهادتان، الصلاة، الزكاة، الصوم، الحج'},
+    {"q": 'ما هي أطول سورة في القرآن؟', "options": ['آل عمران', 'النساء', 'البقرة', 'المائدة'], "answer": 'البقرة', "explain": 'سورة البقرة هي أطول سورة في القرآن الكريم'},
+    {"q": 'كم عدد أنبياء الله المذكورين في القرآن؟', "options": ['20', '35', '30', '25'], "answer": '25', "explain": 'ذُكر 25 نبياً بالاسم في القرآن الكريم'},
+    {"q": 'ما هو اسم والد النبي إبراهيم عليه السلام؟', "options": ['تارح', 'عمران', 'يشكر', 'آزر'], "answer": 'آزر', "explain": 'ذكر القرآن اسم والد إبراهيم آزر'},
+    {"q": 'في أي شهر نزل القرآن الكريم؟', "options": ['رجب', 'شعبان', 'محرم', 'رمضان'], "answer": 'رمضان', "explain": 'قال تعالى: شهر رمضان الذي أنزل فيه القرآن'},
+    {"q": 'كم عدد سور القرآن الكريم؟', "options": ['110', '114', '112', '116'], "answer": '114', "explain": 'يتكون القرآن الكريم من 114 سورة'},
+    {"q": 'ما هي السورة التي تعدل ثلث القرآن؟', "options": ['الفلق', 'الفاتحة', 'الكوثر', 'الإخلاص'], "answer": 'الإخلاص', "explain": 'قال النبي ﷺ إن سورة الإخلاص تعدل ثلث القرآن'},
+    {"q": 'كم عدد أركان الإيمان؟', "options": ['4', '5', '6', '7'], "answer": '6', "explain": 'الإيمان بالله وملائكته وكتبه ورسله واليوم الآخر والقدر'},
+    {"q": 'ما هو أول مسجد بُني في الإسلام؟', "options": ['المسجد الحرام', 'المسجد الأقصى', 'مسجد النبي', 'مسجد قباء'], "answer": 'مسجد قباء', "explain": 'مسجد قباء هو أول مسجد بُني في الإسلام عند هجرة النبي ﷺ'},
+    {"q": 'كم سنة استغرق نزول القرآن الكريم؟', "options": ['20 سنة', '30 سنة', '25 سنة', '23 سنة'], "answer": '23 سنة', "explain": 'نزل القرآن الكريم على مدى 23 سنة'},
+    {"q": 'ما هو اسم جبل النور الذي نزل فيه الوحي؟', "options": ['جبل عرفات', 'جبل حراء', 'جبل ثور', 'جبل أبي قبيس'], "answer": 'جبل حراء', "explain": 'في غار حراء بجبل النور نزل أول وحي على النبي ﷺ'},
+    {"q": 'ما هي أول آية نزلت من القرآن؟', "options": ['بسم الله', 'الحمد لله', 'اقرأ باسم ربك', 'يا أيها المدثر'], "answer": 'اقرأ باسم ربك', "explain": 'أول ما نزل: اقرأ باسم ربك الذي خلق'},
+    {"q": 'كم سنة بقي أصحاب الكهف في نومهم؟', "options": ['100 سنة', '200 سنة', '309 سنوات', '400 سنة'], "answer": '309 سنوات', "explain": 'قال تعالى: ولبثوا في كهفهم ثلاث مئة سنين وازدادوا تسعاً'},
+    {"q": 'ما هي السورة الوحيدة التي ليس فيها بسملة في أولها؟', "options": ['الفيل', 'التوبة', 'الإخلاص', 'المعوذتان'], "answer": 'التوبة', "explain": 'سورة التوبة لم يُكتب في أولها بسملة'},
+    {"q": 'ما هي السورة التي تُسمى عروس القرآن؟', "options": ['الرحمن', 'يس', 'الواقعة', 'الكهف'], "answer": 'الرحمن', "explain": 'سورة الرحمن تُسمى عروس القرآن'},
+    {"q": 'من هو النبي الذي ابتلعه الحوت؟', "options": ['إلياس', 'إدريس', 'يونس', 'أيوب'], "answer": 'يونس', "explain": 'يونس عليه السلام ذو النون التقمه الحوت'},
+    {"q": 'ما هي مدة نوح عليه السلام في قومه؟', "options": ['300 سنة', '500 سنة', '950 سنة', '1000 سنة'], "answer": '950 سنة', "explain": 'قال تعالى: فلبث فيهم ألف سنة إلا خمسين عاماً'},
+    {"q": 'ما هي السورة التي تحتوي على آية الكرسي؟', "options": ['آل عمران', 'النساء', 'المائدة', 'البقرة'], "answer": 'البقرة', "explain": 'آية الكرسي هي الآية 255 من سورة البقرة'},
+    {"q": 'أي نبي سكن في مصر وأصبح عزيزها؟', "options": ['موسى', 'يوسف', 'إبراهيم', 'إسحاق'], "answer": 'يوسف', "explain": 'يوسف عليه السلام أصبح عزيز مصر'},
+    {"q": 'من هو أول من جمع القرآن في مصحف واحد؟', "options": ['زيد بن ثابت', 'عمر بن الخطاب', 'أبو بكر الصديق', 'علي بن أبي طالب'], "answer": 'أبو بكر الصديق', "explain": 'أبو بكر أمر بجمع القرآن في مصحف واحد'},
+    {"q": 'كم ركعة تُصلى صلاة العيد؟', "options": ['ركعتان', 'أربع ركعات', 'ثلاث ركعات', 'ست ركعات'], "answer": 'ركعتان', "explain": 'صلاة العيد ركعتان مع تكبيرات زائدة'},
+    {"q": 'ما هي الصلاة الوسطى المذكورة في القرآن؟', "options": ['الفجر', 'الظهر', 'العصر', 'المغرب'], "answer": 'العصر', "explain": 'قال تعالى: حافظوا على الصلوات والصلاة الوسطى — وهي العصر'},
+    {"q": 'كم حجة حجّها النبي ﷺ؟', "options": ['ثلاث حجج', 'حجتان', 'لم يحج', 'حجة واحدة'], "answer": 'حجة واحدة', "explain": 'حجّ النبي ﷺ حجة واحدة وهي حجة الوداع عام 10هـ'},
+    {"q": 'من هو الصحابي الملقب بـ أمين الأمة؟', "options": ['علي', 'عمر', 'أبو بكر', 'أبو عبيدة'], "answer": 'أبو عبيدة', "explain": 'لقّب النبي ﷺ أبا عبيدة بن الجراح بأمين هذه الأمة'},
+    {"q": 'ما هو الفرق بين الزكاة والصدقة؟', "options": ['الزكاة واجبة والصدقة تطوع', 'الصدقة واجبة والزكاة تطوع', 'لا فرق', 'الزكاة للفقراء فقط'], "answer": 'الزكاة واجبة والصدقة تطوع', "explain": 'الزكاة ركن من أركان الإسلام واجبة، والصدقة تطوع مستحب'},
+    {"q": 'ما هو أول ما خلق الله؟', "options": ['القلم', 'الماء', 'العرش', 'النور'], "answer": 'القلم', "explain": 'قال النبي ﷺ: أول ما خلق الله القلم فقال له اكتب'},
+    {"q": 'ما هي آخر آية نزلت من القرآن؟', "options": ['إذا جاء نصر الله', 'اليوم أكملت لكم دينكم', 'واتقوا يوماً ترجعون', 'قل أعوذ برب الناس'], "answer": 'واتقوا يوماً ترجعون', "explain": 'قيل إن آخر آية نزلت: واتقوا يوماً ترجعون فيه إلى الله'},
+    {"q": 'ما هي اسم زوجة فرعون المؤمنة؟', "options": ['هاجر', 'بلقيس', 'آسية', 'مريم'], "answer": 'آسية', "explain": 'آسية بنت مزاحم زوجة فرعون آمنت بالله'},
+    {"q": 'من هو النبي الذي كان نجاراً؟', "options": ['زكريا', 'داود', 'سليمان', 'يوسف'], "answer": 'زكريا', "explain": 'كان زكريا عليه السلام نجاراً يعمل بيده'},
+    {"q": 'ما هي الآية الأطول في القرآن؟', "options": ['آية الكرسي', 'أول البقرة', 'آية الدَّين', 'آية النكاح'], "answer": 'آية الدَّين', "explain": 'آية الدَّين (البقرة 282) هي الأطول في القرآن'},
+    {"q": 'في أي عام وُلد النبي محمد ﷺ؟', "options": ['570م', '568م', '572م', '575م'], "answer": '570م', "explain": 'وُلد النبي ﷺ عام الفيل الموافق 570م'},
+    {"q": 'كم عمر النبي ﷺ حين تُوفّي؟', "options": ['60 سنة', '63 سنة', '61 سنة', '65 سنة'], "answer": '63 سنة', "explain": 'تُوفّي النبي ﷺ وعمره 63 سنة'},
+    {"q": 'ما هو اسم أم النبي ﷺ؟', "options": ['فاطمة بنت أسد', 'آمنة بنت وهب', 'هالة بنت وهب', 'خديجة بنت خويلد'], "answer": 'آمنة بنت وهب', "explain": 'أم النبي ﷺ هي آمنة بنت وهب'},
+    {"q": 'من هو أول من أسلم من الرجال؟', "options": ['علي بن أبي طالب', 'أبو بكر الصديق', 'عمر بن الخطاب', 'زيد بن حارثة'], "answer": 'أبو بكر الصديق', "explain": 'أبو بكر أول من أسلم من الرجال الأحرار'},
+    {"q": 'في أي سنة كانت الهجرة النبوية؟', "options": ['620م', '621م', '622م', '623م'], "answer": '622م', "explain": 'الهجرة النبوية كانت عام 622م الموافق 1هـ'},
+    {"q": 'كم غزوة غزاها النبي ﷺ بنفسه؟', "options": ['20', '27', '30', '23'], "answer": '27', "explain": 'غزا النبي ﷺ 27 غزوة بنفسه'},
+    {"q": 'ما هو اسم ناقة النبي ﷺ؟', "options": ['العضباء فقط', 'القصواء فقط', 'كلها أسماء لها', 'الجدعاء فقط'], "answer": 'كلها أسماء لها', "explain": 'القصواء والعضباء والجدعاء كلها أسماء لناقة النبي ﷺ'},
+    {"q": 'في أي معركة كُسرت رَباعيّة النبي ﷺ؟', "options": ['بدر', 'أُحد', 'حنين', 'الخندق'], "answer": 'أُحد', "explain": 'في غزوة أُحد شُجّ وجه النبي ﷺ وكُسرت رَباعيّته'},
+    {"q": 'من هي أول زوجات النبي ﷺ؟', "options": ['عائشة', 'حفصة', 'خديجة بنت خويلد', 'زينب بنت جحش'], "answer": 'خديجة بنت خويلد', "explain": 'خديجة رضي الله عنها أول زوجات النبي ﷺ'},
+    {"q": 'ما اسم جدّ النبي ﷺ الذي رعاه؟', "options": ['عبدالله', 'عبدالمطلب', 'أبو طالب', 'الزبير'], "answer": 'عبدالمطلب', "explain": 'عبدالمطلب رعى النبي ﷺ بعد وفاة أمه'},
+    {"q": 'من هو الصحابي الملقب بسيف الله المسلول؟', "options": ['عمرو بن العاص', 'خالد بن الوليد', 'سعد بن أبي وقاص', 'أبو عبيدة'], "answer": 'خالد بن الوليد', "explain": 'لقّبه النبي ﷺ بسيف الله المسلول'},
+    {"q": 'من هو أول مؤذن في الإسلام؟', "options": ['عبدالله بن زيد', 'بلال بن رباح', 'أبو محذورة', 'سعد القرظ'], "answer": 'بلال بن رباح', "explain": 'بلال بن رباح رضي الله عنه هو أول مؤذن في الإسلام'},
+    {"q": 'من هو الصحابي الملقب بالفاروق؟', "options": ['أبو بكر', 'علي', 'عمر بن الخطاب', 'عثمان'], "answer": 'عمر بن الخطاب', "explain": 'لُقّب عمر بالفاروق لأن الله فرّق به بين الحق والباطل'},
+    {"q": 'من هو الصحابي الملقب بذي النورين؟', "options": ['عثمان بن عفان', 'أبو بكر', 'علي بن أبي طالب', 'طلحة'], "answer": 'عثمان بن عفان', "explain": 'لُقّب بذي النورين لأنه تزوج بنتين للنبي ﷺ'},
+    {"q": 'من هو الصحابي الذي بكى النبي ﷺ حين سمع قراءته؟', "options": ['أبو موسى الأشعري', 'معاذ بن جبل', 'عبدالله بن مسعود', 'أبي بن كعب'], "answer": 'عبدالله بن مسعود', "explain": 'بكى النبي ﷺ حين سمع قراءة ابن مسعود للقرآن'},
+    {"q": 'من هو الصحابي الملقب بحواري رسول الله؟', "options": ['أبو بكر', 'سعد بن أبي وقاص', 'الزبير بن العوام', 'طلحة بن عبيدالله'], "answer": 'الزبير بن العوام', "explain": 'قال النبي ﷺ: إن لكل نبي حوارياً وحواريّ الزبير'},
+    {"q": 'أكمل الحديث: إنما الأعمال...', "options": ['بالنيات', 'بالإخلاص', 'بالقلوب', 'بالإيمان'], "answer": 'بالنيات', "explain": 'الحديث: إنما الأعمال بالنيات وإنما لكل امرئ ما نوى'},
+    {"q": 'أكمل الحديث: لا يؤمن أحدكم حتى يحب لأخيه...', "options": ['الخير والهدى', 'ما يحب لنفسه', 'ما يحب لربه', 'الجنة والنعيم'], "answer": 'ما يحب لنفسه', "explain": 'رواه البخاري ومسلم — من أصول الإيمان'},
+    {"q": 'أكمل الحديث: المسلم من سلم المسلمون من...', "options": ['قلبه ونيته', 'ظلمه وجوره', 'كلامه وفعله', 'لسانه ويده'], "answer": 'لسانه ويده', "explain": 'رواه البخاري — من جوامع كلمه ﷺ'},
+    {"q": 'أكمل الحديث: من كان يؤمن بالله واليوم الآخر فليقل...', "options": ['لا إله إلا الله', 'سبحان الله', 'الحمد لله', 'خيراً أو ليصمت'], "answer": 'خيراً أو ليصمت', "explain": 'رواه البخاري ومسلم — حثّ على صون اللسان'},
+    {"q": 'أكمل الحديث: بُني الإسلام على خمس شهادة أن لا إله إلا الله...', "options": ['وإقام الصلاة وإيتاء الزكاة وصوم رمضان وحج البيت', 'والجهاد والصبر والتوكل', 'والصلاة والزكاة والصبر والحج', 'والصوم والحج والصدق والأمانة'], "answer": 'وإقام الصلاة وإيتاء الزكاة وصوم رمضان وحج البيت', "explain": 'حديث ابن عمر رضي الله عنهما في الصحيحين'},
+    {"q": 'أكمل الآية: إن مع العسر...', "options": ['يُسرا', 'نصراً مبيناً', 'فرجاً قريباً', 'رحمةً واسعة'], "answer": 'يُسرا', "explain": 'سورة الشرح آية 6 — بُشرى بأن مع العسر يُسراً'},
+    {"q": 'أكمل الآية: وما توفيقي إلا...', "options": ['بالصبر', 'بالله', 'بالإيمان', 'من عند الله'], "answer": 'بالله', "explain": 'سورة هود آية 88 — قالها شعيب عليه السلام'},
+    {"q": 'أكمل الآية: ألا بذكر الله تطمئن...', "options": ['الأرواح', 'النفوس', 'العقول', 'القلوب'], "answer": 'القلوب', "explain": 'سورة الرعد آية 28 — من أعظم آيات القرآن'},
+    {"q": 'أكمل الآية: فإذا عزمت فتوكل على...', "options": ['الله', 'ربك وحده', 'نفسك', 'العقل والحكمة'], "answer": 'الله', "explain": 'سورة آل عمران آية 159'},
+    {"q": 'ما معنى كلمة الفلاح في القرآن؟', "options": ['الرزق الوفير', 'النجاح والفوز', 'الصبر والتحمل', 'العبادة الدائمة'], "answer": 'النجاح والفوز', "explain": 'الفلاح يعني النجاح والفوز بالجنة والنجاة من النار'},
+    {"q": 'ما معنى كلمة القنوت في القرآن؟', "options": ['الدعاء فقط', 'الصمت التام', 'الصيام', 'الطاعة والخشوع'], "answer": 'الطاعة والخشوع', "explain": 'القنوت يعني الطاعة الكاملة والخشوع لله'},
+    {"q": 'كم عدد تكبيرات صلاة الجنازة؟', "options": ['3', '4', '5', '6'], "answer": '4', "explain": 'صلاة الجنازة أربع تكبيرات بلا ركوع ولا سجود'},
+    {"q": 'ما حكم صيام يوم العيدين؟', "options": ['حرام', 'مكروه', 'جائز', 'مستحب'], "answer": 'حرام', "explain": 'نهى النبي ﷺ عن صيام يوم الفطر ويوم الأضحى'},
+    {"q": 'ما نصاب زكاة الذهب بالجرامات تقريباً؟', "options": ['50 جرام', '70 جرام', '100 جرام', '85 جرام'], "answer": '85 جرام', "explain": 'نصاب زكاة الذهب 85 جراماً إذا حال عليها الحول'},
+    {"q": 'كم مرة تُطاف الكعبة في الطواف؟', "options": ['5 أشواط', '6 أشواط', '7 أشواط', '8 أشواط'], "answer": '7 أشواط', "explain": 'الطواف حول الكعبة سبعة أشواط'},
+    {"q": 'ما الذي ينقض الوضوء باتفاق الفقهاء؟', "options": ['الضحك', 'الأكل', 'خروج الريح', 'النوم جالساً'], "answer": 'خروج الريح', "explain": 'خروج شيء من السبيلين ينقض الوضوء باتفاق'},
+    {"q": 'من هو أول خليفة في الإسلام؟', "options": ['عمر بن الخطاب', 'أبو بكر الصديق', 'علي بن أبي طالب', 'عثمان بن عفان'], "answer": 'أبو بكر الصديق', "explain": 'أبو بكر الصديق أول خليفة للمسلمين بعد وفاة النبي ﷺ'},
+    {"q": 'من هو الخليفة الذي فتح بيت المقدس؟', "options": ['أبو بكر', 'عمر بن الخطاب', 'علي', 'عثمان'], "answer": 'عمر بن الخطاب', "explain": 'فتح عمر رضي الله عنه بيت المقدس عام 637م'},
+    {"q": 'في أي عام فُتحت مكة المكرمة هجرياً؟', "options": ['6هـ', '8هـ', '7هـ', '9هـ'], "answer": '8هـ', "explain": 'فُتحت مكة في رمضان السنة الثامنة للهجرة'},
+    {"q": 'من هو أول شهيد في الإسلام؟', "options": ['سمية بنت خياط', 'ياسر بن عامر', 'عمار بن ياسر', 'بلال بن رباح'], "answer": 'سمية بنت خياط', "explain": 'سمية بنت خياط أم عمار — أول شهيدة في الإسلام'},
+    {"q": 'من هو باني الكعبة المشرفة؟', "options": ['نوح وإدريس', 'محمد ﷺ وصحابته', 'إبراهيم وإسماعيل', 'آدم وحده'], "answer": 'إبراهيم وإسماعيل', "explain": 'قال تعالى: وإذ يرفع إبراهيم القواعد من البيت وإسماعيل'},
+    {"q": 'ما لقب النبي إبراهيم عليه السلام؟', "options": ['خليل الله', 'كليم الله', 'نبي الله', 'روح الله'], "answer": 'خليل الله', "explain": 'قال تعالى: واتخذ الله إبراهيم خليلاً'},
+    {"q": 'ما لقب النبي موسى عليه السلام؟', "options": ['خليل الله', 'كليم الله', 'روح الله', 'نجي الله'], "answer": 'كليم الله', "explain": 'كلّم الله موسى تكليماً مباشراً فلُقّب بكليم الله'},
+    {"q": 'ما لقب النبي عيسى عليه السلام في القرآن؟', "options": ['روح الله وكلمته', 'كليم الله', 'صفي الله', 'خليل الله'], "answer": 'روح الله وكلمته', "explain": 'قال تعالى: إنما المسيح عيسى ابن مريم رسول الله وكلمته وروح منه'},
+    {"q": 'من هو النبي الملقب بأبي البشر؟', "options": ['إبراهيم', 'آدم', 'نوح', 'محمد ﷺ'], "answer": 'آدم', "explain": 'آدم عليه السلام أبو البشرية كلها'},
+    {"q": 'كم جزءاً في القرآن الكريم؟', "options": ['25', '30', '28', '32'], "answer": '30', "explain": 'القرآن الكريم مقسّم إلى 30 جزءاً'},
+    {"q": 'ما هي أقصر سورة في القرآن؟', "options": ['الفاتحة', 'الكوثر', 'الفلق', 'الناس'], "answer": 'الكوثر', "explain": 'سورة الكوثر أقصر سورة في القرآن بثلاث آيات فقط'},
+    {"q": 'كم مرة ذُكر اسم محمد ﷺ في القرآن؟', "options": ['4', '3', '2', '5'], "answer": '4', "explain": 'ذُكر اسم محمد ﷺ أربع مرات في القرآن الكريم'},
+    {"q": 'في أي يوم خُلق آدم عليه السلام؟', "options": ['الاثنين', 'الجمعة', 'الأربعاء', 'السبت'], "answer": 'الجمعة', "explain": 'قال النبي ﷺ: خُلق آدم يوم الجمعة'},
+    {"q": 'كم باباً للجنة؟', "options": ['9', '7', '6', '8'], "answer": '8', "explain": 'للجنة ثمانية أبواب منها باب الريّان لأهل الصيام'},
+    {"q": 'كم باباً للنار؟', "options": ['8', '6', '5', '7'], "answer": '7', "explain": 'قال تعالى: لها سبعة أبواب لكل باب منهم جزء مقسوم'},
+    {"q": 'ما هو الذكر الأثقل في الميزان؟', "options": ['لا إله إلا الله', 'الله أكبر كبيراً', 'الحمد لله رب العالمين', 'سبحان الله وبحمده سبحان الله العظيم'], "answer": 'سبحان الله وبحمده سبحان الله العظيم', "explain": 'قال النبي ﷺ: كلمتان خفيفتان على اللسان ثقيلتان في الميزان'},
+    {"q": 'من هو الملك الموكّل بالوحي؟', "options": ['ميكائيل', 'إسرافيل', 'عزرائيل', 'جبريل'], "answer": 'جبريل', "explain": 'جبريل عليه السلام هو أمين الوحي'},
+    {"q": 'ما هي السورة التي تُقرأ على المحتضر؟', "options": ['يس', 'البقرة', 'الرحمن', 'الفاتحة'], "answer": 'يس', "explain": 'قال النبي ﷺ: اقرأوا على موتاكم يس'},
+    {"q": 'في أي سنة وقعت غزوة بدر الكبرى؟', "options": ['3هـ', '1هـ', '2هـ', '4هـ'], "answer": '2هـ', "explain": 'غزوة بدر كانت في 17 رمضان السنة الثانية للهجرة'},
+    {"q": 'كم كان عدد المسلمين في غزوة بدر تقريباً؟', "options": ['100', '313', '213', '500'], "answer": '313', "explain": 'كان المسلمون 313 رجلاً في مقابل نحو 1000 من المشركين'},
+    {"q": 'من هو الصحابي الذي سمّاه النبي ﷺ حب الله ورسوله؟', "options": ['عمر', 'علي بن أبي طالب', 'أبو بكر', 'أسامة بن زيد'], "answer": 'أسامة بن زيد', "explain": 'قال النبي ﷺ لأسامة: إنك لحبي وابن حبي'},
+    {"q": 'ما اسم أول ولد وُلد للمهاجرين في المدينة؟', "options": ['عبدالله بن الزبير', 'عبدالله بن عمر', 'محمد بن علي', 'سالم بن أبي حذيفة'], "answer": 'عبدالله بن الزبير', "explain": 'كان المشركون يقولون لن يولد لهم فجاء عبدالله بن الزبير'},
+    {"q": 'كم دامت دعوة النبي ﷺ في مكة قبل الهجرة؟', "options": ['13 سنة', '10 سنوات', '8 سنوات', '15 سنة'], "answer": '13 سنة', "explain": 'مكث النبي ﷺ في مكة يدعو 13 سنة قبل الهجرة'},
+    {"q": 'ما هي السورة التي تُسمى قلب القرآن؟', "options": ['الفاتحة', 'البقرة', 'الكهف', 'يس'], "answer": 'يس', "explain": 'قال النبي ﷺ: إن لكل شيء قلباً وقلب القرآن يس'},
+    {"q": 'كم آية في سورة الفاتحة؟', "options": ['5', '6', '8', '7'], "answer": '7', "explain": 'سورة الفاتحة سبع آيات وهي السبع المثاني'},
+    {"q": 'ما هي السورة التي من قرأها حُفظ من الدجال؟', "options": ['يس', 'الكهف', 'البقرة', 'الإخلاص'], "answer": 'الكهف', "explain": 'قال النبي ﷺ: من قرأ عشر آيات من سورة الكهف عُصم من الدجال'},
+    {"q": 'كم حرفاً في البسملة؟', "options": ['17', '20', '18', '19'], "answer": '19', "explain": 'بسم الله الرحمن الرحيم تتكون من 19 حرفاً'},
+    {"q": 'ما هو آخر ما نزل من القرآن كاملاً من السور؟', "options": ['المائدة', 'النصر', 'التوبة', 'البقرة'], "answer": 'النصر', "explain": 'سورة النصر آخر ما نزل كاملاً وفيها إشارة لوفاة النبي ﷺ'},
+    {"q": 'أكمل الآية: وقل رب زدني...', "options": ['رزقاً', 'صبراً', 'هدىً', 'علماً'], "answer": 'علماً', "explain": 'سورة طه آية 114 — الدعاء بالعلم'},
+    {"q": 'أكمل الآية: حسبنا الله ونعم...', "options": ['الرحيم', 'المولى', 'الوكيل', 'الحفيظ'], "answer": 'الوكيل', "explain": 'سورة آل عمران — قالها إبراهيم حين أُلقي في النار وقالها النبي ﷺ'},
+    {"q": 'معنى كلمة التوكل في القرآن؟', "options": ['التسليم للقضاء فقط', 'ترك العمل', 'الاعتماد على الله مع الأخذ بالأسباب', 'الصبر على البلاء'], "answer": 'الاعتماد على الله مع الأخذ بالأسباب', "explain": 'التوكل هو صدق الاعتماد على الله مع بذل الأسباب'},
+    {"q": 'معنى كلمة الصراط في القرآن؟', "options": ['الجسر', 'الميزان', 'السبيل الضيق', 'الطريق'], "answer": 'الطريق', "explain": 'الصراط يعني الطريق الواضح المستقيم'},
+    {"q": 'أكمل الحديث: خير الناس أنفعهم...', "options": ['للناس', 'لأهلهم', 'لدينهم', 'لربهم'], "answer": 'للناس', "explain": 'قال النبي ﷺ: خير الناس أنفعهم للناس — رواه الطبراني'},
+    {"q": 'أكمل الحديث: الدنيا سجن المؤمن وجنة...', "options": ['العاصي', 'المنافق', 'الكافر', 'الجاحد'], "answer": 'الكافر', "explain": 'رواه مسلم — يعني المؤمن يصبر في الدنيا وينعم في الآخرة'},
+    {"q": 'أكمل الحديث: من صام رمضان إيماناً واحتساباً غُفر له...', "options": ['ذنبه كله', 'ذنوب يوم وليلة', 'كبائر ذنبه', 'ما تقدم من ذنبه'], "answer": 'ما تقدم من ذنبه', "explain": 'متفق عليه — فضل صيام رمضان'},
+    {"q": 'أكمل الحديث: تبسّمك في وجه أخيك...', "options": ['من الإحسان', 'من الإيمان', 'صدقة', 'نور'], "answer": 'صدقة', "explain": 'رواه الترمذي — حثّ على إظهار البشاشة'},
+    {"q": 'أكمل الحديث: كل ابن آدم خطّاء وخير الخطّائين...', "options": ['من استغفر', 'من تاب', 'التوّابون', 'الصابرون'], "answer": 'التوّابون', "explain": 'رواه الترمذي وابن ماجه — حثّ على التوبة'},
+    {"q": 'ما شروط قبول العبادة؟', "options": ['الإخلاص لله والمتابعة للنبي ﷺ', 'المتابعة فقط', 'النية والخشوع', 'الإخلاص فقط'], "answer": 'الإخلاص لله والمتابعة للنبي ﷺ', "explain": 'لا تُقبل العبادة إلا بشرطين: الإخلاص والمتابعة'},
+    {"q": 'ما حكم صلاة الجمعة؟', "options": ['فرض عين على الرجال', 'سنة مؤكدة', 'فرض كفاية', 'مستحبة'], "answer": 'فرض عين على الرجال', "explain": 'صلاة الجمعة فرض عين على كل مسلم بالغ حر مقيم'},
+    {"q": 'ما هي أركان الصلاة؟', "options": ['النية والتكبير فقط', 'القيام والركوع والسجود فقط', 'خمسة أركان فقط', 'النية والتكبير والقراءة والركوع والسجود والتشهد والتسليم'], "answer": 'النية والتكبير والقراءة والركوع والسجود والتشهد والتسليم', "explain": 'أركان الصلاة سبعة وبدونها لا تصح'},
+    {"q": 'ما الفرق بين الركن والواجب في الصلاة؟', "options": ['الركن يُقضى والواجب لا', 'لا فرق', 'الواجب أهم من الركن', 'ترك الركن يُبطل الصلاة وترك الواجب يُوجب سجود السهو'], "answer": 'ترك الركن يُبطل الصلاة وترك الواجب يُوجب سجود السهو', "explain": 'الركن لا تصح الصلاة بدونه والواجب يُجبر بسجود السهو'},
+    {"q": 'ما هي النجاسة التي لا تطهر بالغسل؟', "options": ['الكلب في الملاقاة', 'البول', 'الدم', 'المني'], "answer": 'الكلب في الملاقاة', "explain": 'يُغسل الإناء من ولوغ الكلب سبعاً إحداهن بالتراب'},
+    {"q": 'من هو المعروف بـ ذي القرنين في التاريخ الإسلامي؟', "options": ['الإسكندر المقدوني', 'رجل صالح ذكره القرآن', 'نبي من الأنبياء', 'كورش الكبير'], "answer": 'رجل صالح ذكره القرآن', "explain": 'ذو القرنين مذكور في سورة الكهف وهو رجل صالح ملّكه الله في الأرض'},
+    {"q": 'ما هي أول دولة إسلامية تعترف بالإسلام رسمياً؟', "options": ['فارس', 'الروم', 'الحبشة', 'اليمن'], "answer": 'الحبشة', "explain": 'آوى النجاشي ملك الحبشة المسلمين وعدل بينهم واعترف بالإسلام'},
+    {"q": 'من أول من هاجر إلى الحبشة؟', "options": ['عثمان بن عفان', 'جعفر بن أبي طالب', 'الزبير بن العوام', 'عبدالرحمن بن عوف'], "answer": 'عثمان بن عفان', "explain": 'هاجر عثمان وزوجته رقية بنت النبي ﷺ في أول هجرة للحبشة'},
+    {"q": 'ما اسم قائد جيش المسلمين في معركة اليرموك؟', "options": ['سعد بن أبي وقاص', 'عمرو بن العاص', 'خالد بن الوليد', 'أبو عبيدة بن الجراح'], "answer": 'خالد بن الوليد', "explain": 'قاد خالد بن الوليد المسلمين في معركة اليرموك الفاصلة'},
+    {"q": 'كم سنة كان يوسف عليه السلام في السجن؟', "options": ['3 سنوات', '10 سنوات', '5 سنوات', '7 سنوات'], "answer": '7 سنوات', "explain": 'قيل إن يوسف مكث في السجن سبع سنوات بعد إغواء امرأة العزيز'},
+    {"q": 'ما هو المعجزة الكبرى التي أُعطيها موسى عليه السلام؟', "options": ['إحياء الموتى', 'شفاء الأكمه', 'العصا التي تنقلب حية', 'الكلام مع الله مباشرة'], "answer": 'العصا التي تنقلب حية', "explain": 'من أعظم معجزات موسى العصا التي تنقلب ثعباناً وتلقف سحر السحرة'},
+    {"q": 'ما هو الجبل الذي كلّم الله عليه موسى؟', "options": ['جبل الطور', 'جبل حراء', 'جبل عرفات', 'جبل أُحد'], "answer": 'جبل الطور', "explain": 'قال تعالى: وناديناه من جانب الطور الأيمن — على جبل الطور'},
+    {"q": 'من هو النبي الذي أُوتي الزبور؟', "options": ['إبراهيم', 'موسى', 'سليمان', 'داود'], "answer": 'داود', "explain": 'قال تعالى: وآتينا داود زبوراً'},
+    {"q": 'كم نبياً ذُكر في سورة الأنبياء؟', "options": ['16', '14', '18', '10'], "answer": '16', "explain": 'ذُكر في سورة الأنبياء ستة عشر نبياً من الأنبياء الكرام'},
+    {"q": 'ما هو الدعاء المستجاب بين الأذان والإقامة؟', "options": ['الدعاء في هذا الوقت لا يُرد', 'اللهم رب هذه الدعوة التامة', 'لا إله إلا الله وحده', 'ربنا لك الحمد'], "answer": 'الدعاء في هذا الوقت لا يُرد', "explain": 'قال النبي ﷺ: الدعاء لا يُرد بين الأذان والإقامة'},
+    {"q": 'ما هي ليلة القدر؟', "options": ['ليلة 27 رمضان فقط', 'إحدى ليالي العشر الأخيرة من رمضان', 'أول ليلة رمضان', 'ليلة النصف من شعبان'], "answer": 'إحدى ليالي العشر الأخيرة من رمضان', "explain": 'قال النبي ﷺ: التمسوا ليلة القدر في العشر الأواخر من رمضان'},
+    {"q": 'ما هو أفضل الذكر؟', "options": ['الحمد لله', 'لا إله إلا الله', 'سبحان الله', 'الله أكبر'], "answer": 'لا إله إلا الله', "explain": 'قال النبي ﷺ: أفضل الذكر لا إله إلا الله'},
+    {"q": 'كم عدد الصلوات المفروضة في اليوم؟', "options": ['6', '4', '3', '5'], "answer": '5', "explain": 'فُرضت خمس صلوات ليلة المعراج وهي الفريضة اليومية'},
+    {"q": 'ما هو الوضوء الكامل كم مرة لكل عضو؟', "options": ['ثلاث مرات', 'مرة واحدة', 'مرتان', 'حسب العضو'], "answer": 'ثلاث مرات', "explain": 'السنة غسل كل عضو ثلاث مرات والواجب مرة واحدة'},
+    {"q": 'ما هو اسم صلاة الاستسقاء؟', "options": ['صلاة طلب المطر', 'صلاة الحاجة', 'صلاة الاستخارة', 'صلاة التهجد'], "answer": 'صلاة طلب المطر', "explain": 'صلاة الاستسقاء صلاة مشروعة لطلب المطر من الله'},
+    {"q": 'ما هو الفرق بين النبي والرسول؟', "options": ['لا فرق بينهما', 'الرسول بشر فقط والنبي قد يكون ملكاً', 'الرسول أُوحي إليه بشريعة جديدة والنبي يتبع شريعة من قبله', 'النبي أفضل من الرسول'], "answer": 'الرسول أُوحي إليه بشريعة جديدة والنبي يتبع شريعة من قبله', "explain": 'الرسول أُرسل بشريعة جديدة وكتاب، والنبي يُبلّغ شريعة من قبله'},
+]
+
+DAILY_DUAA = [
+    {"text": "رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الْآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ", "source": "القرآن الكريم — البقرة 201", "meaning": "دعاء جامع لخيري الدنيا والآخرة"},
+    {"text": "اللَّهُمَّ إِنِّي أَعُوذُ بِكَ مِنَ الْهَمِّ وَالْحَزَنِ، وَالْعَجْزِ وَالْكَسَلِ، وَالْبُخْلِ وَالْجُبْنِ، وَضَلَعِ الدَّيْنِ وَغَلَبَةِ الرِّجَالِ", "source": "صحيح البخاري", "meaning": "دعاء النبي ﷺ للاستعاذة من آفات النفس"},
+    {"text": "رَبِّ اشْرَحْ لِي صَدْرِي وَيَسِّرْ لِي أَمْرِي وَاحْلُلْ عُقْدَةً مِّن لِّسَانِي يَفْقَهُوا قَوْلِي", "source": "القرآن الكريم — طه 25-28", "meaning": "دعاء موسى عليه السلام بالتوفيق والبيان"},
+    {"text": "اللَّهُمَّ أَصْلِحْ لِي دِينِي الَّذِي هُوَ عِصْمَةُ أَمْرِي، وَأَصْلِحْ لِي دُنْيَايَ الَّتِي فِيهَا مَعَاشِي، وَأَصْلِحْ لِي آخِرَتِي الَّتِي فِيهَا مَعَادِي", "source": "صحيح مسلم", "meaning": "دعاء جامع لإصلاح الدين والدنيا والآخرة"},
+    {"text": "رَبَّنَا لَا تُزِغْ قُلُوبَنَا بَعْدَ إِذْ هَدَيْتَنَا وَهَبْ لَنَا مِن لَّدُنكَ رَحْمَةً إِنَّكَ أَنتَ الْوَهَّابُ", "source": "القرآن الكريم — آل عمران 8", "meaning": "دعاء الثبات على الهداية"},
+    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْعَفْوَ وَالْعَافِيَةَ فِي الدُّنْيَا وَالْآخِرَةِ", "source": "سنن أبي داود وابن ماجه — صحيح", "meaning": "من أجمع الأدعية وأحبها إلى النبي ﷺ"},
+    {"text": "رَبِّ إِنِّي لِمَا أَنزَلْتَ إِلَيَّ مِنْ خَيْرٍ فَقِيرٌ", "source": "القرآن الكريم — القصص 24", "meaning": "دعاء موسى عليه السلام بالافتقار إلى الله"},
+    {"text": "اللَّهُمَّ اغْفِرْ لِي وَارْحَمْنِي وَاهْدِنِي وَعَافِنِي وَارْزُقْنِي", "source": "صحيح مسلم", "meaning": "دعاء جامع علّمه النبي ﷺ"},
+    {"text": "لَا إِلَهَ إِلَّا أَنتَ سُبْحَانَكَ إِنِّي كُنتُ مِنَ الظَّالِمِينَ", "source": "القرآن الكريم — الأنبياء 87", "meaning": "دعاء يونس عليه السلام في بطن الحوت"},
+    {"text": "اللَّهُمَّ أَعِنِّي عَلَى ذِكْرِكَ وَشُكْرِكَ وَحُسْنِ عِبَادَتِكَ", "source": "سنن أبي داود — صحيح", "meaning": "دعاء علّمه النبي ﷺ لمعاذ بن جبل"},
+    {"text": "رَبَّنَا ظَلَمْنَا أَنفُسَنَا وَإِن لَّمْ تَغْفِرْ لَنَا وَتَرْحَمْنَا لَنَكُونَنَّ مِنَ الْخَاسِرِينَ", "source": "القرآن الكريم — الأعراف 23", "meaning": "دعاء آدم وحواء عليهما السلام بالتوبة"},
+    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ عِلْمًا نَافِعًا وَرِزْقًا طَيِّبًا وَعَمَلًا مُتَقَبَّلًا", "source": "سنن ابن ماجه — صحيح", "meaning": "دعاء الصباح النبوي"},
+    {"text": "حَسْبِيَ اللَّهُ لَا إِلَهَ إِلَّا هُوَ عَلَيْهِ تَوَكَّلْتُ وَهُوَ رَبُّ الْعَرْشِ الْعَظِيمِ", "source": "القرآن الكريم — التوبة 129", "meaning": "دعاء التوكل على الله"},
+    {"text": "اللَّهُمَّ إِنِّي أَعُوذُ بِكَ مِنْ عِلْمٍ لَا يَنْفَعُ وَمِنْ قَلْبٍ لَا يَخْشَعُ وَمِنْ نَفْسٍ لَا تَشْبَعُ وَمِنْ دَعْوَةٍ لَا يُسْتَجَابُ لَهَا", "source": "صحيح مسلم", "meaning": "دعاء النبي ﷺ من أربع آفات"},
+    {"text": "رَبِّ زِدْنِي عِلْمًا", "source": "القرآن الكريم — طه 114", "meaning": "أمر الله نبيه بطلب الزيادة من العلم"},
+    {"text": "اللَّهُمَّ أَلِّفْ بَيْنَ قُلُوبِنَا وَأَصْلِحْ ذَاتَ بَيْنِنَا وَاهْدِنَا سُبُلَ السَّلَامِ", "source": "مسند أحمد وسنن أبي داود — صحيح", "meaning": "دعاء الأُلفة والمحبة بين المسلمين"},
+    {"text": "رَبَّنَا هَبْ لَنَا مِنْ أَزْوَاجِنَا وَذُرِّيَّاتِنَا قُرَّةَ أَعْيُنٍ وَاجْعَلْنَا لِلْمُتَّقِينَ إِمَامًا", "source": "القرآن الكريم — الفرقان 74", "meaning": "دعاء عباد الرحمن للذرية الصالحة"},
+    {"text": "اللَّهُمَّ اجْعَلْ فِي قَلْبِي نُورًا وَفِي لِسَانِي نُورًا وَفِي سَمْعِي نُورًا وَفِي بَصَرِي نُورًا", "source": "صحيح البخاري", "meaning": "دعاء النور الشامل من هدي النبي ﷺ"},
+    {"text": "رَبَّنَا اغْفِرْ لَنَا وَلِإِخْوَانِنَا الَّذِينَ سَبَقُونَا بِالْإِيمَانِ", "source": "القرآن الكريم — الحشر 10", "meaning": "دعاء المؤمنين لمن سبقهم بالإيمان"},
+    {"text": "اللَّهُمَّ إِنَّكَ عَفُوٌّ تُحِبُّ الْعَفْوَ فَاعْفُ عَنِّي", "source": "سنن الترمذي — صحيح", "meaning": "دعاء ليلة القدر علّمه النبي ﷺ لعائشة"},
+    {"text": "رَبِّ أَوْزِعْنِي أَنْ أَشْكُرَ نِعْمَتَكَ الَّتِي أَنْعَمْتَ عَلَيَّ وَعَلَى وَالِدَيَّ وَأَنْ أَعْمَلَ صَالِحًا تَرْضَاهُ", "source": "القرآن الكريم — الأحقاف 15", "meaning": "دعاء المؤمن بالشكر على النعم وصلاح العمل"},
+    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْجَنَّةَ وَأَعُوذُ بِكَ مِنَ النَّارِ", "source": "سنن أبي داود — صحيح", "meaning": "من أبسط وأعظم الأدعية"},
+    {"text": "سُبْحَانَكَ اللَّهُمَّ وَبِحَمْدِكَ أَشْهَدُ أَنْ لَا إِلَهَ إِلَّا أَنتَ أَسْتَغْفِرُكَ وَأَتُوبُ إِلَيْكَ", "source": "سنن الترمذي — صحيح", "meaning": "كفارة المجلس"},
+    {"text": "رَبِّ اجْعَلْنِي مُقِيمَ الصَّلَاةِ وَمِن ذُرِّيَّتِي رَبَّنَا وَتَقَبَّلْ دُعَاءِ", "source": "القرآن الكريم — إبراهيم 40", "meaning": "دعاء إبراهيم عليه السلام بإقامة الصلاة"},
+    {"text": "اللَّهُمَّ آتِ نَفْسِي تَقْوَاهَا وَزَكِّهَا أَنتَ خَيْرُ مَن زَكَّاهَا أَنتَ وَلِيُّهَا وَمَوْلَاهَا", "source": "صحيح مسلم", "meaning": "دعاء تزكية النفس"},
+    {"text": "رَبَّنَا أَفْرِغْ عَلَيْنَا صَبْرًا وَثَبِّتْ أَقْدَامَنَا وَانصُرْنَا عَلَى الْقَوْمِ الْكَافِرِينَ", "source": "القرآن الكريم — البقرة 250", "meaning": "دعاء الثبات والنصر"},
+    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ حُبَّكَ وَحُبَّ مَن يُحِبُّكَ وَحُبَّ عَمَلٍ يُقَرِّبُنِي إِلَى حُبِّكَ", "source": "سنن الترمذي — حسن", "meaning": "دعاء طلب محبة الله"},
+    {"text": "رَبَّنَا لَا تُؤَاخِذْنَا إِن نَّسِينَا أَوْ أَخْطَأْنَا", "source": "القرآن الكريم — البقرة 286", "meaning": "من آخر البقرة التي أجاب الله كل دعاء فيها بنعم"},
+    {"text": "اللَّهُمَّ اهْدِنِي وَسَدِّدْنِي", "source": "صحيح مسلم", "meaning": "دعاء الهداية والسداد علّمه النبي ﷺ لعلي"},
+    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ الثَّبَاتَ فِي الْأَمْرِ، وَأَسْأَلُكَ عَزِيمَةَ الرُّشْدِ، وَأَسْأَلُكَ شُكْرَ نِعْمَتِكَ، وَحُسْنَ عِبَادَتِكَ", "source": "سنن النسائي — صحيح", "meaning": "دعاء جامع للثبات والرشد والشكر"},
+    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْهُدَى وَالتُّقَى وَالْعَفَافَ وَالْغِنَى", "source": "صحيح مسلم", "meaning": "أربع خصال جمع فيها النبي ﷺ خير الدنيا والآخرة"},
+    {"text": "اللَّهُمَّ مُصَرِّفَ الْقُلُوبِ صَرِّفْ قُلُوبَنَا عَلَى طَاعَتِكَ", "source": "صحيح مسلم", "meaning": "دعاء تثبيت القلب على الطاعة"},
+    {"text": "رَبَّنَا اصْرِفْ عَنَّا عَذَابَ جَهَنَّمَ إِنَّ عَذَابَهَا كَانَ غَرَامًا", "source": "القرآن الكريم — الفرقان 65", "meaning": "دعاء عباد الرحمن للنجاة من عذاب جهنم"},
+    {"text": "اللَّهُمَّ أَحْسِنْ عَاقِبَتَنَا فِي الْأُمُورِ كُلِّهَا، وَأَجِرْنَا مِنْ خِزْيِ الدُّنْيَا وَعَذَابِ الْآخِرَةِ", "source": "المعجم الكبير للطبراني — صحيح", "meaning": "دعاء حسن الخاتمة والنجاة"},
+    {"text": "يَا مُقَلِّبَ الْقُلُوبِ ثَبِّتْ قَلْبِي عَلَى دِينِكَ", "source": "سنن الترمذي — صحيح", "meaning": "كان النبي ﷺ يكثر من هذا الدعاء"},
+    {"text": "اللَّهُمَّ إِنِّي أَعُوذُ بِرِضَاكَ مِنْ سَخَطِكَ، وَبِمُعَافَاتِكَ مِنْ عُقُوبَتِكَ، وَأَعُوذُ بِكَ مِنْكَ", "source": "صحيح مسلم", "meaning": "من دعاء النبي ﷺ في سجوده"},
+    {"text": "رَبَّنَا آمَنَّا فَاغْفِرْ لَنَا وَارْحَمْنَا وَأَنتَ خَيْرُ الرَّاحِمِينَ", "source": "القرآن الكريم — المؤمنون 109", "meaning": "دعاء المؤمنين طالبين المغفرة والرحمة"},
+    {"text": "اللَّهُمَّ اجْعَلْنِي صَبُورًا وَاجْعَلْنِي شَكُورًا وَاجْعَلْنِي فِي عَيْنِي صَغِيرًا وَفِي أَعْيُنِ النَّاسِ كَبِيرًا", "source": "المستدرك للحاكم — صحيح", "meaning": "دعاء التواضع وحسن السيرة"},
+    {"text": "رَبِّ هَبْ لِي حُكْمًا وَأَلْحِقْنِي بِالصَّالِحِينَ", "source": "القرآن الكريم — الشعراء 83", "meaning": "دعاء إبراهيم عليه السلام بالحكمة والصلاح"},
+    {"text": "اللَّهُمَّ اجْعَلْ أَوَّلَ هَذَا النَّهَارِ صَلَاحًا وَأَوْسَطَهُ فَلَاحًا وَآخِرَهُ نَجَاحًا", "source": "سنن أبي داود — حسن", "meaning": "دعاء بركة اليوم من أوله لآخره"},
+    {"text": "رَبَّنَا اغْفِرْ لِي وَلِوَالِدَيَّ وَلِلْمُؤْمِنِينَ يَوْمَ يَقُومُ الْحِسَابُ", "source": "القرآن الكريم — إبراهيم 41", "meaning": "دعاء إبراهيم عليه السلام للمغفرة يوم القيامة"},
+    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ فِعْلَ الْخَيْرَاتِ وَتَرْكَ الْمُنْكَرَاتِ وَحُبَّ الْمَسَاكِينِ", "source": "سنن الترمذي — صحيح", "meaning": "من دعاء الإسراء، طلب فعل الخيرات وحب الفقراء"},
+    {"text": "رَبَّنَا لَا تَجْعَلْنَا فِتْنَةً لِّلْقَوْمِ الظَّالِمِينَ وَنَجِّنَا بِرَحْمَتِكَ مِنَ الْقَوْمِ الْكَافِرِينَ", "source": "القرآن الكريم — يونس 85-86", "meaning": "دعاء المؤمنين مع موسى عليه السلام"},
+    {"text": "اللَّهُمَّ أَنْتَ رَبِّي لَا إِلَهَ إِلَّا أَنْتَ خَلَقْتَنِي وَأَنَا عَبْدُكَ وَأَنَا عَلَى عَهْدِكَ وَوَعْدِكَ مَا اسْتَطَعْتُ", "source": "صحيح البخاري", "meaning": "سيد الاستغفار — من قاله موقناً فمات دخل الجنة"},
+    {"text": "رَبَّنَا آتِنَا مِن لَّدُنكَ رَحْمَةً وَهَيِّئْ لَنَا مِنْ أَمْرِنَا رَشَدًا", "source": "القرآن الكريم — الكهف 10", "meaning": "دعاء أصحاب الكهف بالرحمة والهداية"},
+    {"text": "اللَّهُمَّ إِنِّي أَعُوذُ بِكَ مِنَ الْفَقْرِ وَالْقِلَّةِ وَالذِّلَّةِ وَأَعُوذُ بِكَ مِنْ أَنْ أَظْلِمَ أَوْ أُظْلَمَ", "source": "سنن أبي داود — صحيح", "meaning": "الاستعاذة من الفقر والظلم"},
+    {"text": "رَبِّ أَعُوذُ بِكَ مِنْ هَمَزَاتِ الشَّيَاطِينِ وَأَعُوذُ بِكَ رَبِّ أَن يَحْضُرُونِ", "source": "القرآن الكريم — المؤمنون 97-98", "meaning": "الاستعاذة من وساوس الشياطين"},
+    {"text": "اللَّهُمَّ أَصْلِحْ لِي دِينِي وَوَسِّعْ لِي فِي دَارِي وَبَارِكْ لِي فِيمَا رَزَقْتَنِي", "source": "المستدرك للحاكم — صحيح", "meaning": "دعاء جامع لصلاح الدين والرزق والمسكن"},
+    {"text": "رَبَّنَا اكْشِفْ عَنَّا الْعَذَابَ إِنَّا مُؤْمِنُونَ", "source": "القرآن الكريم — الدخان 12", "meaning": "دعاء رفع البلاء والعذاب"},
+    {"text": "رَبِّ أَدْخِلْنِي مُدْخَلَ صِدْقٍ وَأَخْرِجْنِي مُخْرَجَ صِدْقٍ وَاجْعَل لِّي مِن لَّدُنكَ سُلْطَانًا نَّصِيرًا", "source": "القرآن الكريم — الإسراء 80", "meaning": "دعاء الصدق في الأمور كلها"},
+]
+
+def get_duaa_of_day() -> dict:
+    """ارجع دعاء اليوم بناءً على رقم اليوم في السنة"""
+    day_num = _dt.datetime.now(AMMAN_TZ).timetuple().tm_yday
+    return DAILY_DUAA[day_num % len(DAILY_DUAA)]
+
+
+DAILY_TOPICS = [
+    "الصبر", "الصدق", "الأمانة", "الدعاء", "التوبة",
+    "الصلاة", "الزكاة", "الرحمة", "الأخلاق", "العلم",
+    "الجنة", "الجهاد", "الذكر", "الشكر", "البر",
+]
+
+MOOD_TOPICS = {
+    "happy":   ["الشكر", "الحمد", "النعمة"],
+    "tired":   ["الصبر", "الراحة", "الرحمة"],
+    "angry":   ["الغضب", "الحلم", "العفو"],
+}
+
+async def send_mood_hadith(user_id: int, mood: str, context) -> str:
+    topics = MOOD_TOPICS.get(mood, ["الصبر"])
+    topic = _random.choice(topics)
+    try:
+        results = await search_dorar_api(topic)
+        if results:
+            h = _random.choice(results[:10])
+            return (
+                f"📖 *حديث على قدك*\n"
+                f"━━━━━━━━━━━━━━━\n\n"
+                f"📌 {h['text']}\n\n"
+                f"👤 *الراوي:* {h.get('rawi') or 'غير محدد'}\n"
+                f"📚 *المصدر:* {h.get('source') or 'غير محدد'}\n"
+                f"⚖️ *الدرجة:* {h.get('grade') or 'غير محدد'}"
+            )
+    except:
+        pass
+    return "⚠️ ما قدرت أجيب حديثاً الآن، حاول مرة ثانية."
+
+# ==================== صديقي الروحي (Tier 3) ====================
+SPIRITUAL_KEYWORDS = {
+    "الصبر": "الصبر والشدة",
+    "الحزن": "الصبر والشدة",
+    "الضيق": "الصبر والشدة",
+    "الدعاء": "الدعاء والتضرع",
+    "الرزق": "الرزق والتوكل",
+    "الأسرة": "الأسرة والوالدين",
+    "الوالدين": "الأسرة والوالدين",
+    "التوبة": "التوبة والاستغفار",
+    "الاستغفار": "التوبة والاستغفار",
+    "الصلاة": "الصلاة",
+    "الأخلاق": "الأخلاق والمعاملة",
+    "العلم": "العلم والتعلم",
+    "الجنة": "الآخرة والجنة",
+    "الموت": "الآخرة والجنة",
+}
+
+MOOD_MESSAGES = {
+    "الصبر والشدة": "يبدو إنك تمر بوقت صعب 🤍 هذه الأحاديث قد تعينك",
+    "الدعاء والتضرع": "يظهر إنك تبحث عن القرب من الله 🤲 هذه الأحاديث لك",
+    "الرزق والتوكل": "في أمور الرزق توكّل على الله 🌿 هذه الأحاديث تذكّرك",
+    "الأسرة والوالدين": "العائلة تهمك كثيراً 🏠 هذه الأحاديث تقربك منهم",
+    "التوبة والاستغفار": "باب التوبة مفتوح دائماً 🌸 هذه الأحاديث تبشّرك",
+    "الصلاة": "الصلاة عماد الدين 🕌 هذه الأحاديث تذكّرك بفضلها",
+    "الأخلاق والمعاملة": "الأخلاق الحسنة من أثقل الموازين ⚖️ هذه الأحاديث لك",
+    "العلم والتعلم": "طلب العلم عبادة 📖 هذه الأحاديث تشجّعك",
+    "الآخرة والجنة": "ذكر الآخرة يهوّن الدنيا 🌟 هذه الأحاديث تذكّرك",
+}
+
+
+
+async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id in ADMIN_IDS and context.user_data.get("broadcast"):
+        context.user_data.pop("broadcast", None)
+        context.user_data.pop("broadcast_type", None)
+        await update.message.reply_text("✅ تم إلغاء الإشعار.", reply_markup=admin_main_keyboard())
+        return True
+    return False
+
+# ==================== معالجات الدعم (التبرع) ====================
+async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إظهار خيارات التبرع"""
+    await update.message.reply_text(
+        "💰 دعم بوت راوِي\n\n"
+        "يمكنك دعم البوت عن طريق التبرع بالنجوم (Telegram Stars).\n"
+        "اختر المبلغ الذي تريد التبرع به:",
+        reply_markup=donation_keyboard()
+    )
+
+async def handle_donation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة اختيار المبلغ وإرسال الفاتورة"""
+    text = update.message.text
+    amount_map = {
+        "⭐ 1 نجمة": 1,
+        "⭐ 5 نجوم": 5,
+        "⭐ 10 نجوم": 10,
+        "⭐ 25 نجمة": 25,
+        "⭐ 50 نجمة": 50,
+    }
+    if text not in amount_map:
+        return False
+
+    amount = amount_map[text]
+    title = "دعم بوت راوِي"
+    description = f"تبرع بمبلغ {amount} نجمة لدعم استمرارية البوت وتطويره. شكراً لك!"
+    payload = f"donation_{amount}"
+    currency = "XTR"
+    # ✅ التصحيح: استخدام LabeledPrice بدلاً من tuple
+    prices = [LabeledPrice(f"{amount} نجمة", amount)]
+
+    await context.bot.send_invoice(
+        chat_id=update.effective_chat.id,
+        title=title,
+        description=description,
+        payload=payload,
+        provider_token="",
+        currency=currency,
+        prices=prices
+    )
+    return True
+
+async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """التحقق من عملية الدفع (يتم قبولها دائماً)"""
+    query = update.pre_checkout_query
+    await query.answer(ok=True)
+
+def get_tier(user_id: int) -> int:
+    """مستوى المستخدم — الكل مجاني"""
+    return 0
+
+def get_tier_label(tier: int) -> str:
+    return "👤 مستخدم"
+
+def get_tier_features(tier: int) -> str:
+    return "✅ جميع الميزات متاحة للجميع"
+
+def has_favorites(user_id: int) -> bool:
+    """هل للمستخدم مفضلة — متاح للجميع"""
+    return True
+
+def has_topics(user_id: int) -> bool:
+    """بحث بالموضوع — متاح للجميع"""
+    return True
+
+def activate_premium(user_id: int, amount: int):
+    """تسجيل الدعم — بدون tier"""
+    pass
+
+def get_premium_stars(user_id: int) -> int:
+    """إجمالي النجوم المتبرع بها"""
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            row = conn.execute(
+                "SELECT SUM(amount) FROM donations WHERE user_id=?", (user_id,)
+            ).fetchone()
+        return row[0] or 0 if row else 0
+    except Exception:
+        return 0
+
+def accept_duel(duel_id: int) -> bool:
+    """قبول تحدي — stub"""
+    return False
+
+def refund_star_payment(user_id: int, charge_id: str, amount: int):
+    """استرداد نجوم — stub"""
+    pass
+
+
+TIER1_STARS = 1
+TIER2_STARS = 5
+TIER3_STARS = 25
+
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالجة الدفع الناجح مع حفظ charge_id"""
+    payment = update.message.successful_payment
+    amount = payment.total_amount
+    charge_id = payment.telegram_payment_charge_id
+    user_id = update.effective_user.id
+    payload = payment.invoice_payload
+
+    # لو كان دفع أسئلة إضافية
+    if payload.startswith("qa_extra_"):
+        log_donation(user_id, amount, charge_id)
+        add_qa_extra(user_id, QA_EXTRA_BONUS)
+        _, remaining, _ = can_ask_question(user_id)
+        # إشعار الأدمن
+        username = update.effective_user.username or "لا يوجد"
+        full_name = update.effective_user.full_name
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"❓ *شراء أسئلة دينية*\n"
+                    f"👤 {full_name} (@{username}) — ID: {user_id}\n"
+                    f"⭐ {amount} نجمة مقابل {QA_EXTRA_BONUS} أسئلة إضافية",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        await update.message.reply_text(
+            f"✅ *شكراً! تم إضافة {QA_EXTRA_BONUS} أسئلة*\n\n"
+            f"📊 رصيدك الآن: *{remaining} سؤال* متاح اليوم\n\n"
+            "اضغط ❓ سؤال ديني للبدء 👇",
+            parse_mode="Markdown"
+        )
+        return
+    username = update.effective_user.username or "لا يوجد"
+    full_name = update.effective_user.full_name
+
+    # تسجيل التبرع في قاعدة البيانات مع charge_id
+    log_donation(user_id, amount, charge_id)
+
+    # إشعار المشرفين
+    admin_msg = (
+        f"💰 *تبرع جديد*\n"
+        f"👤 المستخدم: {full_name} (@{username}) (ID: {user_id})\n"
+        f"⭐ المبلغ: {amount} نجمة\n"
+        f"🆔 معرف المعاملة: {charge_id}\n"
+        f"📅 التاريخ: {_dt.datetime.now(AMMAN_TZ).strftime('%Y-%m-%d %H:%M:%S')}"
+    )
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(admin_id, admin_msg)
+        except:
+            pass
+
+    # حدّث بيانات الداعم
+    activate_premium(user_id, amount)
+    total_stars = get_premium_stars(user_id)
+    tier = get_tier(user_id)
+    tier_label = get_tier_label(tier)
+    features = get_tier_features(tier)
+
+    new_features = ""
+    if tier == 1 and total_stars - amount < TIER1_STARS:
+        new_features = "\n🎉 *تم فتح مزايا جديدة:*\n✅ 🔎 بحث بالموضوع\n"
+    elif tier == 2 and total_stars - amount < TIER2_STARS:
+        new_features = "\n🎉 *تم فتح مزايا جديدة:*\n✅ 💾 المفضلة\n"
+    elif tier == 3 and total_stars - amount < TIER3_STARS:
+        new_features = "\n🎉 *تم فتح جميع المزايا:*\n✅ 🕐 تخصيص وقت الإشعار\n"
+
+    await update.message.reply_text(
+        f"✅ شكراً جزيلاً على دعمك!\n"
+        f"تبرعت بـ {amount} نجمة | إجمالي: {total_stars} نجمة\n\n"
+        f"{tier_label}\n"
+        f"{new_features}\n"
+        f"{features}\n"
+        f"جزاك الله خيراً 🤍",
+        parse_mode="Markdown"
+    )
+
+# ==================== أمر استرداد النجوم ====================
+async def refund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أمر استرداد النجوم (للمشرفين فقط)"""
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ هذا الأمر للمشرفين فقط.")
+        return
+
+    if context.user_data.get("awaiting_refund"):
+        # المستخدم في حالة انتظار إدخال بيانات الاسترداد
+        try:
+            parts = update.message.text.strip().split()
+            if len(parts) != 2:
+                await update.message.reply_text("⚠️ الصيغة غير صحيحة. أرسل معرف المستخدم ثم معرف المعاملة مفصولين بمسافة.")
+                return
+
+            user_id = int(parts[0])
+            charge_id = parts[1]
+
+            # التحقق من وجود التبرع
+            donation = get_donation(user_id, charge_id)
+            if not donation:
+                await update.message.reply_text("⚠️ لم يتم العثور على تبرع بهذه البيانات.")
+                context.user_data.pop("awaiting_refund", None)
+                return
+
+            # محاولة استرداد المبلغ
+            try:
+                await context.bot.refund_star_payment(
+                    user_id=user_id,
+                    telegram_payment_charge_id=charge_id
+                )
+                await update.message.reply_text(f"✅ تم استرداد {donation[0]} نجمة للمستخدم {user_id} بنجاح.")
+            except Exception as e:
+                await update.message.reply_text(f"❌ فشل الاسترداد: {e}")
+
+            context.user_data.pop("awaiting_refund", None)
+        except Exception as e:
+            await update.message.reply_text(f"❌ خطأ: {e}")
+            context.user_data.pop("awaiting_refund", None)
+    else:
+        # أول مرة: نطلب إدخال البيانات
+        context.user_data["awaiting_refund"] = True
+        await update.message.reply_text(
+            "💰 *استرداد نجوم*\n\n"
+            "أرسل معرف المستخدم ثم معرف المعاملة مفصولين بمسافة.\n"
+            "مثال: `123456789 donation_5_abc123`\n"
+            "يمكنك العثور على معرف المعاملة في إشعار التبرع الذي وصلك."
+        )
+
+# ==================== المعالجات ====================
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    register_user(user.id, user.username or "", user.full_name)
+
+    # deep links
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("duel_"):
+            try:
+                challenger_id = int(arg.split("_")[1])
+                if challenger_id == user.id:
+                    await update.message.reply_text("❌ ما تقدر تتحدى نفسك 😄")
+                else:
+                    duel_id = 0  # duel removed
+                    if duel_id == -1:
+                        await update.message.reply_text("⚠️ يوجد تحدٍ نشط بينكما مسبقاً!")
+                    else:
+                        accept_duel(duel_id)
+                        conn = sqlite3.connect("bot.db")
+                        cur = conn.cursor()
+                        cur.execute("SELECT full_name FROM users WHERE user_id=?", (challenger_id,))
+                        row = cur.fetchone()
+                        conn.close()
+                        name = row[0] if row else "شخص ما"
+                        try:
+                            await context.bot.send_message(challenger_id,
+                                f"⚔️ {user.full_name} قبل تحديك! 🔥 التحدي بدأ!")
+                        except:
+                            pass
+                        await update.message.reply_text(
+                            f"⚔️ التحدي بدأ مع {name}!\n"
+                            "اضغط ✅ قرأت على حديث اليوم يومياً\n"
+                            "استخدم /duel لمتابعة التحدي."
+                        )
+            except:
+                pass
+            return
+        elif arg.startswith("fc_"):
+            # تحدي صديق — الخصم يفتح الرابط
+            challenge_id = arg[3:]
+            ch = get_friend_challenge(challenge_id)
+            if not ch:
+                await update.message.reply_text("⚠️ هذا التحدي غير موجود أو انتهت صلاحيته.")
+                return
+            if ch["status"] == "finished":
+                await update.message.reply_text("⚠️ هذا التحدي انتهى بالفعل.")
+                return
+            if ch["creator_id"] == user.id:
+                await update.message.reply_text("😄 ما تقدر تتحدى نفسك!")
+                return
+            if ch["opponent_score"] >= 0:
+                await update.message.reply_text("⚠️ التحدي مشغول بلاعب آخر!")
+                return
+            # ابدأ التحدي للخصم
+            context.user_data["fc_id"] = challenge_id
+            context.user_data["fc_role"] = "opponent"
+            context.user_data["fc_index"] = 0
+            context.user_data["fc_score"] = 0
+            context.user_data["fc_questions"] = ch["questions"]
+            try:
+                await context.bot.send_message(
+                    ch["creator_id"],
+                    f"🎯 *{user.full_name}* قبل تحديك! بدأ الاختبار الآن 🔥",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            await update.message.reply_text(
+                f"⚔️ *تحدي من {ch['creator_name']}*\n"
+                "━━━━━━━━━━━━━━━\n\n"
+                "📋 10 أسئلة إسلامية\n"
+                "⭐ كل إجابة صحيحة = نقطة\n\n"
+                "استعد... السؤال الأول 👇",
+                parse_mode="Markdown"
+            )
+            await _send_fc_question(update, context)
+            return
+
+        elif arg == "challenge":
+            challenge = get_today_challenge()
+            if not challenge:
+                await cmd_challenge_now(update, context)
+            else:
+                context.user_data["in_challenge"] = True
+                context.user_data["challenge_answer"] = challenge["answer"]
+                context.user_data["challenge_full"] = challenge["full"]
+                await update.message.reply_text(
+                    "🧩 تحدي اليوم\n━━━━━━━━━━━━━━━\n\n"
+                    f"📌 {challenge['text']}\n\nأرسل الكلمة الناقصة 👇"
+                )
+            return
+
+    is_new = register_user(user.id, user.username or "", user.full_name)
+    is_admin = user.id in ADMIN_IDS
+    users, _, hadiths, _ = get_global_stats()
+    conn2 = sqlite3.connect("bot.db")
+    cur2 = conn2.cursor()
+    cur2.execute("SELECT daily_hadith, adhkar_sub FROM users WHERE user_id=?", (user.id,))
+    sub_row = cur2.fetchone()
+    conn2.close()
+    _daily = sub_row[0] if sub_row else 1
+    _adhkar = sub_row[1] if sub_row else 0
+
+    # إشعار الأدمن بكل دخول
+    _uname = f"@{user.username}" if user.username else "بدون يوزر"
+    _label = "🆕 مستخدم جديد!" if is_new else "👋 عودة مستخدم"
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(
+                admin_id,
+                f"{_label}\n\n"
+                f"الاسم: {user.full_name}\n"
+                f"اليوزر: {_uname}\n"
+                f"ID: `{user.id}`",
+                parse_mode="Markdown"
+            )
+        except:
+            pass
+
+    if is_new:
+        # رسالة ترحيب تفاعلية للمستخدم الجديد
+        tour_kb = InlineKeyboardMarkup([
+            [colored_btn("🔍 جرب بحث الآن", switch_inline_query_current_chat="إنما الأعمال بالنيات", style="primary")],
+            [colored_btn("🌅 اشترك بحديث اليوم", callback_data="tour_daily", style="primary"),
+             colored_btn("🕌 أذكار الصباح والمساء", callback_data="tour_adhkar", style="primary")],
+            [colored_btn("✅ فهمت! ابدأ", callback_data="tour_done", style="success")],
+        ])
+        await update.message.reply_text(
+            f"🌙 أهلاً وسهلاً، {user.first_name}!\n\n"
+            "أنا *راوِي* 📜\n"
+            "بوتك اليومي للأحاديث النبوية والمعرفة الإسلامية\n\n"
+            "🔍 تحقق من صحة أي حديث\n"
+            "📜 اقترح لي حديثاً من كتب السنة\n"
+            "🎯 اختبر معلوماتك يومياً بـ 10 أسئلة\n"
+            "🤲 دعاء اليوم من القرآن والسنة\n"
+            "🌟 قصص الأنبياء والصحابة كل يوم\n\n"
+            "🤍 _إن نفعك البوت فادعُ للمطور بظهر الغيب_\n\n"
+            "استخدم الأزرار للوصول السريع 👇",
+            reply_markup=tour_kb,
+            parse_mode="Markdown"
+        )
+        await update.message.reply_text(
+            "القائمة الرئيسية جاهزة 👇",
+            reply_markup=main_kb(is_admin)
+        )
+    else:
+        await update.message.reply_text(
+            f"🌙 مرحباً بعودتك، {user.first_name}!\n\n"
+            "أنا *راوِي* 📜\n"
+            "بوتك اليومي للأحاديث النبوية والمعرفة الإسلامية\n\n"
+            "🔍 تحقق من صحة أي حديث\n"
+            "📜 اقترح لي حديثاً من كتب السنة\n"
+            "🎯 اختبر معلوماتك يومياً بـ 10 أسئلة\n"
+            "🤲 دعاء اليوم من القرآن والسنة\n"
+            "🌟 قصص الأنبياء والصحابة كل يوم\n\n"
+            "🤍 _إن نفعك البوت فادعُ للمطور بظهر الغيب_\n\n"
+            "استخدم الأزرار للوصول السريع 👇",
+            reply_markup=main_kb(is_admin)
+        )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"🆘 مساعدة بوت {BOT_NAME}:\n\n"
+        "• أرسل أي حديث وسأبحث عنه.\n"
+        "• أرسل اسم راوي (مثل 'أبو هريرة') لترى أحاديثه.\n"
+        "• الأزرار:\n"
+        "/random - حديث عشوائي\n"
+        "/donate - دعم البوت"
+    )
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """عرض معلومات الإصدار"""
+    msg = (
+        "╔══════════════════╗\n"
+        "   🕌 بوت راوِي\n"
+        "   الإصدار  v5.0\n"
+        "╚══════════════════╝\n\n"
+        "📅 مارس 2026\n\n\n"
+        "🆕 ما الجديد؟\n\n"
+        "  ⚔️  تحدي الصديق\n"
+        "  تحدّ من تشاء في 10 أسئلة\n"
+        "  واكتشف من الأذكى منكم!\n\n"
+        "  ━━━━━━━\n\n"
+        "  🎯  اختبار أقوى من قبل\n"
+        "  120 سؤالاً في القرآن والسيرة\n"
+        "  والفقه والصحابة الكرام\n\n"
+        "  ━━━━━━━\n\n"
+        "  🤲  دعاء اليوم\n"
+        "  50 دعاءً نبوياً وقرآنياً\n"
+        "  يتجدد معك كل يوم\n\n\n"
+        "✦ ✦ ✦\n\n"
+        "       👨\u200d💻 @ssss_ssss_x\n"
+        "  ضمّوني بين دعواتكم 💙"
+    )
+    await update.message.reply_text(msg)
+
+async def cmd_asma(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """أسماء الله الحسنى - اسم اليوم"""
+    user = update.effective_user
+    asma = get_asma_of_day(user.id)
+    msg = build_asma_msg(asma)
+    kb = build_asma_keyboard(asma['name'])
+    await update.message.reply_text(msg, reply_markup=kb)
+
+def get_asma_of_day(user_id: int) -> dict:
+    """يرجع اسم الله اليوم بناءً على رقم اليوم"""
+    day = _dt.datetime.now(AMMAN_TZ).timetuple().tm_yday
+    return ASMA_ALLAH[day % len(ASMA_ALLAH)]
+
+def build_asma_msg(asma: dict) -> str:
+    # الدالة تدعم المفتاحين القديم (dua) والجديد (dhikr)، ونفس الشيء للفائدة
+    dua_text = asma.get('dua') or asma.get('dhikr', '')
+    benefit_text = asma.get('benefit', '')
+    msg = (
+        "✨ *اسم الله الحسنى اليوم*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"🌟 *{asma['name']}*\n\n"
+        f"📖 *المعنى:*\n{asma['meaning']}\n\n"
+    )
+    if benefit_text:
+        msg += f"💡 *الفائدة:*\n{benefit_text}\n\n"
+    msg += (
+        f"🤲 *الدعاء:*\n_{dua_text}_\n\n"
+        "━━━━━━━━━━━━━━━\n"
+        f"🤖 {BOT_NAME} | {BOT_USERNAME}"
+    )
+    return msg
+
+def build_asma_keyboard(name: str) -> InlineKeyboardMarkup:
+    share_text = urllib.parse.quote(
+        f"✨ اسم الله اليوم: {name}\n\n"
+        f"تعرّف على أسماء الله الحسنى الـ99 عبر بوت راوِي:\n{BOT_USERNAME}"
+    )
+    share_url = f"https://t.me/share/url?url=https://t.me/{BOT_USERNAME.lstrip('@')}&text={share_text}"
+    return InlineKeyboardMarkup([[
+        colored_btn("✨ اسم آخر", callback_data="asma_next", style="primary"),
+        colored_btn("📋 كل الأسماء", callback_data="asma_list", style="primary"),
+    ],[
+        colored_btn("📤 شارك", switch_inline_query="bot_share", style="primary"),
+    ]])
+
+async def _quiz_timeout(context):
+    """ينتهي وقت السؤال تلقائياً بعد 30 ثانية"""
+    user_id = context.job.data["user_id"]
+    chat_id = context.job.data["chat_id"]
+    msg_id = context.job.data["msg_id"]
+    q_data = context.job.data["q_data"]
+    next_idx = context.job.data["next_idx"]
+    total_q = context.job.data["total_q"]
+    score = context.job.data["score"]
+    questions = context.job.data["questions"]
+    date = context.job.data["date"]
+
+    # تحقق إذا المستخدم أجاب مسبقاً
+    answered_idx = context.job.data.get("answered_idx")
+    if answered_idx is not None:
+        return  # أجاب، مش محتاج نعمل شيء
+
+    # انتهى الوقت — أغلق الأزرار
+    try:
+        await context.bot.edit_message_reply_markup(
+            chat_id=chat_id,
+            message_id=msg_id,
+            reply_markup=None
+        )
+    except Exception:
+        pass
+
+    # أرسل رسالة انتهاء الوقت
+    try:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=f"⏰ *انتهى الوقت!*\n\n✅ الجواب الصحيح: *{q_data['answer']}*\n\n📖 {q_data['explain']}",
+            parse_mode="Markdown"
+        )
+    except Exception:
+        pass
+
+    save_quiz_session(user_id, questions, next_idx, score, date)
+
+    if next_idx >= total_q:
+        stars = "⭐" * score + "☆" * (total_q - score)
+        pct = round(score / total_q * 100)
+        if pct == 100: comment = "ممتاز! أنت نجم! 🏆"
+        elif pct >= 80: comment = "رائع جداً! 👏"
+        elif pct >= 60: comment = "جيد! استمر 👍"
+        elif pct >= 40: comment = "تحتاج مراجعة 📚"
+        else: comment = "لا تستسلم، استمر في التعلم 💪"
+        try:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    f"🎯 *انتهى الاختبار!*\n"
+                    "━━━━━━━━━━━━━━━\n\n"
+                    f"نتيجتك: *{score}/{total_q}* {stars}\n"
+                    f"💬 {comment}\n\n"
+                    "تعال غداً لاختبار جديد 🌙"
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+    else:
+        # السؤال التالي بعد ثانية
+        await asyncio.sleep(1)
+        try:
+            await _send_timed_question(context.bot, chat_id, user_id, context, questions, next_idx, score, date)
+        except Exception:
+            pass
+
+
+async def _send_timed_question(bot, chat_id, user_id, context, questions, idx, score, date):
+    """إرسال سؤال مع عداد 30 ثانية"""
+    q = questions[idx]
+    total_q = len(questions)
+    opts = q["options"]
+    num = idx + 1
+
+    kb = InlineKeyboardMarkup([
+        [colored_btn(opts[0], callback_data="quiz_0", style="primary"),
+         colored_btn(opts[1], callback_data="quiz_1", style="primary")],
+        [colored_btn(opts[2], callback_data="quiz_2", style="primary"),
+         colored_btn(opts[3], callback_data="quiz_3", style="primary")],
+    ])
+    sent = await bot.send_message(
+        chat_id=chat_id,
+        text=(
+            f"❓ *سؤال {num}/{total_q}*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            f"📌 {q['q']}\n\n"
+            f"1️⃣ {opts[0]}\n"
+            f"2️⃣ {opts[1]}\n"
+            f"3️⃣ {opts[2]}\n"
+            f"4️⃣ {opts[3]}\n\n"
+            "⏳ *الوقت: 30 ثانية*"
+        ),
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+    # حفظ بيانات السؤال الحالي
+    context.user_data["quiz_index"] = idx
+    context.user_data["quiz_score"] = score
+    context.user_data["quiz_current_msg_id"] = sent.message_id
+    context.user_data["quiz_answered"] = False
+
+    # جدول مؤقت 30 ثانية
+    job_name = f"quiz_timeout_{user_id}"
+    # إلغاء أي مؤقت سابق
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for j in current_jobs:
+        j.schedule_removal()
+
+    context.job_queue.run_once(
+        _quiz_timeout,
+        when=30,
+        name=job_name,
+        data={
+            "user_id": user_id,
+            "chat_id": chat_id,
+            "msg_id": sent.message_id,
+            "q_data": q,
+            "next_idx": idx + 1,
+            "total_q": total_q,
+            "score": score,
+            "questions": questions,
+            "date": date,
+            "answered_idx": None,
+        }
+    )
+
+
+async def send_quiz_question(msg, context, q, num):
+    """إرسال سؤال في الاختبار اليومي مع عداد 30 ثانية"""
+    opts = q["options"]
+    total_q = len(context.user_data.get("quiz_questions", [q]))
+    kb = InlineKeyboardMarkup([
+        [colored_btn(opts[0], callback_data="quiz_0", style="primary"),
+         colored_btn(opts[1], callback_data="quiz_1", style="primary")],
+        [colored_btn(opts[2], callback_data="quiz_2", style="primary"),
+         colored_btn(opts[3], callback_data="quiz_3", style="primary")],
+    ])
+    sent = await msg.reply_text(
+        f"❓ *سؤال {num}/{total_q}*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"📌 {q['q']}\n\n"
+        f"1️⃣ {opts[0]}\n"
+        f"2️⃣ {opts[1]}\n"
+        f"3️⃣ {opts[2]}\n"
+        f"4️⃣ {opts[3]}\n\n"
+        "⏳ *الوقت: 30 ثانية*",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+    user_id = msg.chat.id
+    context.user_data["quiz_current_msg_id"] = sent.message_id
+    context.user_data["quiz_answered"] = False
+
+    # جدول مؤقت 30 ثانية
+    job_name = f"quiz_timeout_{user_id}"
+    current_jobs = context.job_queue.get_jobs_by_name(job_name)
+    for j in current_jobs:
+        j.schedule_removal()
+
+    questions = context.user_data.get("quiz_questions", [])
+    idx = num - 1
+    date = context.user_data.get("quiz_date", "")
+    score = context.user_data.get("quiz_score", 0)
+
+    context.job_queue.run_once(
+        _quiz_timeout,
+        when=30,
+        name=job_name,
+        data={
+            "user_id": user_id,
+            "chat_id": msg.chat.id,
+            "msg_id": sent.message_id,
+            "q_data": q,
+            "next_idx": idx + 1,
+            "total_q": total_q,
+            "score": score,
+            "questions": questions,
+            "date": date,
+            "answered_idx": None,
+        }
+    )
+
+async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("✅ النسخة: v5.0 - 2026-03-12")
+
+async def random_hadith(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text, src, grade = get_random_hadith()
+    await update.message.reply_text(f"🎁 *اقتراح حديث:*\n\n{text}\n\n📚 {src}\n⚖️ {grade}")
+
+async def random_suggestion(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """اقتراح حديث عشوائي"""
+    await random_hadith(update, context)
+
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ هذه الصفحة للمشرفين فقط.")
+        return
+    await update.message.reply_text("⚙️ لوحة تحكم المشرف", reply_markup=admin_main_keyboard())
+
+async def handle_admin_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if user.id not in ADMIN_IDS:
+        return
+    text = update.message.text
+
+    if text == "📢 إشعار للجميع":
+        context.user_data["broadcast"] = True
+        context.user_data["broadcast_type"] = "📝 نص"
+        await update.message.reply_text("📢 أرسل الرسالة التي تريد نشرها لجميع المستخدمين:", reply_markup=cancel_broadcast_keyboard())
+
+    elif text == "📢 إشعار متقدم":
+        await update.message.reply_text(
+            "📢 اختر نوع الوسائط للإشعار:",
+            reply_markup=advanced_broadcast_keyboard()
+        )
+        return
+
+    elif text in ["📝 نص", "🖼️ صورة", "🎤 صوت", "🎥 فيديو", "📁 ملف"]:
+        context.user_data["broadcast_type"] = text
+        context.user_data["broadcast"] = True
+        msg = f"📢 أرسل {'الرسالة النصية' if text == '📝 نص' else 'الوسائط'} التي تريد نشرها لجميع المستخدمين:"
+        await update.message.reply_text(msg, reply_markup=cancel_broadcast_keyboard())
+        return
+
+    elif text == "📊 إحصائيات":
+        users, searches, hadiths, recent = get_global_stats()
+        w = get_weekly_stats()
+        # إحصائيات الأسئلة الدينية
+        with sqlite3.connect("bot.db") as _qa_c:
+            qa_today = _qa_c.execute(
+                "SELECT COUNT(*), SUM(count) FROM qa_usage WHERE date=?",
+                (_dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d"),)
+            ).fetchone()
+            qa_paid = _qa_c.execute(
+                "SELECT COUNT(*), SUM(extra_questions) FROM qa_usage WHERE extra_questions > 0"
+            ).fetchone()
+        msg = (
+            f"📊 *إحصائيات البوت*\n\n"
+            f"👥 إجمالي المستخدمين: {users}\n"
+            f"🔎 إجمالي البحوث: {searches}\n"
+            f"📚 عدد الأحاديث: {hadiths}\n"
+            f"🔥 نشطين آخر 7 أيام: {w['active']}\n"
+            f"❓ أسئلة دينية اليوم: {qa_today[1] or 0} سؤال من {qa_today[0] or 0} مستخدم\n"
+            f"⭐ مستخدمون اشتروا أسئلة: {qa_paid[0] or 0}\n"
+        )
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    elif text == "📅 إحصائيات الأسبوع":
+        w = get_weekly_stats()
+        # معدل الاحتفاظ (ميزة 10)
+        conn_r = sqlite3.connect("bot.db")
+        cur_r = conn_r.cursor()
+        two_weeks = (_dt.datetime.now(AMMAN_TZ) - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
+        one_week = (_dt.datetime.now(AMMAN_TZ) - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        cur_r.execute("SELECT COUNT(DISTINCT user_id) FROM searches WHERE date BETWEEN ? AND ?", (two_weeks, one_week))
+        old_users = cur_r.fetchone()[0] or 1
+        cur_r.execute("SELECT COUNT(DISTINCT user_id) FROM searches WHERE date >= ?", (one_week,))
+        returned = cur_r.fetchone()[0]
+        conn_r.close()
+        retention = round((returned / old_users) * 100) if old_users else 0
+        # أكثر الأحاديث مشاركةً (ميزة 8)
+        top_shared = get_top_shared(3)
+        msg = (
+            f"📅 *إحصائيات آخر 7 أيام*\n\n"
+            f"🆕 مستخدمين جدد: {w['new_users']}\n"
+            f"🔥 مستخدمين نشطين: {w['active']}\n"
+            f"🔍 إجمالي البحوث: {w['searches']}\n"
+            f"⭐ نجوم مستلمة: {w['donations']}\n"
+            f"🔄 معدل الاحتفاظ: {retention}%\n\n"
+            f"*أكثر المواضيع بحثاً:*\n"
+        )
+        for word, count in w['top']:
+            msg += f"  • {word}: {count} مرة\n"
+        if top_shared:
+            msg += "\n*أكثر الأحاديث مشاركةً:*\n"
+            for i, (text_h, cnt) in enumerate(top_shared, 1):
+                msg += f"  {i}. {text_h[:60]}... ({cnt} مرة)\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    elif text == "📈 نمو يومي":
+        growth = get_daily_growth()
+        msg = "📈 *نمو المستخدمين - آخر 7 أيام*\n\n"
+        for day, count in growth:
+            bar = "█" * min(count, 20) if count > 0 else "—"
+            msg += f"{day}: {bar} ({count})\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    elif text == "⏰ أوقات النشاط":
+        hours = get_peak_hours()
+        msg = "⏰ *أكثر أوقات النشاط (آخر أسبوع)*\n\n"
+        for hour, cnt in hours:
+            msg += f"الساعة {hour:02d}:00 — {cnt} بحث\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    elif text == "🏆 أنشط المستخدمين":
+        top = get_top_searchers(10)
+        msg = "🏆 *أكثر المستخدمين بحثاً*\n\n"
+        for i, (name, uname, total) in enumerate(top, 1):
+            u = f"@{uname}" if uname else "بدون يوزر"
+            msg += f"{i}. {name or 'مجهول'} ({u}) — {total} بحث\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    elif text == "🆕 مستخدمون جدد":
+        recent = get_recent_users(10)
+        msg = "🆕 *آخر 10 مستخدمين انضموا*\n\n"
+        for name, uname, joined in recent:
+            u = f"@{uname}" if uname else "بدون يوزر"
+            msg += f"• {name or 'مجهول'} ({u}) — {joined[:10]}\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    elif text == "📋 سجل الفواتير":
+        conn = sqlite3.connect("bot.db")
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT d.user_id, u.full_name, u.username, d.amount, d.charge_id, d.date
+            FROM donations d
+            LEFT JOIN users u ON d.user_id = u.user_id
+            ORDER BY d.date DESC LIMIT 10
+        """)
+        rows = cur.fetchall()
+        conn.close()
+        if not rows:
+            await update.message.reply_text("📋 لا توجد فواتير بعد.")
+            return
+        msg = "📋 آخر 10 فواتير:\n\n"
+        buttons = []
+        for i, (uid, name, uname, amount, charge_id, date) in enumerate(rows, 1):
+            u = f"@{uname}" if uname else str(uid)
+            msg += f"{i}. {name or 'مجهول'} ({u})\n   ⭐ {amount} نجمة | 🗓 {date[:10]}\n   🔑 {charge_id}\n\n"
+            # charge_id قد يكون طويل - نخزنه في context
+            refund_key = f"refund_{i}"
+            if not context.user_data.get("refund_map"):
+                context.user_data["refund_map"] = {}
+            context.user_data["refund_map"][refund_key] = {"uid": uid, "charge_id": charge_id, "amount": amount}
+            buttons.append([colored_btn(
+                f"↩️ استرداد {amount}⭐ — {name or uid}",
+                callback_data=refund_key,
+                style="danger"
+            )])
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(buttons) if buttons else None)
+        return
+
+    elif text == "🗑️ حذف مستخدم":
+        context.user_data["admin_action"] = "delete_user"
+        await update.message.reply_text("أرسل ID المستخدم الذي تريد حذفه:")
+        return
+
+    elif text == "✏️ رسالة الترحيب":
+        current = get_setting("welcome_msg", "غير محددة")
+        context.user_data["admin_action"] = "set_welcome"
+        await update.message.reply_text(
+            f"الرسالة الحالية:\n"
+            "أرسل رسالة الترحيب الجديدة:"
+        )
+        return
+
+    elif text == "⏸ إيقاف البحث":
+        current = get_setting("search_disabled", "0")
+        new_val = "0" if current == "1" else "1"
+        save_setting("search_disabled", new_val)
+        status = "🔴 موقوف" if new_val == "1" else "🟢 مفعّل"
+        await update.message.reply_text(f"البحث الآن: {status}")
+        return
+
+    elif text == "📢 إشعار لمستوى":
+        context.user_data["admin_action"] = "broadcast_tier"
+        tier_kb = InlineKeyboardMarkup([
+            [colored_btn("⭐ Tier 1+", callback_data="btier_1", style="primary"),
+             colored_btn("⭐⭐ Tier 2+", callback_data="btier_2", style="primary"),
+             colored_btn("🌟 Tier 3", callback_data="btier_3", style="primary")],
+        ])
+        await update.message.reply_text("اختر المستوى:", reply_markup=tier_kb)
+        return
+
+    elif text == "👁 معاينة إشعار":
+        context.user_data["admin_action"] = "preview_broadcast"
+        await update.message.reply_text("أرسل نص الإشعار للمعاينة:")
+        return
+
+    elif text == "🔍 بحث مستخدم":
+        context.user_data["admin_action"] = "search_user"
+        await update.message.reply_text("أرسل ID المستخدم أو @يوزره:")
+        return
+
+    elif text == "🌟 قائمة الداعمين":
+        donors = get_all_donors()
+        if not donors:
+            await update.message.reply_text("لا يوجد داعمون حتى الآن.")
+            return
+        msg = f"🌟 *قائمة الداعمين* ({len(donors)})\n\n"
+        for i, d in enumerate(donors[:20], 1):
+            tier = get_tier(d["user_id"])
+            tier_emoji = ["👤","⭐","⭐⭐","🌟"][tier]
+            uname = f"@{d['username']}" if d['username'] else "بدون يوزر"
+            msg += f"{i}. {d['name']} ({uname})\n   {tier_emoji} {d['stars']} نجمة\n"
+        await update.message.reply_text(msg, parse_mode="Markdown")
+        return
+
+    elif text == "🎁 منح مستوى":
+        context.user_data["admin_action"] = "grant_tier"
+        await update.message.reply_text(
+            "أرسل البيانات بهذا الشكل:\n`ID عدد_النجوم`\n\nمثال: `123456789 25`",
+            parse_mode="Markdown"
+        )
+        return
+
+    elif text == "💰 استرداد نجوم":
+        await refund_command(update, context)
+        return
+
+    elif text == "❌ إلغاء الإشعار":
+        await cancel_broadcast(update, context)
+        return
+
+    elif text == "🔙 رجوع":
+        await update.message.reply_text("تم العودة", reply_markup=admin_main_keyboard())
+        return
+
+    elif text == "✉️ رسالة خاصة":
+        context.user_data["private_msg"] = True
+        await update.message.reply_text(
+            "✉️ أرسل معرف المستخدم (رقم ID) ثم الرسالة في سطر جديد.\n"
+            "مثال:\n123456789\nمرحباً بك"
+        )
+
+    elif text == "⚠️ سجل الأخطاء":
+        errors = get_error_logs(10)
+        if not errors:
+            await update.message.reply_text("✅ لا توجد أخطاء مسجلة.")
+            return
+        msg = "⚠️ *آخر 10 أخطاء:*\n\n"
+        for ts, etype, emsg, uid in errors:
+            user_info = f" (مستخدم: {uid})" if uid else ""
+            msg += f"• [{ts}] {etype}: {emsg}{user_info}\n"
+        await update.message.reply_text(msg)
+
+    elif text == "🗑️ مسح سجل الأخطاء":
+        clear_error_logs()
+        await update.message.reply_text("✅ تم مسح سجل الأخطاء.")
+
+async def handle_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.user_data.get("broadcast"):
+        return False
+
+    broadcast_type = context.user_data.get("broadcast_type", "📝 نص")
+
+    # مرحلة التأكيد - لو وصلنا محتوى جديد نعرض معاينة أولاً
+    if not context.user_data.get("broadcast_confirmed"):
+        if broadcast_type == "📝 نص":
+            if not update.message.text or update.message.text == "❌ إلغاء الإشعار":
+                return False
+            context.user_data["broadcast_content_text"] = update.message.text
+            preview_kb = InlineKeyboardMarkup([[
+                colored_btn("✅ إرسال للجميع", callback_data="confirm_adv_broadcast", style="success"),
+                colored_btn("✏️ تعديل", callback_data="edit_adv_broadcast", style="primary"),
+                colored_btn("❌ إلغاء", callback_data="cancel_broadcast_cb", style="danger"),
+            ]])
+            await update.message.reply_text(
+                f"👁 معاينة الإشعار:\n\n📢 إشعار من الإدارة:\n{update.message.text}",
+                reply_markup=preview_kb
+            )
+            return True
+        elif broadcast_type in ["🖼️ صورة", "🎤 صوت", "🎥 فيديو", "📁 ملف"]:
+            # تخزين file_id للمعاينة
+            if broadcast_type == "🖼️ صورة" and update.message.photo:
+                context.user_data["broadcast_file_id"] = update.message.photo[-1].file_id
+                context.user_data["broadcast_caption"] = update.message.caption or "📢 إشعار من الإدارة"
+                preview_kb = InlineKeyboardMarkup([[
+                    colored_btn("✅ إرسال للجميع", callback_data="confirm_adv_broadcast", style="success"),
+                    colored_btn("❌ إلغاء", callback_data="cancel_broadcast_cb", style="danger"),
+                ]])
+                await update.message.reply_photo(
+                    update.message.photo[-1].file_id,
+                    caption=f"👁 معاينة:\n{context.user_data['broadcast_caption']}",
+                    reply_markup=preview_kb
+                )
+                return True
+            elif broadcast_type == "🎤 صوت" and update.message.voice:
+                context.user_data["broadcast_file_id"] = update.message.voice.file_id
+                context.user_data["broadcast_caption"] = update.message.caption or "📢 إشعار صوتي"
+                preview_kb = InlineKeyboardMarkup([[
+                    colored_btn("✅ إرسال للجميع", callback_data="confirm_adv_broadcast", style="success"),
+                    colored_btn("❌ إلغاء", callback_data="cancel_broadcast_cb", style="danger"),
+                ]])
+                await update.message.reply_text("👁 تم استلام الصوت. هل تريد إرساله للجميع؟", reply_markup=preview_kb)
+                return True
+            elif broadcast_type == "🎥 فيديو" and (update.message.video or update.message.document):
+                fid = update.message.video.file_id if update.message.video else update.message.document.file_id
+                context.user_data["broadcast_file_id"] = fid
+                context.user_data["broadcast_caption"] = update.message.caption or "📢 إشعار فيديو"
+                preview_kb = InlineKeyboardMarkup([[
+                    colored_btn("✅ إرسال للجميع", callback_data="confirm_adv_broadcast", style="success"),
+                    colored_btn("❌ إلغاء", callback_data="cancel_broadcast_cb", style="danger"),
+                ]])
+                await update.message.reply_text("👁 تم استلام الفيديو. هل تريد إرساله للجميع؟", reply_markup=preview_kb)
+                return True
+            elif broadcast_type == "📁 ملف" and update.message.document:
+                context.user_data["broadcast_file_id"] = update.message.document.file_id
+                context.user_data["broadcast_caption"] = update.message.caption or "📢 إشعار ملف"
+                preview_kb = InlineKeyboardMarkup([[
+                    colored_btn("✅ إرسال للجميع", callback_data="confirm_adv_broadcast", style="success"),
+                    colored_btn("❌ إلغاء", callback_data="cancel_broadcast_cb", style="danger"),
+                ]])
+                await update.message.reply_text("👁 تم استلام الملف. هل تريد إرساله للجميع؟", reply_markup=preview_kb)
+                return True
+            else:
+                await update.message.reply_text(f"⚠️ يرجى إرسال {broadcast_type} صالح.", reply_markup=cancel_broadcast_keyboard())
+                return True
+
+    # مرحلة الإرسال الفعلي (بعد التأكيد)
+    conn = sqlite3.connect("bot.db")
+    users = conn.execute("SELECT user_id FROM users").fetchall()
+    conn.close()
+    success = fail = 0
+    context.user_data.pop("broadcast_confirmed", None)
+
+    try:
+        if broadcast_type == "📝 نص":
+            if not update.message.text or update.message.text == "❌ إلغاء الإشعار":
+                return False
+            text = context.user_data.pop("broadcast_content_text", update.message.text)
+            for (uid,) in users:
+                try:
+                    await context.bot.send_message(uid, f"📢 إشعار من الإدارة:\n{text}")
+                    success += 1
+                except:
+                    fail += 1
+                    await asyncio.sleep(0.05)
+
+        elif broadcast_type == "🖼️ صورة":
+            if not update.message.photo:
+                await update.message.reply_text("⚠️ يرجى إرسال صورة صالحة.", reply_markup=cancel_broadcast_keyboard())
+                return True
+            caption = update.message.caption or "📢 إشعار من الإدارة"
+            photo = update.message.photo[-1].file_id
+            for (uid,) in users:
+                try:
+                    await context.bot.send_photo(uid, photo=photo, caption=caption)
+                    success += 1
+                except:
+                    fail += 1
+                    await asyncio.sleep(0.05)
+
+        elif broadcast_type == "🎤 صوت":
+            if not update.message.voice:
+                await update.message.reply_text("⚠️ يرجى إرسال ملف صوتي صالح.", reply_markup=cancel_broadcast_keyboard())
+                return True
+            caption = update.message.caption or "📢 إشعار صوتي"
+            voice = update.message.voice.file_id
+            for (uid,) in users:
+                try:
+                    await context.bot.send_voice(uid, voice=voice, caption=caption)
+                    success += 1
+                except:
+                    fail += 1
+                    await asyncio.sleep(0.05)
+
+        elif broadcast_type == "🎥 فيديو":
+            video_id = None
+            if update.message.video:
+                video_id = update.message.video.file_id
+            elif update.message.document and update.message.document.mime_type and 'video' in update.message.document.mime_type:
+                video_id = update.message.document.file_id
+            else:
+                await update.message.reply_text("⚠️ يرجى إرسال ملف فيديو صالح.", reply_markup=cancel_broadcast_keyboard())
+                return True
+            caption = update.message.caption or "📢 إشعار فيديو"
+            for (uid,) in users:
+                try:
+                    await context.bot.send_video(uid, video=video_id, caption=caption)
+                    success += 1
+                except:
+                    try:
+                        await context.bot.send_document(uid, document=video_id, caption=caption)
+                        success += 1
+                    except:
+                        fail += 1
+                        await asyncio.sleep(0.05)
+
+        elif broadcast_type == "📁 ملف":
+            if not update.message.document:
+                await update.message.reply_text("⚠️ يرجى إرسال ملف صالح.", reply_markup=cancel_broadcast_keyboard())
+                return True
+            caption = update.message.caption or "📢 إشعار ملف"
+            document = update.message.document.file_id
+            for (uid,) in users:
+                try:
+                    await context.bot.send_document(uid, document=document, caption=caption)
+                    success += 1
+                except:
+                    fail += 1
+                    await asyncio.sleep(0.05)
+
+    except Exception as e:
+        logger.error(f"خطأ في handle_broadcast: {e}")
+        await update.message.reply_text("❌ حدث خطأ أثناء الإرسال.")
+        context.user_data.pop("broadcast", None)
+        context.user_data.pop("broadcast_type", None)
+        return True
+
+    await update.message.reply_text(f"✅ تم الإرسال: {success} نجح، {fail} فشل", reply_markup=admin_main_keyboard())
+    context.user_data.pop("broadcast", None)
+    context.user_data.pop("broadcast_type", None)
+    return True
+
+async def handle_private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if context.user_data.get("private_msg"):
+        parts = update.message.text.strip().split('\n', 1)
+        if len(parts) == 2:
+            try:
+                target_id = int(parts[0].strip())
+                msg_text = parts[1].strip()
+                await context.bot.send_message(target_id, f"✉️ رسالة خاصة من الإدارة:\n{msg_text}")
+                await update.message.reply_text(f"✅ تم إرسال الرسالة إلى {target_id}.")
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطأ: {e}")
+        else:
+            await update.message.reply_text("⚠️ الصيغة غير صحيحة. أرسل ID ثم سطر جديد ثم الرسالة.")
+        context.user_data["private_msg"] = False
+        return True
+    return False
+
+# ==================== المعالج الرئيسي للرسائل (يدعم جميع أنواع الوسائط) ====================
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text if update.message.text else ""
+
+    register_user(user.id, user.username or "", user.full_name)
+
+    # ===== أزرار الكيبورد — تأتي أولاً دائماً =====
+    _KB_BTNS = {
+        "🔍 تحقق من حديث","📖 باحث القرآن","📜 اقترح لي حديثاً",
+        "🤲 دعاء اليوم","🌟 قدوتي اليوم","🎯 اختبر معلوماتك",
+        "⚔️ تحدي صديق","📤 مشاركة","💰 دعم البوت","ℹ️ عن البوت",
+        "🕌 الأذكار","🔙 رجوع","⚙️ لوحة التحكم","📿 ختمة","❓ سؤال ديني",
+    }
+
+    # عند ضغط زر كيبورد — أوقف أوضاع النص السابقة
+    if text in _KB_BTNS:
+        for _k in ["quran_search_mode","hadith_search_mode","khatma_update_mode"]:
+            context.user_data.pop(_k, None)
+        if text != "🌟 قدوتي اليوم":
+            context.user_data["qudwati_waiting"] = False
+        if text != "❓ سؤال ديني":
+            context.user_data.pop("islamic_qa_mode", None)
+
+    # ===== الأدمن =====
+
+
+    # معالج الملاحظة على المفضلة
+    if context.user_data.get("waiting_note"):
+        context.user_data.pop("waiting_note", None)
+
+    # معالج تحديث صفحة الختمة
+    if context.user_data.get("khatma_update_mode") and text:
+        context.user_data.pop("khatma_update_mode", None)
+        try:
+            page = int(text.strip())
+            if 1 <= page <= 604:
+                with sqlite3.connect("bot.db") as conn:
+                    conn.execute("UPDATE khatma SET current_page=? WHERE user_id=?", (page, user.id))
+                await update.message.reply_text(f"✅ تم تحديث صفحتك إلى {page}/604")
+            else:
+                await update.message.reply_text("⚠️ الرقم يجب أن يكون بين 1 و604")
+        except ValueError:
+            await update.message.reply_text("⚠️ أرسل رقم الصفحة فقط مثل: 150")
+        return
+        hadith_text = context.user_data.pop("note_hadith", "")
+        if hadith_text:
+            save_favorite_note(user.id, hadith_text, text[:300])
+            await update.message.reply_text("✅ تم حفظ ملاحظتك على الحديث 📝")
+        else:
+            await update.message.reply_text("⚠️ لم يُعثر على الحديث، حاول مرة أخرى.")
+        return
+
+    # معالج أوامر الأدمن التفاعلية
+    admin_action = context.user_data.get("admin_action")
+    if admin_action and user.id in ADMIN_IDS:
+        context.user_data.pop("admin_action", None)
+
+        if admin_action == "search_user":
+            info = get_user_info(text.strip())
+            if not info:
+                await update.message.reply_text("❌ لم يُعثر على المستخدم.")
+            else:
+                tier_label = get_tier_label(info["tier"])
+                msg = (
+                    f"👤 *{info['full_name']}*\n"
+                    f"🆔 ID: `{info['user_id']}`\n"
+                    f"@{info['username'] or 'بدون يوزر'}\n\n"
+                    f"{tier_label}\n"
+                    f"⭐ النجوم: {info['stars']}\n"
+                    f"🔍 البحوث: {info['searches']}\n"
+                    f"📅 انضم: {(info['joined'] or '')[:10]}\n"
+                    f"🌅 حديث اليوم: {'مفعّل' if info['daily'] else 'موقوف'}\n"
+                    f"🕌 الأذكار: {'مفعّلة' if info['adhkar'] else 'موقوفة'}\n"
+                )
+                await update.message.reply_text(msg, parse_mode="Markdown")
+            return
+
+        elif admin_action == "delete_user":
+            try:
+                uid = int(text.strip())
+                conn = sqlite3.connect("bot.db")
+                for tbl in ["users", "favorites", "searches", "premium", "donations", "search_history"]:
+                    conn.execute(f"DELETE FROM {tbl} WHERE user_id=?", (uid,))
+                conn.commit()
+                conn.close()
+                await update.message.reply_text(f"✅ تم حذف المستخدم {uid} من قاعدة البيانات.")
+            except ValueError:
+                await update.message.reply_text("❌ أرسل ID رقمي صحيح.")
+            except Exception as e:
+                await update.message.reply_text(f"❌ خطأ: {e}")
+            return
+
+        elif admin_action == "set_welcome":
+            save_setting("welcome_msg", text[:1000])
+            await update.message.reply_text("✅ تم حفظ رسالة الترحيب الجديدة!")
+            return
+
+        elif admin_action == "broadcast_tier_msg":
+            tier_min = context.user_data.pop("broadcast_tier_min", 1)
+            conn = sqlite3.connect("bot.db")
+            cur = conn.cursor()
+            cur.execute("SELECT user_id FROM users")
+            all_users = [r[0] for r in cur.fetchall()]
+            conn.close()
+            targets = [uid for uid in all_users if get_tier(uid) >= tier_min]
+            sent, failed = 0, 0
+            for uid in targets:
+                try:
+                    await context.bot.send_message(uid, text, parse_mode="Markdown")
+                    sent += 1
+                    await asyncio.sleep(0.05)
+                except:
+                    failed += 1
+            await update.message.reply_text(
+                f"✅ أُرسل إلى {sent} مستخدم (مستوى {tier_min}+)\n❌ فشل: {failed}"
+            )
+            return
+
+        elif admin_action == "preview_broadcast":
+            await update.message.reply_text(
+                f"👁 *معاينة الإشعار:*\n{text}",
+                parse_mode="Markdown"
+            )
+            broadcast_kb = InlineKeyboardMarkup([[
+                colored_btn("📢 إرسال للجميع", callback_data="confirm_broadcast", style="success"),
+                colored_btn("❌ إلغاء", callback_data="cancel_broadcast_cb", style="danger")
+            ]])
+            context.user_data["pending_broadcast"] = text
+            await update.message.reply_text("هل تريد إرساله؟", reply_markup=broadcast_kb)
+            return
+
+        elif admin_action == "grant_tier":
+            parts = text.strip().split()
+            if len(parts) != 2:
+                await update.message.reply_text("❌ الصيغة غير صحيحة. مثال: `123456789 25`", parse_mode="Markdown")
+                return
+            try:
+                uid, stars = int(parts[0]), int(parts[1])
+                with sqlite3.connect("bot.db") as _gc:
+                    _gc.execute(
+                        "INSERT INTO premium (user_id, stars, donated_at) VALUES (?,?,datetime('now')) "
+                        "ON CONFLICT(user_id) DO UPDATE SET stars=stars+?, donated_at=datetime('now')",
+                        (uid, stars, stars)
+                    )
+                tier = get_tier(uid)
+                await update.message.reply_text(
+                    f"✅ تم منح {stars} نجمة للمستخدم {uid}\n"
+                    f"مستواه الآن: {get_tier_label(tier)}"
+                )
+            except (ValueError, Exception) as e:
+                await update.message.reply_text(f"❌ خطأ: {e}")
+            return
+
+    # التحقق من الإبلاغ
+
+    if context.user_data.get("reporting") and update.message.text:
+        await handle_report_message(update, context)
+        return
+
+
+
+        # أزرار الاشتراك
+
+    if text == "🕌 الأذكار":
+        kb = InlineKeyboardMarkup([
+            [colored_btn("🌄 أذكار الصباح", callback_data="adhkar_sabah", style="primary"),
+             colored_btn("🌆 أذكار المساء", callback_data="adhkar_masaa", style="primary")],
+        ])
+        await update.message.reply_text("اختر نوع الأذكار 👇", reply_markup=kb)
+        return
+
+    if text == "🤲 دعاء اليوم":
+        await cmd_duaa(update, context)
+        return
+
+    if text == "📖 باحث القرآن":
+        for _k in ["hadith_search_mode","islamic_qa_mode","khatma_update_mode","qudwati_waiting"]:
+            context.user_data.pop(_k, None)
+        context.user_data["hadith_search_mode"] = False
+        await cmd_quran_search(update, context)
+        return
+
+
+    if text == "🎯 اختبر معلوماتك":
+        await cmd_quiz_new(update, context)
+        return
+
+    if text == "⚔️ تحدي صديق":
+        await cmd_friend_challenge(update, context)
+        return
+
+    if text == "📤 مشاركة":
+        await cmd_share(update, context)
+        return
+
+    if text == "📿 ختمة":
+        await cmd_khatma_menu(update, context)
+        return
+
+    if text == "❓ سؤال ديني":
+        for _k in ["quran_search_mode","hadith_search_mode","khatma_update_mode","qudwati_waiting"]:
+            context.user_data.pop(_k, None)
+        can_ask, remaining, is_free = can_ask_question(user.id)
+        if can_ask:
+            context.user_data["islamic_qa_mode"] = True
+            free_left = min(remaining, QA_FREE_DAILY - get_qa_usage(user.id)["count"])
+            free_left = max(0, free_left)
+            extra_left = remaining - free_left
+            status = f"🆓 مجاني: {free_left}/{QA_FREE_DAILY}"
+            if extra_left > 0:
+                status += f" | ⭐ إضافي: {extra_left}"
+            kb = InlineKeyboardMarkup([[
+                colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="primary")
+            ]])
+            await update.message.reply_text(
+                f"❓ *سؤال ديني*\n"
+                "━━━━━━━━━━━━━━━\n\n"
+                f"📊 رصيدك اليوم: {remaining} سؤال متبقي\n"
+                f"({status})\n\n"
+                "اكتب سؤالك الديني وسأجيبك من مصادر أهل السنة 👇\n\n"
+                "_مثال: ما حكم صيام يوم السبت منفرداً؟_",
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+        else:
+            kb = InlineKeyboardMarkup([[
+                colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="success")
+            ]])
+            await update.message.reply_text(
+                "❓ *سؤال ديني*\n"
+                "━━━━━━━━━━━━━━━\n\n"
+                f"⚠️ استنفدت أسئلتك المجانية اليوم ({QA_FREE_DAILY}/{QA_FREE_DAILY})\n\n"
+                f"يتجدد رصيدك غداً صباحاً 🌅\n\n"
+                f"أو أضف {QA_EXTRA_STARS} نجوم للحصول على 5 أسئلة إضافية اليوم 👇",
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+        return
+
+    # ===== معالج السؤال الديني =====
+    if context.user_data.get("islamic_qa_mode") and text and not text.startswith("/"):
+        context.user_data["islamic_qa_mode"] = False
+        # تحقق من الرصيد مجدداً
+        can_ask, remaining, _ = can_ask_question(user.id)
+        if not can_ask:
+            kb = InlineKeyboardMarkup([[
+                colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="success")
+            ]])
+            await update.message.reply_text(
+                "⚠️ انتهت أسئلتك اليوم!\n"
+                f"يتجدد رصيدك غداً أو اشترِ {QA_EXTRA_STARS} نجوم للمزيد 👇",
+                reply_markup=kb
+            )
+            return
+        wait = await update.message.reply_text("⏳ جاري البحث عن الإجابة...")
+        system = (
+            "أنت عالم إسلامي متخصص في الفقه والعقيدة على منهج أهل السنة والجماعة. "
+            "أجب على الأسئلة الدينية بشكل واضح ومختصر لا يتجاوز 300 كلمة. "
+            "اذكر المصدر (قرآن أو حديث أو إجماع العلماء) عند الإمكان. "
+            "إذا كان السؤال خارج نطاق الدين الإسلامي اعتذر بلطف. "
+            "أجب باللغة العربية فقط."
+        )
+        full_prompt = f"{system}\n\nالسؤال: {text}"
+        answer = await call_gemini(full_prompt)
+        # سجّل الاستخدام فقط بعد نجاح الإجابة
+        if not answer.startswith("⚠️"):
+            increment_qa_usage(user.id)
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+        _, remaining_after, _ = can_ask_question(user.id)
+        rows = []
+        if remaining_after > 0:
+            rows.append([colored_btn(f"❓ سؤال آخر ({remaining_after} متبقي)", callback_data="qa_new", style="primary")])
+        else:
+            rows.append([colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="success")])
+        kb = InlineKeyboardMarkup(rows)
+        await update.message.reply_text(
+            f"❓ *{text}*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            f"{answer}\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "_⚠️ للتحقق راجع أهل العلم_",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    # أيضاً أوقف islamic_qa_mode عند ضغط أزرار الكيبورد
+    if text in _KB_BTNS:
+        context.user_data.pop("islamic_qa_mode", None)
+
+    if text == "🌟 قدوتي اليوم":
+        await cmd_qudwati(update, context)
+        return
+
+
+
+    if text == "📜 اقترح لي حديثاً":
+        kb = InlineKeyboardMarkup([
+            [colored_btn("📗 البخاري", callback_data="suggest_bukhari", style="primary"),
+             colored_btn("📘 مسلم", callback_data="suggest_muslim", style="primary")],
+            [colored_btn("📙 أبو داود", callback_data="suggest_dawud", style="primary"),
+             colored_btn("📕 الترمذي", callback_data="suggest_tirmidhi", style="primary")],
+            [colored_btn("📒 ابن ماجه", callback_data="suggest_majah", style="primary")],
+        ])
+        await update.message.reply_text(
+            "📜 *اقترح لي حديثاً*\n\nاختر الكتاب 👇",
+            parse_mode="Markdown",
+            reply_markup=kb
+        )
+        return
+
+    # أوامر Premium من لوحة المفاتيح
+
+
+
+    # زر الإبلاغ من لوحة المفاتيح الرئيسية
+    if text == "⚠️ إبلاغ عن خطأ":
+        context.user_data["reporting"] = True
+        context.user_data["reporting_hadith_id"] = 0
+        context.user_data["reporting_hadith_text"] = "إبلاغ عام من لوحة المفاتيح"
+        cancel_kb = InlineKeyboardMarkup([[
+            colored_btn("❌ إلغاء التقرير", callback_data="cancel_report", style="danger")
+        ]])
+        await update.message.reply_text(
+            "📝 إبلاغ عن خطأ\n\n"
+            "اكتب وصف المشكلة أو الخطأ الذي وجدته:\n"
+            "(مثال: خطأ في حديث، معلومات غلط، مشكلة في البوت...)\n\n"
+            "أو ابحث عن الحديث أولاً واضغط زر ⚠️ إبلاغ تحته لتحديد الحديث المقصود.",
+            reply_markup=cancel_kb
+        )
+        return
+
+    # معالجة البث الجماعي أولاً للمشرفين
+    if user.id in ADMIN_IDS and context.user_data.get("broadcast"):
+        if text == "❌ إلغاء الإشعار":
+            await cancel_broadcast(update, context)
+            return
+        if await handle_broadcast(update, context):
+            return
+
+    if user.id in ADMIN_IDS:
+        if await handle_private_message(update, context):
+            return
+
+    # معالجة حالة انتظار الاسترداد
+    if user.id in ADMIN_IDS and context.user_data.get("awaiting_refund"):
+        await refund_command(update, context)
+        return
+
+    # معالجة اختيارات التبرع
+    if text in ["💰 دعم البوت", "/donate"]:
+        await donate_command(update, context)
+        return
+    if text in ["⭐ 1 نجمة", "⭐ 5 نجوم", "⭐ 10 نجوم", "⭐ 25 نجمة", "⭐ 50 نجمة"]:
+        if await handle_donation_choice(update, context):
+            return
+    if text == "🔙 رجوع":
+        with sqlite3.connect("bot.db") as _c3:
+            _row3 = _c3.execute("SELECT daily_hadith, adhkar_sub FROM users WHERE user_id=?", (user.id,)).fetchone()
+        _d3 = _row3[0] if _row3 else 1
+        _a3 = _row3[1] if _row3 else 0
+        await update.message.reply_text(
+            "تم العودة للقائمة الرئيسية.",
+            reply_markup=main_kb(user.id in ADMIN_IDS)
+        )
+        return
+
+    # الأزرار الرئيسية
+    if text == "🔍 تحقق من حديث":
+        # أوقف كل الأوضاع الأخرى صراحةً
+        for _k in ["quran_search_mode","islamic_qa_mode","khatma_update_mode","qudwati_waiting"]:
+            context.user_data.pop(_k, None)
+        context.user_data["hadith_search_mode"] = True
+        await update.message.reply_text(
+            "🔍 *تحقق من حديث*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "✍️ أرسل الحديث أو جزءاً منه أو اسم الراوي 👇\n\n"
+            "مثال: `إنما الأعمال بالنيات`\n"
+            "أو: `أبو هريرة`",
+            parse_mode="Markdown"
+        )
+        return
+    # ===== معالج البحث القرآني =====
+
+    # معالج قدوتي — فقط لو لا يوجد وضع نص آخر نشط
+    _active_mode = (
+        context.user_data.get("islamic_qa_mode") or
+        context.user_data.get("quran_search_mode") or
+        context.user_data.get("hadith_search_mode") or
+        context.user_data.get("khatma_update_mode")
+    )
+    if context.user_data.get("qudwati_waiting") and text and not _active_mode and text not in _KB_BTNS and not text.startswith("/"):
+        context.user_data["qudwati_waiting"] = False
+        correct_answer = context.user_data.get("qudwati_answer_saved", "")
+        user_ans = text.strip()
+        important_words = [w for w in correct_answer.split() if len(w) > 3 and w not in ["رضي","الله","عنه","عليه","السلام","عنها"]]
+        is_correct = any(word in user_ans for word in important_words) if important_words else False
+        if is_correct:
+            await update.message.reply_text(
+                f"✅ *إجابة صحيحة!* أحسنت 🌟\n\n"
+                f"📝 الإجابة الكاملة:\n{correct_answer}",
+                parse_mode="Markdown"
+            )
+        else:
+            await update.message.reply_text(
+                f"❌ *إجابة خاطئة*\n\n"
+                f"✅ الإجابة الصحيحة:\n{correct_answer}",
+                parse_mode="Markdown"
+            )
+        return
+
+    # معالج السؤال الديني
+    if context.user_data.get("islamic_qa_mode") and text and text not in _KB_BTNS and not text.startswith("/"):
+        context.user_data["islamic_qa_mode"] = False
+        # تحقق من الرصيد
+        can_ask, remaining, _ = can_ask_question(user.id)
+        if not can_ask:
+            await update.message.reply_text(
+                f"⚠️ *انتهت أسئلتك اليوم!*\n\n"
+                f"استخدمت {QA_FREE_DAILY}/{QA_FREE_DAILY} أسئلة مجانية.\n"
+                f"يتجدد رصيدك غداً 🌅\n\n"
+                f"أو ادفع {QA_EXTRA_STARS} نجوم للحصول على 5 أسئلة إضافية 👇",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    colored_btn(f"⭐ {QA_EXTRA_STARS} نجوم ← 5 أسئلة", callback_data="qa_buy", style="success")
+                ]])
+            )
+            return
+        # خصم سؤال أولاً
+        increment_qa_usage(user.id)
+        _, remaining_after, _ = can_ask_question(user.id)
+        wait = await update.message.reply_text(f"⏳ جاري البحث... (متبقي: {remaining_after} سؤال)")
+        system = (
+            "أنت عالم إسلامي على منهج أهل السنة والجماعة. "
+            "أجب بشكل واضح مختصر لا يتجاوز 300 كلمة مع ذكر المصدر. "
+            "إذا كان السؤال خارج الدين اعتذر بلطف. أجب بالعربية فقط."
+        )
+        answer = await call_gemini(f"{system}\n\nالسؤال: {text}")
+        # لو فشل الـ API أعِد الخصم
+        if answer.startswith("⚠️"):
+            decrement_qa_usage(user.id)
+            remaining_after = remaining
+        try:
+            await wait.delete()
+        except Exception:
+            pass
+        rows = []
+        if remaining_after > 0:
+            rows.append([colored_btn(f"❓ سؤال آخر ({remaining_after} متبقٍ)", callback_data="qa_new", style="primary")])
+        else:
+            rows.append([colored_btn(f"⭐ {QA_EXTRA_STARS} نجوم ← 5 أسئلة إضافية", callback_data="qa_buy", style="success")])
+        await update.message.reply_text(
+            f"❓ *{text}*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            f"{answer}\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            "_⚠️ للتحقق راجع أهل العلم_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(rows)
+        )
+        return
+
+    # ===== معالج البحث القرآني =====
+    if context.user_data.get("quran_search_mode") and text and not text.startswith("/"):
+        context.user_data["quran_search_mode"] = False
+        wait = await update.message.reply_text("🔍 جاري البحث في القرآن الكريم...")
+        try:
+            results = []
+            import re as _re
+            t = text.strip()
+
+            # الحالة 1: رقم:رقم مثل 2:255
+            num_ref = _re.match(r'^(\d+):(\d+)$', t)
+            # الحالة 2: اسم سورة:رقم مثل الكهف:10
+            name_ref = _re.match(r'^([^\d:]+):(\d+)$', t)
+            # الحالة 3: اسم سورة فقط مثل "الكهف" أو "يس"
+            name_only = t in QURAN_SURAHS
+
+            if num_ref:
+                s, a = int(num_ref.group(1)), int(num_ref.group(2))
+                ayah = await fetch_ayah_by_ref(s, a)
+                if ayah:
+                    results = [ayah]
+
+            elif name_ref:
+                sname = name_ref.group(1).strip()
+                a = int(name_ref.group(2))
+                # تصحيح اسم السورة — جرب مطابقة جزئية
+                s = QURAN_SURAHS.get(sname, 0)
+                if not s:
+                    for sn, snum in QURAN_SURAHS.items():
+                        if sname in sn or sn in sname:
+                            s = snum
+                            break
+                if s:
+                    ayah = await fetch_ayah_by_ref(s, a)
+                    if ayah:
+                        results = [ayah]
+                else:
+                    await wait.edit_text(
+                        f"⚠️ لم أعثر على سورة «{sname}»\n"
+                        "تأكد من الاسم مثل: `الكهف:10` أو `يس:1`"
+                    )
+                    return
+
+            elif name_only:
+                # اسم سورة فقط — جيب أول 5 آيات منها
+                s = QURAN_SURAHS[t]
+                for a in range(1, 6):
+                    ayah = await fetch_ayah_by_ref(s, a)
+                    if ayah:
+                        results.append(ayah)
+
+            else:
+                # بحث نصي حر — يشمل الأخطاء الإملائية
+                results = await fetch_quran_search(t)
+
+            if not results:
+                await wait.edit_text(
+                    f"⚠️ لم أجد نتائج لـ «{text}»\n\n"
+                    "💡 جرّب:\n"
+                    "• كلمات من الآية مثل: `واصبر وما صبرك`\n"
+                    "• اسم السورة والآية: `الكهف:10`\n"
+                    "• رقم مباشر: `18:10`\n"
+                    "• اسم السورة فقط: `يس`"
+                )
+                return
+
+            context.user_data["quran_results"] = results
+            context.user_data["quran_page"] = 0
+            context.user_data["quran_tafsir"] = {}
+
+            h = results[0]
+            msg = build_ayah_msg(h, page=0, total=len(results))
+            kb = build_ayah_keyboard(h, 0, len(results))
+            await wait.delete()
+            await update.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+        except Exception as e:
+            logger.error(f"Quran search handler error: {e}")
+            await wait.edit_text("⚠️ حدث خطأ، حاول مرة ثانية.")
+        return
+
+    # ===== معالج البحث عن حديث =====
+    if context.user_data.get("hadith_search_mode") and text and not text.startswith("/"):
+        context.user_data["hadith_search_mode"] = False
+
+        if len(text) < 3:
+            await update.message.reply_text("⚠️ أرسل نصاً أطول (3 أحرف على الأقل).")
+            return
+        if is_rate_limited(user.id):
+            await update.message.reply_text("⏳ أرسلت طلبات كثيرة، انتظر ثوانٍ قليلة.")
+            return
+
+        wait = await update.message.reply_text("⏳ جاري البحث في الدرر السنية...")
+        try:
+            rawi_match = is_rawi_search(text)
+            search_query = rawi_match if rawi_match else text
+            logger.info(f"[HADITH SEARCH] user={user.id} query={search_query[:50]}")
+            results = await search_dorar_api(search_query)
+            logger.info(f"[HADITH SEARCH] results={len(results)}")
+
+            if not results:
+                suggestion = get_spell_suggestion(text)
+                if suggestion and suggestion != text:
+                    results = await search_dorar_api(suggestion)
+                    if results:
+                        await wait.edit_text(f"🔍 لم أجد نتائج لـ «{text}»، أبحث عن «{suggestion}»...")
+
+            if results:
+                log_search(user.id, text)
+                log_search_history(user.id, text, len(results))
+                context.user_data["search_results"] = results
+                context.user_data["search_results_all"] = results
+                context.user_data["search_page"] = 0
+                context.user_data["grade_filter"] = "all"
+                context.user_data["search_id"] = _uuid.uuid4().hex[:8]
+                await show_search_page(update, context, wait)
+            else:
+                url = f"https://dorar.net/hadith/search?q={urllib.parse.quote(text)}"
+                suggestion = get_spell_suggestion(text)
+                kb = [[colored_btn("🔍 ابحث في الدرر السنية", url=url, style="primary")]]
+                if suggestion:
+                    kb.append([colored_btn(f"✏️ ابحث عن: {suggestion}", callback_data=f"spell_{suggestion[:50]}", style="primary")])
+                spell_hint = f"\n\n💡 هل تقصد: *{suggestion}*؟" if suggestion else ""
+                await wait.edit_text(
+                    f"⚠️ لم أجد نتائج لـ «{text}»{spell_hint}\n\n"
+                    "💡 جرّب كلمة أو كلمتان من نص الحديث",
+                    reply_markup=InlineKeyboardMarkup(kb),
+                    parse_mode="Markdown"
+                )
+        except Exception as e:
+            logger.error(f"[HADITH SEARCH ERROR] {e}", exc_info=True)
+            try:
+                await wait.edit_text(f"⚠️ حدث خطأ: {type(e).__name__}")
+            except Exception:
+                pass
+        return
+
+    if text == "اقترح لي حديثا📜":
+        await random_suggestion(update, context)
+        return
+
+    if text == "ℹ️ عن البوت":
+        users, searches, hadiths, _ = get_global_stats()
+        await update.message.reply_text(
+            f"ℹ️ *{BOT_NAME}* — بوت الأحاديث النبوية\n\n"
+            f"📚 يحتوي على {hadiths} حديث من كتب السنة\n"
+            "🎯 اختبر معلوماتك يومياً\n"
+            "🤲 أدعية يومية من القرآن والسنة\n"
+            "🌟 قصص الأنبياء والصحابة يومياً\n"
+            "🔍 تحقق من صحة أي حديث\n\n"
+            "👤 المطور: @ssss_ssss_x\n"
+            "/help للمساعدة"
+        )
+        return
+    if text == "⚙️ لوحة التحكم" and user.id in ADMIN_IDS:
+        await admin_panel(update, context)
+        return
+
+    # أوامر الأدمن النصية - كل أزرار لوحة التحكم
+    ADMIN_BUTTONS = {
+        "📊 إحصائيات", "📅 إحصائيات الأسبوع",
+        "📈 نمو يومي", "⏰ أوقات النشاط",
+        "🏆 أنشط المستخدمين", "🆕 مستخدمون جدد",
+        "📊 إحصائيات متقدمة",
+        "🔍 بحث مستخدم", "🌟 قائمة الداعمين", "🎁 منح مستوى",
+        "🗑️ حذف مستخدم", "✉️ رسالة خاصة",
+        "📢 إشعار متقدم", "📢 إشعار لمستوى",
+        "📋 سجل الفواتير",
+        "📝 نص", "🖼️ صورة", "🎤 صوت", "🎥 فيديو", "📁 ملف",
+        "⚠️ سجل الأخطاء", "🗑️ مسح سجل الأخطاء",
+        "💰 استرداد نجوم", "❌ إلغاء الإشعار",
+    }
+    if user.id in ADMIN_IDS and text in ADMIN_BUTTONS:
+        await handle_admin_actions(update, context)
+        return
+
+    # إذا كانت الرسالة تحتوي على وسائط ولم تكن في حالة بث، تجاهلها
+    if not text:
+        return
+
+    # البحث عن حديث — يصير بس بعد ضغط زر "تحقق من حديث"
+    if get_setting("search_disabled") == "1" and user.id not in ADMIN_IDS:
+        return
+
+    wait = await update.message.reply_text("⏳ جاري البحث في الدرر السنية...")
+    try:
+        # تحقق من بحث بالراوي
+        rawi_match = is_rawi_search(text)
+        search_query = rawi_match if rawi_match else text
+        results = await search_dorar_api(search_query)
+
+        # لو ما ردّ - جرب الاقتراح الإملائي تلقائياً
+        if not results:
+            suggestion = get_spell_suggestion(text)
+            if suggestion and suggestion != text:
+                logger.info(f"[SPELL] trying suggestion: {suggestion}")
+                results = await search_dorar_api(suggestion)
+                if results:
+                    await wait.edit_text(f"🔍 لم أجد نتائج لـ «{text}»، أبحث عن «{suggestion}»...")
+
+        if not results:
+            await wait.edit_text("⏳ جاري البحث في قاعدة البيانات...")
+        if results:
+            log_search(user.id, text)
+            log_search_history(user.id, text, len(results))
+            context.user_data["search_results"] = results
+            context.user_data["search_results_all"] = results
+            context.user_data["search_page"] = 0
+            context.user_data["grade_filter"] = "all"
+            context.user_data["search_id"] = _uuid.uuid4().hex[:8]
+            await show_search_page(update, context, wait)
+        else:
+            # اقتراح إملائي في رسالة النتيجة
+            suggestion = get_spell_suggestion(text)
+            spell_hint = ""
+            if suggestion:
+                spell_hint = f"\n\n💡 هل تقصد: *{suggestion}*؟\nاضغط الزر للبحث به 👇"
+            url = f"https://dorar.net/hadith/search?q={urllib.parse.quote(text)}"
+            kb = [[colored_btn("🔍 ابحث في الدرر السنية", url=url, style="primary")]]
+            if spell_hint and suggestion:
+                kb.append([colored_btn(f"✏️ ابحث عن: {suggestion}", callback_data=f"spell_{suggestion[:50]}", style="primary")])
+            not_found_msg = (
+                f"⚠️ لم أجد نتائج لـ «{text}»"
+                f"{spell_hint}\n\n"
+                "💡 جرّب:\n"
+                "• كلمة أو كلمتان من نص الحديث\n"
+                "• اسم الراوي مثل: أبو هريرة\n"
+                "• بدون «قال النبي» أو «روى»"
+            )
+            await wait.edit_text(not_found_msg, reply_markup=InlineKeyboardMarkup(kb), parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"خطأ في البحث: {e}")
+        log_error(type(e).__name__, str(e), user.id, traceback.format_exc())
+        await wait.edit_text("⚠️ حدث خطأ أثناء البحث. تم تسجيل المشكلة.")
+
+def build_hadith_msg(h: dict, page: int, total: int) -> str:
+    """بناء رسالة الحديث من dict"""
+    text = h['text'].strip()
+    source = h.get('source') or 'غير محدد'
+    grade = h.get('grade') or 'غير محدد'
+    # أيقونة الدرجة
+    if "صحيح" in grade:
+        grade_icon = "✅"
+    elif "حسن" in grade:
+        grade_icon = "🟡"
+    elif "ضعيف" in grade:
+        grade_icon = "🔴"
+    else:
+        grade_icon = "⚪"
+    # هل من الكتب الستة؟
+    is_sitta = any(k in source for k in _KUTUB_SITTA)
+    sitta_badge = " 📗" if is_sitta else ""
+    # escape HTML
+    def _e(s): return str(s).replace("&","&amp;").replace("<","&lt;").replace(">","&gt;")
+    msg = f"🔍 <b>نتيجة البحث ({page+1}/{total})</b>\n"
+    msg += "━━━━━━━━━━━━━━━\n\n"
+    msg += f"📌 {_e(text)}\n\n"
+    msg += f"👤 الراوي: {_e(h.get('rawi') or 'غير محدد')}\n"
+    if h.get('mohdith'):
+        msg += f"🎓 المحدث: {_e(h['mohdith'])}\n"
+    msg += f"📚 المصدر: <b>{_e(source)}</b>{sitta_badge}\n"
+    msg += f"{grade_icon} الدرجة: {_e(grade)}\n"
+    return msg
+
+def build_share_text(h: dict) -> str:
+    """بناء نص المشاركة"""
+    txt = f"📖 حديث نبوي شريف\n\n"
+    txt += f"📌 {h['text']}\n\n"
+    txt += f"👤 الراوي: {h['rawi']}\n"
+    if h.get('mohdith'):
+        txt += f"🎓 المحدث: {h['mohdith']}\n"
+    txt += f"📚 المصدر: {h['source']}\n"
+    txt += f"⚖️ الدرجة: {h['grade']}\n\n"
+    txt += "🤖 بوت راوِي للتحقق من الأحاديث"
+    return txt
+
+def build_keyboard(page: int, total: int, hid, has_sharh: bool = False, user_id: int = 0, is_fav: bool = False, context_filter: str = "all") -> InlineKeyboardMarkup:
+    """بناء لوحة الأزرار"""
+    keyboard = []
+    if total > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(colored_btn("⬅️ السابق", callback_data="nav_prev", style="primary"))
+        if page < total - 1:
+            nav_row.append(colored_btn("التالي ➡️", callback_data="nav_next", style="primary"))
+        if nav_row:
+            keyboard.append(nav_row)
+    # زر المفضلة لـ Tier 2+
+    if user_id and has_favorites(user_id):
+        fav_btn = colored_btn("💔 إزالة من المفضلة", callback_data="fav_remove" if is_fav else "fav_save", style="danger")
+        keyboard.append([fav_btn])
+    keyboard.append([
+        colored_btn("📤 شارك الحديث", callback_data="share", style="primary"),
+        colored_btn("🔊 استمع", callback_data=f"tts_hadith_{hid}", style="primary"),
+        colored_btn("⚠️ إبلاغ", callback_data=f"report_{hid}", style="danger"),
+    ])
+    if user_id:
+        grade = context_filter if context_filter else "all"
+        grade_labels = {"all": "🔘 كل الدرجات", "sahih": "✅ صحيح فقط", "hasan": "🟡 حسن فقط"}
+        keyboard.append([colored_btn(
+            f"🎚 الفلتر: {grade_labels.get(grade, 'كل الدرجات')}",
+            callback_data=f"grade_filter"
+        )])
+    # زر فلتر الكتب الستة
+    sitta_filter = context_filter == "sitta"
+    keyboard.append([colored_btn(
+        "📗 الكتب الستة فقط ✓" if sitta_filter else "📗 الكتب الستة فقط",
+        callback_data="filter_sitta", style="success" if sitta_filter else "primary"
+    )])
+    keyboard.append([colored_btn("🔄 بحث جديد", callback_data="new", style="primary")])
+    return InlineKeyboardMarkup(keyboard)
+
+async def show_search_page(update: Update, context: ContextTypes.DEFAULT_TYPE, wait_message):
+    results = context.user_data.get("search_results", [])
+    page = context.user_data.get("search_page", 0)
+    if not results:
+        await wait_message.edit_text("⚠️ لا توجد نتائج.")
+        return
+
+    total_pages = len(results)
+    if page >= total_pages:
+        page = total_pages - 1
+        context.user_data["search_page"] = page
+
+    user = update.effective_user
+    h = results[page]
+    msg = build_hadith_msg(h, page, total_pages)
+    favs = get_favorites(user.id) if has_favorites(user.id) else []
+    is_fav = any(f["text"] == h["text"] for f in favs)
+    cf = context.user_data.get("grade_filter", "all")
+    keyboard = build_keyboard(page, total_pages, h["id"], user_id=user.id, is_fav=is_fav, context_filter=cf)
+
+    await wait_message.delete()
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
+
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    user = update.effective_user
+
+    # إذا انتهت الجلسة أو ما في نتائج
+    results = context.user_data.get("search_results", [])
+    stale_actions = {"nav_prev", "nav_next", "share", "fav_save", "fav_remove", "grade_filter"}
+    if q.data in stale_actions and not results:
+        # حاول استرجاع الجلسة من DB
+        if session and session.get("results"):
+            context.user_data["search_results"] = session["results"]
+            context.user_data["search_results_all"] = session["results"]
+            context.user_data["search_page"] = session["page"]
+            context.user_data["grade_filter"] = session.get("grade_filter", "all")
+            context.user_data["search_id"] = session.get("search_id", "")
+            results = session["results"]
+        else:
+            await q.answer("⚠️ انتهت الجلسة، ابحث من جديد.", show_alert=True)
+            return
+
+    if q.data == "new":
+        await q.answer()
+        await q.message.reply_text("✍️ أرسل الحديث الجديد أو اسم الراوي:")
+        await q.message.delete()
+    elif q.data == "share":
+        await q.answer()
+        results = context.user_data.get("search_results", [])
+        page = context.user_data.get("search_page", 0)
+        if not results:
+            if session and session.get("results"):
+                results = session["results"]
+                page = session["page"]
+                context.user_data["search_results"] = results
+                context.user_data["search_page"] = page
+        if results and page < len(results):
+            h = results[page]
+            share_text = build_share_text(h)
+            increment_share(h.get("text", ""))
+            # زر مشاركة مباشر عبر Telegram
+            share_url = f"https://t.me/share/url?url=https://t.me/{BOT_USERNAME.lstrip('@')}&text={urllib.parse.quote(share_text)}"
+            share_kb = InlineKeyboardMarkup([[
+                colored_btn("📤 شارك الحديث", switch_inline_query="hadith_share", style="primary")
+            ]])
+            await q.message.reply_text(share_text, reply_markup=share_kb)
+        else:
+            await q.answer("⚠️ لا يوجد حديث للمشاركة", show_alert=True)
+    elif q.data.startswith("report_"):
+        await q.answer()
+        context.user_data["reporting"] = True
+        results = context.user_data.get("search_results", [])
+        page = context.user_data.get("search_page", 0)
+        if results and page < len(results):
+            h = results[page]
+            context.user_data["reporting_hadith_id"] = h["id"]
+            context.user_data["reporting_hadith_text"] = h["text"]
+            cancel_kb = InlineKeyboardMarkup([[
+                colored_btn("❌ إلغاء التقرير", callback_data="cancel_report", style="danger")
+            ]])
+            await q.message.reply_text(
+                "📝 الإبلاغ عن خطأ في الحديث\n\n"
+                "اكتب وصف الخطأ الذي وجدته (مثلاً: خطأ في النص، الراوي، المصدر، الدرجة).\n"
+                "سيتم إرسال تقريرك إلى المطور للنظر فيه.\n\n"
+                "أو اضغط إلغاء لو ضغطت بالخطأ 👇",
+                reply_markup=cancel_kb
+            )
+        else:
+            await q.message.reply_text("⚠️ حدث خطأ، يرجى إعادة البحث والمحاولة.")
+
+    elif q.data == "nav_prev":
+        results = context.user_data.get("search_results", [])
+        if not results:
+            await q.answer("⚠️ انتهت الجلسة، ابحث من جديد.", show_alert=True)
+            return
+        page = context.user_data.get("search_page", 0)
+        if page > 0:
+            await q.answer()
+            context.user_data["search_page"] = page - 1
+            await q.message.delete()
+            await show_search_page_from_callback(update, context)
+        else:
+            await q.answer("أنت في الصفحة الأولى", show_alert=True)
+    elif q.data == "nav_next":
+        results = context.user_data.get("search_results", [])
+        if not results:
+            await q.answer("⚠️ انتهت الجلسة، ابحث من جديد.", show_alert=True)
+            return
+        page = context.user_data.get("search_page", 0)
+        if page < len(results) - 1:
+            await q.answer()
+            context.user_data["search_page"] = page + 1
+            await q.message.delete()
+            await show_search_page_from_callback(update, context)
+        else:
+            await q.answer("أنت في الصفحة الأخيرة", show_alert=True)
+
+    # ===== مزايا Premium =====
+    elif q.data == "fav_save":
+        if not has_favorites(user.id):
+            stars = get_premium_stars(user.id)
+            await q.answer(f"⭐ تحتاج {max(0,TIER2_STARS-stars)} نجمة إضافية لفتح المفضلة! /donate", show_alert=True)
+            return
+        results = context.user_data.get("search_results", [])
+        page = context.user_data.get("search_page", 0)
+        if results and page < len(results):
+            h = results[page]
+            saved = save_favorite(user.id, h)
+            if saved:
+                await q.answer("✅ تم الحفظ في المفضلة!")
+                cf = context.user_data.get("grade_filter", "all")
+                kb = build_keyboard(page, len(results), h["id"], user_id=user.id, is_fav=True, context_filter=cf)
+                try:
+                    await q.message.edit_reply_markup(reply_markup=kb)
+                except:
+                    pass
+                # عرض خيار إضافة ملاحظة للـ VIP tier 3+
+                if True:  # all users
+                    note_kb = InlineKeyboardMarkup([[
+                        colored_btn("📝 أضف ملاحظة", callback_data=f"add_note", style="success"),
+                        colored_btn("تخطي", callback_data="skip_note", style="danger")
+                    ]])
+                    context.user_data["note_hadith"] = h.get("text","")
+                    await q.message.reply_text("هل تريد إضافة ملاحظة على هذا الحديث؟", reply_markup=note_kb)
+            else:
+                await q.answer("📌 موجود في المفضلة مسبقاً")
+
+    elif q.data == "fav_remove":
+        if not has_favorites(user.id):
+            await q.answer("⭐ هذه الميزة للداعمين فقط", show_alert=True)
+            return
+        results = context.user_data.get("search_results", [])
+        page = context.user_data.get("search_page", 0)
+        if results and page < len(results):
+            h = results[page]
+            remove_favorite(user.id, h["text"])
+            await q.answer("🗑️ تم الإزالة من المفضلة")
+            cf = context.user_data.get("grade_filter", "all")
+            kb = build_keyboard(page, len(results), h["id"], user_id=user.id, is_fav=False, context_filter=cf)
+            try:
+                await q.message.edit_reply_markup(reply_markup=kb)
+            except:
+                pass
+
+    elif q.data.startswith("topic_"):
+        if not has_topics(user.id):
+            await q.answer("⭐ تحتاج نجمة واحدة فقط لفتح هذه الميزة! اضغط دعم البوت", show_alert=True)
+            return
+        topic = q.data[6:]
+        await q.answer("🔍 جاري البحث...")
+        loading = await q.message.reply_text(f"🔍 جاري البحث في موضوع: *{topic}*...", parse_mode="Markdown")
+        results = await search_dorar_api(topic)
+
+        try:
+            await loading.delete()
+        except:
+            pass
+        if not results:
+            await q.message.reply_text(f"⚠️ ما وجدت نتائج عن موضوع: {topic}")
+            return
+        context.user_data["search_results"] = results
+        context.user_data["search_results_all"] = results
+        context.user_data["search_page"] = 0
+        context.user_data["grade_filter"] = "all"
+        context.user_data["from_favorites"] = False
+        h = results[0]
+        msg = build_hadith_msg(h, 0, len(results))
+        # تحقق إذا الحديث محفوظ في المفضلة
+        favs = get_favorites(user.id) if has_favorites(user.id) else []
+        is_fav = any(f["text"] == h["text"] for f in favs)
+        kb = build_keyboard(0, len(results), h["id"], user_id=user.id, is_fav=is_fav, context_filter="all")
+        await q.message.reply_text(msg, reply_markup=kb)
+
+
+
+
+
+    elif q.data == "confirm_broadcast":
+        await q.answer()
+        msg = context.user_data.pop("pending_broadcast", "")
+        if not msg:
+            await q.message.reply_text("❌ لا توجد رسالة للإرسال.")
+            return
+        conn = sqlite3.connect("bot.db")
+        cur = conn.cursor()
+        cur.execute("SELECT user_id FROM users")
+        all_users = [r[0] for r in cur.fetchall()]
+        conn.close()
+        sent, failed = 0, 0
+        for uid in all_users:
+            try:
+                await context.bot.send_message(uid, msg, parse_mode="Markdown")
+                sent += 1
+                await asyncio.sleep(0.05)
+            except:
+                failed += 1
+        await q.message.reply_text(f"✅ أُرسل إلى {sent} مستخدم\n❌ فشل: {failed}")
+
+    elif q.data == "confirm_adv_broadcast":
+        await q.answer()
+        broadcast_type = context.user_data.get("broadcast_type", "📝 نص")
+        conn2 = sqlite3.connect("bot.db")
+        all_users2 = [r[0] for r in conn2.execute("SELECT user_id FROM users").fetchall()]
+        conn2.close()
+        sent2, failed2 = 0, 0
+        try:
+            if broadcast_type == "📝 نص":
+                text2 = context.user_data.pop("broadcast_content_text", "")
+                for uid2 in all_users2:
+                    try:
+                        await context.bot.send_message(uid2, f"📢 إشعار من الإدارة:\n{text2}")
+                        sent2 += 1
+                        await asyncio.sleep(0.05)
+                    except:
+                        failed2 += 1
+            elif broadcast_type == "🖼️ صورة":
+                fid2 = context.user_data.pop("broadcast_file_id", "")
+                cap2 = context.user_data.pop("broadcast_caption", "")
+                for uid2 in all_users2:
+                    try:
+                        await context.bot.send_photo(uid2, photo=fid2, caption=cap2)
+                        sent2 += 1
+                        await asyncio.sleep(0.05)
+                    except:
+                        failed2 += 1
+            elif broadcast_type == "🎤 صوت":
+                fid2 = context.user_data.pop("broadcast_file_id", "")
+                cap2 = context.user_data.pop("broadcast_caption", "")
+                for uid2 in all_users2:
+                    try:
+                        await context.bot.send_voice(uid2, voice=fid2, caption=cap2)
+                        sent2 += 1
+                        await asyncio.sleep(0.05)
+                    except:
+                        failed2 += 1
+            elif broadcast_type in ["🎥 فيديو", "📁 ملف"]:
+                fid2 = context.user_data.pop("broadcast_file_id", "")
+                cap2 = context.user_data.pop("broadcast_caption", "")
+                for uid2 in all_users2:
+                    try:
+                        await context.bot.send_document(uid2, document=fid2, caption=cap2)
+                        sent2 += 1
+                        await asyncio.sleep(0.05)
+                    except:
+                        failed2 += 1
+        except Exception as e2:
+            logger.error(f"confirm_adv_broadcast: {e2}")
+        context.user_data.pop("broadcast", None)
+        context.user_data.pop("broadcast_type", None)
+        context.user_data.pop("broadcast_confirmed", None)
+        await q.message.edit_text(f"✅ تم الإرسال: {sent2} نجح، {failed2} فشل")
+
+    elif q.data == "edit_adv_broadcast":
+        await q.answer()
+        context.user_data.pop("broadcast_content_text", None)
+        await q.message.edit_text("✏️ أرسل النص الجديد للإشعار:", reply_markup=None)
+
+
+
+
+    elif q.data.startswith("quiz_"):
+        chosen_idx = int(q.data[5:]) if q.data[5:].isdigit() else -1
+        questions = context.user_data.get("quiz_questions", [])
+        idx_q = context.user_data.get("quiz_index", 0)
+        score = context.user_data.get("quiz_score", 0)
+        date = context.user_data.get("quiz_date", "")
+
+        if not questions:
+            await q.answer("انتهت الجلسة، ابدأ الاختبار من جديد", show_alert=True)
+            return
+        if idx_q >= len(questions):
+            await q.answer("انتهت الجلسة", show_alert=True)
+            return
+        # تحقق إذا أجاب مسبقاً على هذا السؤال
+        if context.user_data.get("quiz_answered"):
+            await q.answer("✅ أجبت على هذا السؤال مسبقاً!", show_alert=True)
+            return
+
+        context.user_data["quiz_answered"] = True
+
+        # إلغاء المؤقت
+        job_name = f"quiz_timeout_{user.id}"
+        for job in context.job_queue.get_jobs_by_name(job_name):
+            job.schedule_removal()
+
+        q_data = questions[idx_q]
+        if chosen_idx < 0 or chosen_idx >= len(q_data["options"]):
+            await q.answer("خطأ في الإجابة", show_alert=True)
+            return
+        chosen = q_data["options"][chosen_idx]
+        correct = chosen == q_data["answer"]
+        if correct:
+            score += 1
+            context.user_data["quiz_score"] = score
+            result_line = "✅ *إجابة صحيحة!* 🎉"
+        else:
+            result_line = f"❌ *إجابة خاطئة*\nالجواب: *{q_data['answer']}*"
+
+        try:
+            await q.message.edit_text(
+                f"{result_line}\n\n📖 {q_data['explain']}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+        next_idx = idx_q + 1
+        context.user_data["quiz_index"] = next_idx
+        save_quiz_session(user.id, questions, next_idx, score, date)
+        total_q = len(questions)
+
+        if next_idx >= total_q:
+            context.user_data.pop("in_daily_quiz", None)
+            save_quiz_session(user.id, questions, 10, score, date)
+            stars = "⭐" * score + "☆" * (total_q - score)
+            pct = round(score / total_q * 100)
+            if pct == 100: comment = "ممتاز! أنت نجم! 🏆"
+            elif pct >= 80: comment = "رائع جداً! 👏"
+            elif pct >= 60: comment = "جيد! استمر 👍"
+            elif pct >= 40: comment = "تحتاج مراجعة 📚"
+            else: comment = "لا تستسلم، استمر في التعلم 💪"
+            await q.message.reply_text(
+                f"🎯 *انتهى الاختبار!*\n"
+                "━━━━━━━━━━━━━━━\n\n"
+                f"نتيجتك: *{score}/{total_q}* {stars}\n"
+                f"💬 {comment}\n\n"
+                "تعال غداً لاختبار جديد 🌙",
+                parse_mode="Markdown"
+            )
+        else:
+            await asyncio.sleep(1)
+            context.user_data["quiz_answered"] = False
+            await send_quiz_question(q.message, context, questions[next_idx], next_idx + 1)
+
+
+    elif q.data == "cancel_broadcast_cb":
+        await q.answer("تم الإلغاء")
+        context.user_data.pop("pending_broadcast", None)
+        context.user_data.pop("broadcast", None)
+        context.user_data.pop("broadcast_type", None)
+        context.user_data.pop("broadcast_confirmed", None)
+        context.user_data.pop("broadcast_content_text", None)
+        context.user_data.pop("broadcast_file_id", None)
+        try:
+            await q.message.delete()
+        except:
+            pass
+
+    elif q.data.startswith("suggest_"):
+        await q.answer("⏳ جاري البحث...")
+        book_key = q.data.replace("suggest_", "")
+        books = {
+            "bukhari": "البخاري",
+            "muslim": "مسلم",
+            "dawud": "أبو داود",
+            "tirmidhi": "الترمذي",
+            "majah": "ابن ماجه",
+        }
+        book_name = books.get(book_key, "البخاري")
+        # موضوعات عشوائية للبحث
+        import random as _rs
+        topics = ["الصبر", "الصلاة", "الإخلاص", "الأخلاق", "الدعاء", "التوبة", "الرحمة", "العلم", "الصدق", "الكرم"]
+        topic = _rs.choice(topics)
+        loading = await q.message.reply_text(f"⏳ جاري اقتراح حديث من {book_name}...")
+        try:
+            results = await search_dorar_api(topic)
+            # فلتر الكتاب المطلوب
+            filtered = [h for h in results if book_name in (h.get("source") or "")]
+            if not filtered:
+                filtered = results  # لو ما في من الكتاب خذ أي نتيجة
+            if filtered:
+                h = _rs.choice(filtered[:10])
+                msg = build_hadith_msg(h, 0, 1)
+                kb = InlineKeyboardMarkup([
+                    [colored_btn("📤 شارك الحديث", callback_data="share", style="primary"),
+                     colored_btn("🔊 استمع", callback_data=f"tts_hadith_{h.get('id','0')}", style="primary")],
+                    [colored_btn("📜 اقتراح آخر", callback_data=f"suggest_{book_key}", style="primary")],
+                ])
+                await loading.delete()
+                await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+            else:
+                await loading.edit_text(f"⚠️ لم أجد حديثاً من {book_name} الآن، حاول مرة ثانية.")
+        except Exception as e:
+            logger.error(f"suggest callback error: {e}")
+            await loading.edit_text("⚠️ حدث خطأ، حاول مرة ثانية.")
+
+    elif q.data == "fc_start":
+        # المنشئ يبدأ اختباره
+        await q.answer()
+        questions = context.user_data.get("fc_questions", [])
+        if not questions:
+            await q.message.reply_text("⚠️ انتهت الجلسة، ابدأ تحدياً جديداً.")
+            return
+        context.user_data["fc_index"] = 0
+        context.user_data["fc_score"] = 0
+        await q.message.reply_text("🚀 البداية! استعد للسؤال الأول 👇")
+        await _send_fc_question(q.message, context)
+
+    elif q.data.startswith("fc_ans_"):
+        await q.answer()
+        challenge_id = context.user_data.get("fc_id")
+        if not challenge_id:
+            await q.message.reply_text("⚠️ انتهت الجلسة.")
+            return
+        ans_idx = int(q.data.split("_")[2])
+        questions = context.user_data.get("fc_questions", [])
+        idx = context.user_data.get("fc_index", 0)
+        score = context.user_data.get("fc_score", 0)
+        if idx >= len(questions):
+            return
+        q_data = questions[idx]
+        chosen = q_data["options"][ans_idx]
+        correct = chosen == q_data["answer"]
+        if correct:
+            score += 1
+            context.user_data["fc_score"] = score
+            result_line = "✅ *صحيح!* 🎉"
+        else:
+            result_line = f"❌ *خطأ* — الجواب: {q_data['answer']}"
+        try:
+            await q.message.edit_text(
+                f"{result_line}\n\n📖 {q_data.get('explain', '')}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        next_idx = idx + 1
+        context.user_data["fc_index"] = next_idx
+        if next_idx >= len(questions):
+            # انتهى الاختبار — احفظ النتيجة
+            role = context.user_data.get("fc_role", "creator")
+            save_fc_score(challenge_id, user.id, user.full_name, score)
+            ch = get_friend_challenge(challenge_id)
+            total = len(questions)
+            stars = "⭐" * score + "☆" * (total - score)
+            if ch and ch["status"] == "finished":
+                # الاثنين خلّصوا — أرسل النتيجة لكليهما مع زر مشاركة
+                result_msg = build_fc_result(ch)
+                # خزّن النتيجة للمشاركة عبر inline
+                context.application.bot_data[f"fc_result_{user.id}"] = result_msg
+                share_kb = InlineKeyboardMarkup([[
+                    colored_btn("📤 شارك النتيجة", switch_inline_query=f"fc_result_{user.id}", style="primary")
+                ]])
+                await q.message.reply_text(result_msg, parse_mode="Markdown", reply_markup=share_kb)
+                # أرسل للطرف الآخر
+                other_id = ch["opponent_id"] if role == "creator" else ch["creator_id"]
+                try:
+                    other_share_kb = InlineKeyboardMarkup([[
+                        colored_btn("📤 شارك النتيجة", switch_inline_query=f"fc_result_{other_id}", style="primary")
+                    ]])
+                    context.application.bot_data[f"fc_result_{other_id}"] = result_msg
+                    await context.bot.send_message(
+                        other_id, result_msg,
+                        parse_mode="Markdown",
+                        reply_markup=other_share_kb
+                    )
+                except Exception:
+                    pass
+            else:
+                # الطرف الأول خلّص — انتظر الآخر
+                await q.message.reply_text(
+                    f"✅ *أنهيت الاختبار!*\n\n"
+                    f"نتيجتك: {score}/{total} {stars}\n\n"
+                    "⏳ ننتظر صديقك ليكمل التحدي...\n"
+                    "سيصلك الإشعار فور انتهائه 🔔",
+                    parse_mode="Markdown"
+                )
+        else:
+            await _send_fc_question(q.message, context)
+
+
+    elif q.data == "filter_sitta":
+        await q.answer()
+        cur = context.user_data.get("grade_filter", "all")
+        if cur == "sitta":
+            context.user_data["grade_filter"] = "all"
+        else:
+            context.user_data["grade_filter"] = "sitta"
+        # أعد ترتيب النتائج مع الفلتر
+        all_results = context.user_data.get("search_results_all", context.user_data.get("search_results", []))
+        context.user_data["search_results_all"] = all_results
+        if context.user_data["grade_filter"] == "sitta":
+            context.user_data["search_results"] = filter_kutub_sitta(all_results)
+        else:
+            context.user_data["search_results"] = all_results
+        context.user_data["search_page"] = 0
+        await show_search_page_from_callback(q, context)
+
+    elif q.data == "grade_filter":
+        await q.answer()
+        cur_filter = context.user_data.get("grade_filter", "all")
+        nxt = {"all": "sahih", "sahih": "hasan", "hasan": "all"}
+        context.user_data["grade_filter"] = nxt.get(cur_filter, "all")
+        results_all = context.user_data.get("search_results_all", context.user_data.get("search_results", []))
+        context.user_data["search_results_all"] = results_all
+        grade_map = {"sahih": "صحيح", "hasan": "حسن", "all": None}
+        gf = grade_map.get(context.user_data["grade_filter"])
+        if gf:
+            filtered = [r for r in results_all if gf in r.get("grade", "")]
+            context.user_data["search_results"] = filtered if filtered else results_all
+        else:
+            context.user_data["search_results"] = results_all
+        context.user_data["search_page"] = 0
+        await show_search_page_from_callback(update, context)
+
+
+
+    elif q.data == "fc_start":
+        # المنشئ يبدأ اختباره
+        await q.answer()
+        questions = context.user_data.get("fc_questions", [])
+        if not questions:
+            await q.message.reply_text("⚠️ انتهت الجلسة، ابدأ تحدياً جديداً.")
+            return
+        context.user_data["fc_index"] = 0
+        context.user_data["fc_score"] = 0
+        await q.message.reply_text("🚀 البداية! استعد للسؤال الأول 👇")
+        await _send_fc_question(q.message, context)
+
+    elif q.data.startswith("fc_ans_"):
+        await q.answer()
+        challenge_id = context.user_data.get("fc_id")
+        if not challenge_id:
+            await q.message.reply_text("⚠️ انتهت الجلسة.")
+            return
+        ans_idx = int(q.data.split("_")[2])
+        questions = context.user_data.get("fc_questions", [])
+        idx = context.user_data.get("fc_index", 0)
+        score = context.user_data.get("fc_score", 0)
+        if idx >= len(questions):
+            return
+        q_data = questions[idx]
+        chosen = q_data["options"][ans_idx]
+        correct = chosen == q_data["answer"]
+        if correct:
+            score += 1
+            context.user_data["fc_score"] = score
+            result_line = "✅ *صحيح!* 🎉"
+        else:
+            result_line = f"❌ *خطأ* — الجواب: {q_data['answer']}"
+        try:
+            await q.message.edit_text(
+                f"{result_line}\n\n📖 {q_data.get('explain', '')}",
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        next_idx = idx + 1
+        context.user_data["fc_index"] = next_idx
+        if next_idx >= len(questions):
+            # انتهى الاختبار — احفظ النتيجة
+            role = context.user_data.get("fc_role", "creator")
+            save_fc_score(challenge_id, user.id, user.full_name, score)
+            ch = get_friend_challenge(challenge_id)
+            total = len(questions)
+            stars = "⭐" * score + "☆" * (total - score)
+            if ch and ch["status"] == "finished":
+                # الاثنين خلّصوا — أرسل النتيجة لكليهما مع زر مشاركة
+                result_msg = build_fc_result(ch)
+                # خزّن النتيجة للمشاركة عبر inline
+                context.application.bot_data[f"fc_result_{user.id}"] = result_msg
+                share_kb = InlineKeyboardMarkup([[
+                    colored_btn("📤 شارك النتيجة", switch_inline_query=f"fc_result_{user.id}", style="primary")
+                ]])
+                await q.message.reply_text(result_msg, parse_mode="Markdown", reply_markup=share_kb)
+                # أرسل للطرف الآخر
+                other_id = ch["opponent_id"] if role == "creator" else ch["creator_id"]
+                try:
+                    other_share_kb = InlineKeyboardMarkup([[
+                        colored_btn("📤 شارك النتيجة", switch_inline_query=f"fc_result_{other_id}", style="primary")
+                    ]])
+                    context.application.bot_data[f"fc_result_{other_id}"] = result_msg
+                    await context.bot.send_message(
+                        other_id, result_msg,
+                        parse_mode="Markdown",
+                        reply_markup=other_share_kb
+                    )
+                except Exception:
+                    pass
+            else:
+                # الطرف الأول خلّص — انتظر الآخر
+                await q.message.reply_text(
+                    f"✅ *أنهيت الاختبار!*\n\n"
+                    f"نتيجتك: {score}/{total} {stars}\n\n"
+                    "⏳ ننتظر صديقك ليكمل التحدي...\n"
+                    "سيصلك الإشعار فور انتهائه 🔔",
+                    parse_mode="Markdown"
+                )
+        else:
+            await _send_fc_question(q.message, context)
+
+
+    elif q.data == "adhkar_sabah":
+        try:
+            dhikr, fadl, source = _random.choice(ADHKAR_SABAH)
+            msg = (
+                f"🌄 أذكار الصباح\n"
+                f"━━━━━━━━━━━━━━━\n\n"
+                f"✨ {dhikr}\n\n"
+                f"💡 الفضل: {fadl}\n"
+                f"📚 المصدر: {source}\n\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🤖 {BOT_NAME} | {BOT_USERNAME}"
+            )
+            await q.answer()
+            await q.message.reply_text(msg)
+        except Exception as e:
+            logger.error(f"adhkar_sabah: {e}")
+            await q.answer("⚠️ خطأ، حاول مرة أخرى", show_alert=True)
+
+    elif q.data == "adhkar_masaa":
+        try:
+            dhikr, fadl, source = _random.choice(ADHKAR_MASAA)
+            msg = (
+                f"🌆 أذكار المساء\n"
+                f"━━━━━━━━━━━━━━━\n\n"
+                f"✨ {dhikr}\n\n"
+                f"💡 الفضل: {fadl}\n"
+                f"📚 المصدر: {source}\n\n"
+                f"━━━━━━━━━━━━━━━\n"
+                f"🤖 {BOT_NAME} | {BOT_USERNAME}"
+            )
+            await q.answer()
+            await q.message.reply_text(msg)
+        except Exception as e:
+            logger.error(f"adhkar_masaa: {e}")
+            await q.answer("⚠️ خطأ، حاول مرة أخرى", show_alert=True)
+
+    elif q.data.startswith("spell_"):
+        suggested = q.data[6:]
+        await q.answer()
+        wait2 = await q.message.reply_text(f"🔍 جاري البحث عن «{suggested}»...")
+        try:
+            results = await search_dorar_api(suggested)
+            if results:
+                log_search(user.id, suggested)
+                log_search_history(user.id, suggested, len(results))
+                context.user_data["search_results"] = results
+                context.user_data["search_results_all"] = results
+                context.user_data["search_page"] = 0
+                context.user_data["grade_filter"] = "all"
+                await show_search_page(update, context, wait2)
+            else:
+                await wait2.edit_text(f"⚠️ لم أجد نتائج لـ «{suggested}» أيضاً.")
+        except Exception as e:
+            logger.error(f"spell callback: {e}")
+            await wait2.edit_text("⚠️ خطأ في البحث، حاول لاحقاً.")
+
+    elif q.data.startswith("refund_") and user.id in ADMIN_IDS:
+        await q.answer()
+        refund_map = context.user_data.get("refund_map", {})
+        info = refund_map.get(q.data)
+        if not info:
+            await q.message.reply_text("❌ انتهت الجلسة، افتح سجل الفواتير من جديد")
+            return
+        target_uid = info["uid"]
+        charge_id = info["charge_id"]
+        amount = info["amount"]
+        try:
+            await context.bot.refund_star_payment(
+                user_id=target_uid,
+                telegram_payment_charge_id=charge_id
+            )
+            conn = sqlite3.connect("bot.db")
+            conn.execute("DELETE FROM donations WHERE user_id=? AND charge_id=?", (target_uid, charge_id))
+            conn.commit()
+            conn.close()
+            await q.message.reply_text(f"✅ تم استرداد {amount}⭐ للمستخدم {target_uid}")
+        except Exception as e:
+            await q.message.reply_text(f"❌ فشل الاسترداد: {e}")
+
+    elif q.data == "confirm_report":
+        await q.answer()
+        report_text = context.user_data.pop("pending_report_text", "")
+        hadith_text = context.user_data.get("reporting_hadith_text", "")
+        tier = get_tier(user.id)
+        badge = "🌟" if tier >= 3 else "⭐" if tier >= 1 else ""
+        user_info = f"@{user.username}" if user.username else user.full_name
+        if badge:
+            user_info = f"{badge} {user_info}"
+        for admin_id in ADMIN_IDS:
+            try:
+                await context.bot.send_message(
+                    admin_id,
+                    f"⚠️ *تقرير خطأ في حديث*\n\n"
+                    f"👤 المستخدم: {user_info} (ID: {user.id})\n"
+                    f"📌 الحديث: {hadith_text[:200]}...\n"
+                    f"📝 التقرير: {report_text}",
+                    parse_mode="Markdown"
+                )
+            except:
+                pass
+        context.user_data.pop("reporting_hadith_id", None)
+        context.user_data.pop("reporting_hadith_text", None)
+        try:
+            await q.message.edit_text("✅ تم إرسال تقريرك إلى المطور. شكراً لمساعدتك في تحسين البوت!")
+        except:
+            await q.message.reply_text("✅ تم إرسال تقريرك إلى المطور. شكراً!")
+
+    elif q.data == "cancel_report":
+        await q.answer("✅ تم إلغاء التقرير")
+        context.user_data.pop("reporting", None)
+        context.user_data.pop("reporting_hadith_id", None)
+        context.user_data.pop("reporting_hadith_text", None)
+        context.user_data.pop("pending_report_text", None)
+        try:
+            await q.message.delete()
+        except:
+            pass
+
+    elif q.data == "skip_note":
+        await q.answer()
+        context.user_data.pop("note_hadith", None)
+        try:
+            await q.message.delete()
+        except:
+            pass
+
+
+    elif q.data == "qudwati_next":
+        await q.answer()
+        import random as _rq
+        story = _rq.choice(QUDWATI_STORIES)
+        msg = build_qudwati_msg(story)
+        context.user_data["qudwati_question"] = story["question"]
+        context.user_data["qudwati_answer"] = story["answer"]
+        context.user_data["qudwati_answer_saved"] = story["answer"]
+        context.user_data["qudwati_waiting"] = True
+        context.user_data["current_qudwati"] = story
+        bot_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}"
+        share_text = urllib.parse.quote(
+            f"🌟 قدوتي اليوم: {story['name']}\n\n"
+            f"{story['story'][:200]}...\n\n"
+            f"💡 العبرة: {story['lesson']}\n\n"
+            f"تعرّف على قصص الأنبياء والصحابة يومياً عبر بوت راوِي:\n{bot_link}"
+        )
+        share_url = f"https://t.me/share/url?url={bot_link}&text={share_text}"
+        kb = InlineKeyboardMarkup([
+            [colored_btn("🔄 قدوة أخرى", callback_data="qudwati_next", style="primary"),
+             colored_btn("📤 شارك القصة", switch_inline_query=f"qudwati_{story['name'][:30]}", style="primary")],
+            [colored_btn("🔊 استمع للقصة", callback_data="tts_qudwati", style="primary"),
+             colored_btn("✅ أظهر الإجابة", callback_data="qudwati_reveal", style="success")],
+        ])
+        try:
+            await q.message.edit_text(msg, parse_mode="Markdown", reply_markup=kb)
+        except:
+            await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+    # ===== الباحث القرآني =====
+    # ===== ختم القرآن =====
+    elif q.data == "khatma_quran":
+        await q.answer()
+        await _show_khatma_status(q, context, user.id, edit=True)
+
+    elif q.data == "khatma_tasbih":
+        await q.answer()
+        context.user_data.setdefault("tasbih_count", 0)
+        context.user_data.setdefault("tasbih_dhikr", 0)
+        context.user_data.setdefault("tasbih_target", 33)
+        await _show_tasbih(q, context, edit=True)
+
+    elif q.data.startswith("khatma_start_"):
+        await q.answer()
+        days = int(q.data.split("_")[2])
+        today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+        with sqlite3.connect("bot.db") as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO khatma (user_id, current_page, target_days, start_date, last_read) VALUES (?,0,?,?,?)",
+                (user.id, days, today, today)
+            )
+        await _show_khatma_status(q, context, user.id, edit=True)
+
+    elif q.data == "khatma_read":
+        await q.answer()
+        with sqlite3.connect("bot.db") as conn:
+            row = conn.execute("SELECT current_page, target_days, start_date FROM khatma WHERE user_id=?", (user.id,)).fetchone()
+        if not row:
+            await q.answer("ابدأ ختمة أولاً!", show_alert=True)
+            return
+        current, target_days, start_date = row
+        pages_per_day = round(604 / target_days)
+        new_page = min(604, current + pages_per_day)
+        today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+        with sqlite3.connect("bot.db") as conn:
+            conn.execute("UPDATE khatma SET current_page=?, last_read=? WHERE user_id=?", (new_page, today, user.id))
+        if new_page >= 604:
+            try:
+                await q.message.edit_text(
+                    "🎉 *مبارك! أتممت ختم القرآن الكريم!*\n\n"
+                    "تقبّل الله منك وجعله في موازين حسناتك 🤍\n\n"
+                    "اضغط لبدء ختمة جديدة 👇",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[
+                        colored_btn("📖 ختمة جديدة", callback_data="khatma_reset", style="success")
+                    ]])
+                )
+            except Exception:
+                pass
+        else:
+            await _show_khatma_status(q, context, user.id, edit=True)
+
+    elif q.data == "khatma_update":
+        await q.answer()
+        context.user_data["khatma_update_mode"] = True
+        await q.message.reply_text(
+            "📄 أرسل رقم الصفحة التي وصلت إليها (1-604):",
+        )
+
+    elif q.data == "khatma_reset":
+        await q.answer()
+        with sqlite3.connect("bot.db") as conn:
+            conn.execute("DELETE FROM khatma WHERE user_id=?", (user.id,))
+        await _show_khatma_status(q, context, user.id, edit=True)
+
+    elif q.data == "qa_new":
+        await q.answer()
+        can_ask, remaining, _ = can_ask_question(user.id)
+        if can_ask:
+            context.user_data["islamic_qa_mode"] = True
+            await q.message.reply_text(
+                f"❓ اكتب سؤالك الديني 👇\n_({remaining} سؤال متبقي اليوم)_",
+                parse_mode="Markdown"
+            )
+        else:
+            kb = InlineKeyboardMarkup([[
+                colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="success")
+            ]])
+            await q.message.reply_text(
+                f"⚠️ انتهت أسئلتك اليوم!\nيتجدد رصيدك غداً 🌅",
+                reply_markup=kb
+            )
+
+    elif q.data == "qa_buy":
+        await q.answer()
+        await context.bot.send_invoice(
+            chat_id=user.id,
+            title="⭐ 5 أسئلة دينية إضافية",
+            description=f"أضف {QA_EXTRA_BONUS} أسئلة إضافية لسؤالك الديني اليوم",
+            payload=f"qa_extra_{user.id}",
+            provider_token="",
+            currency="XTR",
+            prices=[LabeledPrice(f"{QA_EXTRA_STARS} نجوم", QA_EXTRA_STARS)]
+        )
+
+    # ===== التسبيح =====
+    elif q.data == "tasbih_tap":
+        count = context.user_data.get("tasbih_count", 0)
+        target = context.user_data.get("tasbih_target", 33)
+        if count < target:
+            context.user_data["tasbih_count"] = count + 1
+        await q.answer(f"{context.user_data['tasbih_count']}")
+        await _show_tasbih(q, context, edit=True)
+
+    elif q.data == "tasbih_reset":
+        context.user_data["tasbih_count"] = 0
+        await q.answer("تم الإعادة")
+        await _show_tasbih(q, context, edit=True)
+
+    elif q.data in ("tasbih_prev", "tasbih_next"):
+        idx = context.user_data.get("tasbih_dhikr", 0)
+        idx = (idx - 1) % len(TASBIH_OPTIONS) if q.data == "tasbih_prev" else (idx + 1) % len(TASBIH_OPTIONS)
+        context.user_data["tasbih_dhikr"] = idx
+        context.user_data["tasbih_count"] = 0
+        await q.answer()
+        await _show_tasbih(q, context, edit=True)
+
+    elif q.data.startswith("tasbih_t_"):
+        target = int(q.data.split("_")[2])
+        context.user_data["tasbih_target"] = target
+        context.user_data["tasbih_count"] = 0
+        await q.answer(f"الهدف: {target}")
+        await _show_tasbih(q, context, edit=True)
+
+    elif q.data == "tasbih_info":
+        dhikr_idx = context.user_data.get("tasbih_dhikr", 0)
+        dhikr_text, _ = TASBIH_OPTIONS[dhikr_idx % len(TASBIH_OPTIONS)]
+        await q.answer(dhikr_text, show_alert=True)
+
+    elif q.data == "qr_new":
+        await q.answer()
+        context.user_data["quran_search_mode"] = True
+        await q.message.reply_text(
+            "📖 أرسل كلمة أو رقم السورة:الآية للبحث 👇\n"
+            "مثال: `الصبر` أو `2:255` أو `الكهف:10`",
+            parse_mode="Markdown"
+        )
+
+    elif q.data in ("qr_prev", "qr_next"):
+        await q.answer()
+        results = context.user_data.get("quran_results", [])
+        page = context.user_data.get("quran_page", 0)
+        if not results:
+            await q.answer("⚠️ انتهت الجلسة، ابحث من جديد", show_alert=True)
+            return
+        page = page - 1 if q.data == "qr_prev" else page + 1
+        page = max(0, min(page, len(results) - 1))
+        context.user_data["quran_page"] = page
+        context.user_data["quran_tafsir"] = {}
+        h = results[page]
+        msg = build_ayah_msg(h, page=page, total=len(results))
+        kb = build_ayah_keyboard(h, page, len(results))
+        try:
+            await q.message.edit_text(msg, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+    elif q.data.startswith("qr_tafsir_"):
+        await q.answer("⏳ جاري جلب التفسير...")
+        parts = q.data.split("_")
+        s, a = int(parts[2]), int(parts[3])
+        tafsir = await fetch_tafsir(s, a)
+        results = context.user_data.get("quran_results", [])
+        page = context.user_data.get("quran_page", 0)
+        if not results:
+            await q.answer("⚠️ انتهت الجلسة", show_alert=True)
+            return
+        h = results[page]
+        if not tafsir:
+            tafsir = "⚠️ التفسير غير متاح لهذه الآية حالياً"
+        msg = build_ayah_msg(h, tafsir=tafsir, page=page, total=len(results))
+        kb = build_ayah_keyboard(h, page, len(results), show_tafsir=True)
+        try:
+            await q.message.edit_text(msg, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+    elif q.data.startswith("qr_hide_tafsir_"):
+        await q.answer()
+        results = context.user_data.get("quran_results", [])
+        page = context.user_data.get("quran_page", 0)
+        if not results:
+            return
+        h = results[page]
+        msg = build_ayah_msg(h, page=page, total=len(results))
+        kb = build_ayah_keyboard(h, page, len(results), show_tafsir=False)
+        try:
+            await q.message.edit_text(msg, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            pass
+
+    elif q.data.startswith("qr_ayah_"):
+        await q.answer()
+        parts = q.data.split("_")
+        s, a = int(parts[2]), int(parts[3])
+        loading = await q.message.reply_text("⏳ جاري جلب الآية...")
+        ayah = await fetch_ayah_by_ref(s, a)
+        if not ayah:
+            await loading.edit_text("⚠️ الآية غير موجودة")
+            return
+        # أضف للنتائج
+        results = context.user_data.get("quran_results", [])
+        # تحقق إذا موجودة
+        exists = any(r.get("surah_num") == s and r.get("ayah_num") == a for r in results)
+        if not exists:
+            results = [ayah]
+            context.user_data["quran_results"] = results
+            context.user_data["quran_page"] = 0
+        page = 0
+        context.user_data["quran_tafsir"] = {}
+        msg = build_ayah_msg(ayah, page=page, total=len(results))
+        kb = build_ayah_keyboard(ayah, page, len(results))
+        await loading.delete()
+        await q.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+    # ===== 🔊 تحويل النص لصوت =====
+    elif q.data.startswith("tts_hadith_"):
+        await q.answer("⏳ جاري تحويل الحديث لصوت...")
+        hid = q.data.replace("tts_hadith_", "")
+        results = context.user_data.get("search_results", [])
+        h = next((r for r in results if str(r.get("id","")) == hid), None)
+        if not h and results:
+            h = results[context.user_data.get("search_page", 0)]
+        if not h:
+            await q.answer("⚠️ لم أجد الحديث", show_alert=True)
+            return
+        tts_text = (
+            f"حديث نبوي شريف.\n"
+            f"{h['text']}\n\n"
+            f"رواه {h.get('rawi','')}"
+        )
+        ok = await send_voice_reply(q, tts_text)
+        if not ok:
+            await q.answer("⚠️ تعذّر تحويل الصوت، حاول لاحقاً", show_alert=True)
+
+    elif q.data == "tts_qudwati":
+        await q.answer("⏳ جاري تحويل القصة لصوت...")
+        _base = _dt.date(2025, 1, 1)
+        _cur = _dt.datetime.now(AMMAN_TZ).date()
+        _idx = (_cur - _base).days % len(QUDWATI_STORIES)
+        story = context.user_data.get("current_qudwati") or QUDWATI_STORIES[_idx]
+        tts_text = (
+            f"قدوتي اليوم: {story['name']}.\n\n"
+            f"{story['story']}\n\n"
+            f"العبرة: {story['lesson']}"
+        )
+        ok = await send_voice_reply(q, tts_text)
+        if not ok:
+            await q.answer("⚠️ تعذّر تحويل الصوت، تأكد من تثبيت gTTS", show_alert=True)
+
+    elif q.data == "tts_duaa":
+        await q.answer("⏳ جاري تحويل الدعاء لصوت...")
+        d = context.application.bot_data.get("duaa_today") or get_duaa_of_day()
+        tts_text = f"دعاء اليوم.\n\n{d['text']}\n\nالمصدر: {d.get('source','')}"
+        ok = await send_voice_reply(q, tts_text)
+        if not ok:
+            await q.answer("⚠️ تعذّر تحويل الصوت", show_alert=True)
+
+    elif q.data == "qudwati_reveal":
+        await q.answer()
+        # نبحث في كل مكان ممكن
+        answer = (
+            context.user_data.get("qudwati_answer_saved") or
+            context.user_data.get("qudwati_answer") or
+            ""
+        )
+        context.user_data.pop("qudwati_waiting", None)
+        if answer:
+            await q.message.reply_text(
+                f"✅ *الإجابة الصحيحة:*\n\n{answer}",
+                parse_mode="Markdown"
+            )
+        else:
+            await q.answer("❗ اضغط على قدوتي اليوم مجدداً", show_alert=True)
+
+async def show_search_page_from_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    results = context.user_data.get("search_results", [])
+    page = context.user_data.get("search_page", 0)
+    if not results:
+        # حاول استرجاع الجلسة من DB
+        if session and session.get("results"):
+            results = session["results"]
+            page = session["page"]
+            context.user_data["search_results"] = results
+            context.user_data["search_results_all"] = results
+            context.user_data["search_page"] = page
+            context.user_data["grade_filter"] = session.get("grade_filter", "all")
+            context.user_data["search_id"] = session.get("search_id", "")
+        else:
+            await update.callback_query.answer("⚠️ انتهت الجلسة، ابحث من جديد.", show_alert=True)
+            return
+
+    total_pages = len(results)
+    if page >= total_pages:
+        page = total_pages - 1
+        context.user_data["search_page"] = page
+
+    user = update.effective_user
+    h = results[page]
+    msg = build_hadith_msg(h, page, total_pages)
+    # تحقق إذا الحديث في المفضلة
+    favs = get_favorites(user.id) if has_favorites(user.id) else []
+    is_fav = any(f["text"] == h["text"] for f in favs)
+    cf = context.user_data.get("grade_filter", "all")
+    keyboard = build_keyboard(page, total_pages, h["id"], user_id=user.id, is_fav=is_fav, context_filter=cf)
+
+    try:
+        await update.callback_query.message.delete()
+    except:
+        pass
+    await update.callback_query.message.reply_text(msg, parse_mode="HTML", reply_markup=keyboard)
+
+async def handle_report_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    report_text = update.message.text.strip()
+
+    hadith_id = context.user_data.get("reporting_hadith_id")
+    hadith_text = context.user_data.get("reporting_hadith_text")
+
+    if hadith_id is not None and hadith_text:
+        # احفظ نص التقرير وانتظر التأكيد
+        context.user_data["pending_report_text"] = report_text
+        context.user_data["reporting"] = False  # أوقف الاستقبال مؤقتاً
+
+        confirm_kb = InlineKeyboardMarkup([[
+            colored_btn("✅ نعم، أرسل التقرير", callback_data="confirm_report", style="success"),
+            colored_btn("❌ لا، إلغاء", callback_data="cancel_report", style="danger"),
+        ]])
+        await update.message.reply_text(
+            f"📝 تقريرك:\n\n{report_text}\n\n"
+            "هل تريد إرسال هذا التقرير إلى المطور؟",
+            reply_markup=confirm_kb
+        )
+    else:
+        await update.message.reply_text("⚠️ حدث خطأ، يرجى إعادة المحاولة.")
+        context.user_data.pop("reporting", None)
+        context.user_data.pop("reporting_hadith_id", None)
+        context.user_data.pop("reporting_hadith_text", None)
+
+# ==================== التشغيل ====================
+def run_web_server():
+    """سيرفر بسيط يمنع Replit من النوم"""
+    from http.server import HTTPServer, BaseHTTPRequestHandler
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-type", "text/plain")
+            self.end_headers()
+            self.wfile.write("راوِي | Bot is alive ✅".encode())
+        def log_message(self, *args):
+            pass  # يكتم logs السيرفر
+    server = HTTPServer(("0.0.0.0", 8080), Handler)
+    server.serve_forever()
+
+async def scheduled_daily_hadith(context):
+    """إرسال حديث اليوم لجميع المشتركين"""
+    try:
+        topics = ["الصبر", "الصلاة", "الإخلاص", "الأخلاق", "الدعاء", "التوبة", "الرحمة", "العلم"]
+        import random as _rsch
+        topic = _rsch.choice(topics)
+        results = await search_dorar_api(topic)
+        if not results:
+            return
+        h = _rsch.choice(results[:5])
+        msg = (
+            "🌅 *حديث اليوم*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            f"📌 {h['text']}\n\n"
+            f"👤 الراوي: {h.get('rawi') or 'غير محدد'}\n"
+            f"📚 المصدر: {h.get('source') or 'غير محدد'}\n"
+            f"⚖️ الدرجة: {h.get('grade') or 'غير محدد'}\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            f"🤖 {BOT_NAME} | {BOT_USERNAME}"
+        )
+        subscribers = get_subscribers("daily_hadith")
+        success = fail = 0
+        for uid in subscribers:
+            try:
+                kb = InlineKeyboardMarkup([[
+                    colored_btn("✅ قرأت", callback_data="streak_read", style="success")
+                ]])
+                await context.bot.send_message(uid, msg, parse_mode="Markdown", reply_markup=kb)
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                fail += 1
+        logger.info(f"✅ حديث اليوم أُرسل لـ {success} مشترك، فشل: {fail}")
+    except Exception as e:
+        logger.error(f"scheduled_daily_hadith error: {e}")
+
+async def scheduled_monday_hadith(context):
+    """إشعار خاص كل يوم اثنين - حديث مميز"""
+    try:
+        now = _dt.datetime.now(AMMAN_TZ)
+        if now.weekday() != 0:  # 0 = Monday
+            return
+        results = await search_dorar_api("الاثنين")
+        import random as _rmon
+        if results:
+            h = _rmon.choice(results[:5])
+        else:
+            return
+        msg = (
+            "🌟 *حديث يوم الاثنين*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            f"📌 {h['text']}\n\n"
+            f"👤 الراوي: {h.get('rawi') or 'غير محدد'}\n"
+            f"📚 المصدر: {h.get('source') or 'غير محدد'}\n"
+            f"⚖️ الدرجة: {h.get('grade') or 'غير محدد'}\n\n"
+            "💡 _كان النبي ﷺ يصوم الاثنين ويقول: ذلك يوم وُلدت فيه_\n\n"
+            "━━━━━━━━━━━━━━━\n"
+            f"🤖 {BOT_NAME} | {BOT_USERNAME}"
+        )
+        subscribers = get_subscribers("daily_hadith")
+        success = 0
+        for uid in subscribers:
+            try:
+                await context.bot.send_message(uid, msg, parse_mode="Markdown")
+                success += 1
+                await asyncio.sleep(0.05)
+            except:
+                pass
+        logger.info(f"✅ حديث الاثنين أُرسل لـ {success} مشترك")
+    except Exception as e:
+        logger.error(f"scheduled_monday_hadith error: {e}")
+
+def watchdog():
+    """يراقب البوت ويسجل لو في مشكلة"""
+    import time as _time
+    import os as _os
+    import subprocess as _sub
+    _time.sleep(30)
+    fails = 0
+    while True:
+        try:
+            import urllib.request as _req
+            _req.urlopen("http://localhost:8080", timeout=10)
+            fails = 0
+        except Exception as e:
+            fails += 1
+            logger.warning(f"⚠️ Watchdog: البوت لا يستجيب ({fails}/3) - {e}")
+            if fails >= 3:
+                logger.error("🔴 Watchdog: إعادة تشغيل...")
+                _os.execv(__import__('sys').executable, [__import__('sys').executable] + __import__('sys').argv)
+        _time.sleep(60)
+
+def self_ping():
+    """يقرع البوت نفسه كل دقيقة لمنع النوم"""
+    import urllib.request as _req
+    import time as _time
+    _time.sleep(20)  # انتظر يشتغل البوت أولاً
+    while True:
+        try:
+            _req.urlopen("http://localhost:8080", timeout=5)
+        except:
+            pass
+        _time.sleep(60)  # كل دقيقة
+
+def main():
+    logger.info("🚀 بدء تشغيل بوت راوِي...")
+    init_db()
+    # شغّل web server في thread منفصل عشان Replit ما ينام
+    from threading import Thread
+    Thread(target=run_web_server, daemon=True).start()
+    Thread(target=self_ping, daemon=True).start()
+    Thread(target=watchdog, daemon=True).start()
+    logger.info("🌐 Web server شغّال على port 8080 + self-ping كل 4 دقائق")
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    # ===== جدولة الإشعارات اليومية =====
+    jq = app.job_queue
+    if jq:
+        # حديث اليوم كل يوم الساعة 7 صباحاً بتوقيت عمّان
+        jq.run_daily(
+            scheduled_daily_hadith,
+            time=_dt.time(7, 0, 0, tzinfo=AMMAN_TZ),
+            name="daily_hadith"
+        )
+        # حديث الاثنين — يُرسل كل يوم الاثنين الساعة 8 صباحاً
+        jq.run_daily(
+            scheduled_monday_hadith,
+            time=_dt.time(8, 0, 0, tzinfo=AMMAN_TZ),
+            days=(0,),  # الاثنين
+            name="monday_hadith"
+        )
+        logger.info("✅ الإشعارات اليومية مجدولة")
+
+    # إضافة المعالجات - CommandHandlers أولاً دايماً قبل MessageHandler
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("version", version_command))
+    app.add_handler(CommandHandler("random", random_hadith))
+    app.add_handler(CommandHandler("donate", donate_command))
+    app.add_handler(CommandHandler("qudwati", cmd_qudwati))
+    app.add_handler(CommandHandler("quran", cmd_quran_search))
+
+    # Inline Mode — للمشاركة بزر شفاف
+    app.add_handler(InlineQueryHandler(handle_inline_query))
+
+    # معالجات الدفع
+    app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+
+    # معالج الأزرار التفاعلية
+    app.add_handler(CallbackQueryHandler(handle_callback))
+
+    # معالج الرسائل العام - دايماً آخر شي
+    app.add_handler(MessageHandler(filters.ALL, handle_message))
+
+    logger.info("✅ البوت جاهز!")
+    app.run_polling(drop_pending_updates=True)
+
+# ==================== أوامر Premium ====================
+
+TOPICS = {
+    "الصلاة": "الصلاة",
+    "🌙 الصيام": "الصيام والصوم",
+    "💰 الزكاة": "الزكاة",
+    "🤲 الدعاء": "الدعاء",
+    "💪 الصبر": "الصبر",
+    "🤝 الأخلاق": "الأخلاق والمعاملة",
+    "📖 العلم": "العلم والتعلم",
+    "❤️ الرحمة": "الرحمة والرفق",
+    "🏠 الأسرة": "الأسرة والوالدين",
+    "💼 الرزق": "الرزق والعمل",
+    "🔄 توبة": "التوبة والاستغفار",
+    "🌍 الآخرة": "الآخرة والجنة",
+}
+
+async def cmd_challenge_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """تحدي في أي وقت - أحاديث ثابتة"""
+    user = update.effective_user
+    if has_answered_today(user.id):
+        await update.message.reply_text("✅ أجبت على تحدي اليوم! تعال غداً 🌙")
+        return
+    challenge = get_today_challenge()
+    if not challenge:
+        static = [('إنما الأعمال بالنيات وإنما لكل امرئ ما نوى فمن كانت هجرته إلى الله ورسوله فهجرته إلى الله ورسوله ومن كانت هجرته لدنيا يصيبها أو امرأة ينكحها فهجرته إلى ما هاجر إليه', 'صحيح البخاري', 'صحيح'), ('المسلم من سلم المسلمون من لسانه ويده والمهاجر من هجر ما نهى الله عنه', 'صحيح البخاري', 'صحيح'), ('لا يؤمن أحدكم حتى يحب لأخيه ما يحب لنفسه من الخير', 'صحيح البخاري', 'صحيح'), ('من كان يؤمن بالله واليوم الآخر فليقل خيراً أو ليصمت ومن كان يؤمن بالله واليوم الآخر فليكرم جاره ومن كان يؤمن بالله واليوم الآخر فليكرم ضيفه', 'صحيح البخاري', 'صحيح'), ('الدين النصيحة قلنا لمن قال لله ولكتابه ولرسوله ولأئمة المسلمين وعامتهم', 'صحيح مسلم', 'صحيح'), ('خير الناس أنفعهم للناس', 'صحيح الجامع', 'صحيح'), ('اتق الله حيثما كنت وأتبع السيئة الحسنة تمحها وخالق الناس بخلق حسن', 'صحيح الترمذي', 'صحيح'), ('كل أمتي يدخلون الجنة إلا من أبى قيل ومن يأبى قال من أطاعني دخل الجنة ومن عصاني فقد أبى', 'صحيح البخاري', 'صحيح'), ('بينما رجل يمشي بطريق وجد غصن شوك على الطريق فأخره فشكر الله له فغفر له', 'صحيح البخاري', 'صحيح'), ('لو كان الدنيا تعدل عند الله جناح بعوضة ما سقى كافراً منها شربة ماء', 'صحيح الترمذي', 'صحيح')]
+        full_text = _random.choice(static)[0]
+        words = full_text.split()
+        if len(words) < 6:
+            full_text = static[0][0]
+            words = full_text.split()
+        answer = words[-1].strip(".,،؟!")
+        question_text = " ".join(words[:-1]) + " ..."
+        save_today_challenge(question_text, answer, full_text)
+        challenge = {"text": question_text, "answer": answer, "full": full_text}
+    context.user_data["in_challenge"] = True
+    context.user_data["challenge_answer"] = challenge["answer"]
+    context.user_data["challenge_full"] = challenge["full"]
+    await update.message.reply_text(
+        "🧩 تحدي اليوم\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "أكمل الحديث النبوي:\n\n"
+        f"📌 {challenge['text']}\n\n"
+        "أرسل الكلمة الناقصة 👇"
+    )
+
+async def _send_fc_question(update_or_msg, context: ContextTypes.DEFAULT_TYPE):
+    """أرسل سؤال تحدي الصديق"""
+    questions = context.user_data.get("fc_questions", [])
+    idx = context.user_data.get("fc_index", 0)
+    if idx >= len(questions):
+        return
+    q = questions[idx]
+    opts = q["options"]
+    kb = InlineKeyboardMarkup([
+        [colored_btn(opts[0], callback_data="fc_ans_0", style="primary"),
+         colored_btn(opts[1], callback_data="fc_ans_1", style="primary")],
+        [colored_btn(opts[2], callback_data="fc_ans_2", style="primary"),
+         colored_btn(opts[3], callback_data="fc_ans_3", style="primary")],
+    ])
+    msg = (
+        f"❓ *سؤال {idx+1}/{len(questions)}*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"*{q['q']}*"
+    )
+    if hasattr(update_or_msg, 'message') and update_or_msg.message:
+        await update_or_msg.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await update_or_msg.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+
+async def cmd_friend_challenge(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """زر تحدي صديق من الكيبورد"""
+    user = update.effective_user
+    import random as _rand_fc
+    questions = _rand_fc.sample(DAILY_QUESTIONS, min(10, len(DAILY_QUESTIONS)))
+    challenge_id = create_friend_challenge(user.id, user.full_name, questions)
+    context.user_data["fc_id"] = challenge_id
+    context.user_data["fc_role"] = "creator"
+    context.user_data["fc_index"] = 0
+    context.user_data["fc_score"] = 0
+    context.user_data["fc_questions"] = questions
+    link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=fc_{challenge_id}"
+    share_text = urllib.parse.quote(
+        f"⚔️ تحداني {user.full_name} في بوت راوِي الإسلامي!\n\n"
+        f"هل تقدر تتفوق عليّ؟ 10 أسئلة إسلامية 🎯\n\n"
+        f"👇 اضغط هنا لقبول التحدي:\n{link}"
+    )
+    tg_share_url = f"https://t.me/share/url?url={link}&text={share_text}"
+    kb = InlineKeyboardMarkup([
+        [colored_btn("📤 شارك التحدي مع صديق", switch_inline_query=f"challenge_{challenge_id}", style="primary")],
+        [colored_btn("🚀 ابدأ الاختبار الآن", callback_data="fc_start", style="success")],
+    ])
+    await update.message.reply_text(
+        "⚔️ *تحدي الصديق*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "📋 10 أسئلة إسلامية\n"
+        "⭐ كل إجابة صحيحة = نقطة\n\n"
+        "1️⃣ شارك الرابط مع صديقك\n"
+        "2️⃣ ابدأ الاختبار أنت أيضاً\n"
+        "3️⃣ تقارن النتيجة في النهاية 🏆",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+
+# ==================== الباحث القرآني ====================
+
+QURAN_SURAHS = {
+    "الفاتحة":1,"البقرة":2,"آل عمران":3,"النساء":4,"المائدة":5,
+    "الأنعام":6,"الأعراف":7,"الأنفال":8,"التوبة":9,"يونس":10,
+    "هود":11,"يوسف":12,"الرعد":13,"إبراهيم":14,"الحجر":15,
+    "النحل":16,"الإسراء":17,"الكهف":18,"مريم":19,"طه":20,
+    "الأنبياء":21,"الحج":22,"المؤمنون":23,"النور":24,"الفرقان":25,
+    "الشعراء":26,"النمل":27,"القصص":28,"العنكبوت":29,"الروم":30,
+    "لقمان":31,"السجدة":32,"الأحزاب":33,"سبأ":34,"فاطر":35,
+    "يس":36,"الصافات":37,"ص":38,"الزمر":39,"غافر":40,
+    "فصلت":41,"الشورى":42,"الزخرف":43,"الدخان":44,"الجاثية":45,
+    "الأحقاف":46,"محمد":47,"الفتح":48,"الحجرات":49,"ق":50,
+    "الذاريات":51,"الطور":52,"النجم":53,"القمر":54,"الرحمن":55,
+    "الواقعة":56,"الحديد":57,"المجادلة":58,"الحشر":59,"الممتحنة":60,
+    "الصف":61,"الجمعة":62,"المنافقون":63,"التغابن":64,"الطلاق":65,
+    "التحريم":66,"الملك":67,"القلم":68,"الحاقة":69,"المعارج":70,
+    "نوح":71,"الجن":72,"المزمل":73,"المدثر":74,"القيامة":75,
+    "الإنسان":76,"المرسلات":77,"النبأ":78,"النازعات":79,"عبس":80,
+    "التكوير":81,"الانفطار":82,"المطففين":83,"الانشقاق":84,"البروج":85,
+    "الطارق":86,"الأعلى":87,"الغاشية":88,"الفجر":89,"البلد":90,
+    "الشمس":91,"الليل":92,"الضحى":93,"الشرح":94,"التين":95,
+    "العلق":96,"القدر":97,"البينة":98,"الزلزلة":99,"العاديات":100,
+    "القارعة":101,"التكاثر":102,"العصر":103,"الهمزة":104,"الفيل":105,
+    "قريش":106,"الماعون":107,"الكوثر":108,"الكافرون":109,"النصر":110,
+    "المسد":111,"الإخلاص":112,"الفلق":113,"الناس":114,
+}
+
+async def fetch_quran_search(query: str) -> list:
+    """بحث في القرآن عبر API alquran.cloud مع تصحيح إملائي"""
+    # قاموس تصحيح الأخطاء الشائعة في الكتابة العربية
+    QURAN_FIXES = [
+        # تصحيح التاء المربوطة والمبسوطة
+        (lambda q: q.replace("ه", "ة").replace("ة", "ه"), "تاء مربوطة/مبسوطة"),
+        # تصحيح الألف المقصورة والممدودة
+        (lambda q: q.replace("ى", "ي").replace("ي", "ى"), "ألف مقصورة/ياء"),
+        # تصحيح الهمزات
+        (lambda q: q.replace("أ", "ا").replace("إ", "ا").replace("آ", "ا"), "همزات"),
+        # تصحيح الضاد/الظاء
+        (lambda q: q.replace("ض", "ظ").replace("ظ", "ض"), "ضاد/ظاء"),
+    ]
+
+    async def _search_once(q: str) -> list:
+        encoded = urllib.parse.quote(q)
+        url = f"https://api.alquran.cloud/v1/search/{encoded}/all/ar"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; QuranBot/1.0)"}
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+                async with session.get(url, headers=headers) as resp:
+                    if resp.status != 200:
+                        return []
+                    data = await resp.json()
+                    if data.get("status") != "OK":
+                        return []
+                    matches = data.get("data", {}).get("matches", [])
+                    results = []
+                    for m in matches[:10]:
+                        results.append({
+                            "text": m.get("text", ""),
+                            "surah_name": m.get("surah", {}).get("name", ""),
+                            "surah_num": m.get("surah", {}).get("number", 0),
+                            "ayah_num": m.get("numberInSurah", 0),
+                            "ref": f"{m.get('surah', {}).get('name', '')}:{m.get('numberInSurah', '')}",
+                        })
+                    return results
+        except Exception as e:
+            logger.error(f"Quran search error: {e}")
+            return []
+
+    # البحث الأول بالنص الأصلي
+    results = await _search_once(query)
+    if results:
+        return results
+
+    # لو ما لقى — جرب تصحيحات إملائية
+    tried = {query}
+    for fix_fn, _ in QURAN_FIXES:
+        variant = fix_fn(query)
+        if variant not in tried:
+            tried.add(variant)
+            results = await _search_once(variant)
+            if results:
+                return results
+
+    # لو لسا ما لقى — جرب كل كلمة منفردة من الكلمات الطويلة
+    words = [w for w in query.split() if len(w) >= 4]
+    for word in words[:3]:
+        if word not in tried:
+            tried.add(word)
+            results = await _search_once(word)
+            if results:
+                return results
+
+    return []
+
+
+async def fetch_tafsir(surah: int, ayah: int) -> str:
+    """جلب تفسير الجلالين لآية معينة"""
+    url = f"https://api.alquran.cloud/v1/ayah/{surah}:{ayah}/ar.jalalayn"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return ""
+                data = await resp.json()
+                if data.get("status") != "OK":
+                    return ""
+                return data.get("data", {}).get("text", "")
+    except Exception as e:
+        logger.error(f"Tafsir fetch error: {e}")
+        return ""
+
+
+async def fetch_ayah_by_ref(surah: int, ayah: int) -> dict:
+    """جلب آية بالرقم مع نصها"""
+    url = f"https://api.alquran.cloud/v1/ayah/{surah}:{ayah}/ar"
+    headers = {"User-Agent": "Mozilla/5.0"}
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status != 200:
+                    return {}
+                data = await resp.json()
+                if data.get("status") != "OK":
+                    return {}
+                d = data.get("data", {})
+                return {
+                    "text": d.get("text", ""),
+                    "surah_name": d.get("surah", {}).get("name", ""),
+                    "surah_num": d.get("surah", {}).get("number", 0),
+                    "ayah_num": d.get("numberInSurah", 0),
+                    "ref": f"{d.get('surah', {}).get('name', '')}:{d.get('numberInSurah', '')}",
+                }
+    except Exception as e:
+        logger.error(f"fetch_ayah error: {e}")
+        return {}
+
+
+def build_ayah_msg(ayah: dict, tafsir: str = "", page: int = 0, total: int = 1) -> str:
+    """بناء رسالة الآية"""
+    ref = ayah.get("ref", "")
+    msg = (
+        f"📖 *نتيجة ({page+1}/{total})*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"🌿 *{ayah['text']}*\n\n"
+        f"📚 السورة: *{ayah['surah_name']}* — الآية: *{ayah['ayah_num']}*\n"
+    )
+    if tafsir:
+        # قصّر التفسير لو طويل
+        t = tafsir[:400] + ("..." if len(tafsir) > 400 else "")
+        msg += f"\n💡 *التفسير (الجلالين):*\n{t}\n"
+    return msg
+
+
+def build_ayah_keyboard(ayah: dict, page: int, total: int,
+                        show_tafsir: bool = False) -> InlineKeyboardMarkup:
+    s = ayah.get("surah_num", 0)
+    a = ayah.get("ayah_num", 0)
+    rows = []
+    # تنقل
+    nav = []
+    if page > 0:
+        nav.append(colored_btn("⬅️ السابق", callback_data="qr_prev", style="primary"))
+    if page < total - 1:
+        nav.append(colored_btn("التالي ➡️", callback_data="qr_next", style="primary"))
+    if nav:
+        rows.append(nav)
+    # تفسير / إخفاء تفسير
+    if not show_tafsir:
+        rows.append([colored_btn("💡 عرض التفسير", callback_data=f"qr_tafsir_{s}_{a}", style="success")])
+    else:
+        rows.append([colored_btn("🔼 إخفاء التفسير", callback_data=f"qr_hide_tafsir_{s}_{a}", style="primary")])
+    # آية سابقة / تالية
+    rows.append([
+        colored_btn("◀️ الآية السابقة", callback_data=f"qr_ayah_{s}_{max(1,a-1)}", style="primary"),
+        colored_btn("الآية التالية ▶️", callback_data=f"qr_ayah_{s}_{a+1}", style="primary"),
+    ])
+    # مشاركة وبحث جديد
+    rows.append([
+        colored_btn("📤 شارك الآية", switch_inline_query=f"ayah_{s}_{a}", style="primary"),
+        colored_btn("🔄 بحث جديد", callback_data="qr_new", style="primary"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def cmd_quran_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """باحث القرآن الكريم"""
+    # إلغاء أي وضع آخر
+    context.user_data["hadith_search_mode"] = False
+    context.user_data["quran_search_mode"] = True
+    await update.message.reply_text(
+        "📖 *الباحث القرآني*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "🔹 *كلمات من الآية*\n"
+        "  `رب اجعلني مقيم الصلاة`\n\n"
+        "🔹 *اسم السورة:رقم الآية*\n"
+        "  `الكهف:10`\n\n"
+        "🔹 *رقم السورة:رقم الآية*\n"
+        "  `18:10`\n\n"
+        "🔹 *اسم السورة فقط*\n"
+        "  `يس` ← يجيب أول 5 آيات\n\n"
+        "✍️ أرسل بحثك الآن 👇",
+        parse_mode="Markdown"
+    )
+
+
+# ==================== ختمة — ختم القرآن والتسبيح ====================
+
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
+ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam - صوت عربي جيد
+
+# ==================== نظام أسئلة السؤال الديني ====================
+QA_FREE_DAILY = 2       # أسئلة مجانية يومياً
+QA_EXTRA_STARS = 10     # نجوم مقابل 5 أسئلة إضافية
+QA_EXTRA_BONUS = 5      # عدد الأسئلة الإضافية
+
+def get_qa_usage(user_id: int) -> dict:
+    """جلب استخدام اليوم"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    with sqlite3.connect("bot.db") as conn:
+        row = conn.execute(
+            "SELECT count, extra_questions FROM qa_usage WHERE user_id=? AND date=?",
+            (user_id, today)
+        ).fetchone()
+    if row:
+        return {"count": row[0], "extra": row[1], "date": today}
+    return {"count": 0, "extra": 0, "date": today}
+
+def increment_qa_usage(user_id: int):
+    """زيادة عداد الأسئلة"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    with sqlite3.connect("bot.db") as conn:
+        conn.execute(
+            "INSERT INTO qa_usage (user_id, date, count) VALUES (?,?,1) "
+            "ON CONFLICT(user_id, date) DO UPDATE SET count=count+1",
+            (user_id, today)
+        )
+
+def add_qa_extra(user_id: int, bonus: int):
+    """إضافة أسئلة إضافية بعد الدفع"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    with sqlite3.connect("bot.db") as conn:
+        conn.execute(
+            "INSERT INTO qa_usage (user_id, date, count, extra_questions) VALUES (?,?,0,?) "
+            "ON CONFLICT(user_id, date) DO UPDATE SET extra_questions=extra_questions+?",
+            (user_id, today, bonus, bonus)
+        )
+
+def decrement_qa_usage(user_id: int):
+    """إلغاء خصم سؤال لو فشل الـ API"""
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    with sqlite3.connect("bot.db") as conn:
+        conn.execute(
+            "UPDATE qa_usage SET count=MAX(0,count-1) WHERE user_id=? AND date=?",
+            (user_id, today)
+        )
+
+
+def can_ask_question(user_id: int) -> tuple:
+    """
+    هل يمكن للمستخدم أن يسأل؟
+    returns: (can_ask: bool, remaining: int, is_free: bool)
+    """
+    usage = get_qa_usage(user_id)
+    used = usage["count"]
+    extra = usage["extra"]
+    total_allowed = QA_FREE_DAILY + extra
+    remaining = max(0, total_allowed - used)
+    return remaining > 0, remaining, used < QA_FREE_DAILY
+
+
+# ==================== تحويل النص لصوت ====================
+
+def _clean_tts_text(text: str) -> str:
+    """تنظيف النص من رموز Markdown وHTMLأ"""
+    import re as _re
+    text = _re.sub(r'<[^>]+>', '', text)       # HTML tags
+    text = _re.sub(r'[*_`#]', '', text)         # Markdown
+    text = _re.sub(r'━+', '—', text)            # خطوط
+    text = _re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+async def _tts_elevenlabs(text: str) -> bytes | None:
+    """ElevenLabs — الأساسي"""
+    if not ELEVENLABS_API_KEY:
+        return None
+    text = text[:2500]
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVENLABS_VOICE_ID}"
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+    body = {
+        "text": text,
+        "model_id": "eleven_multilingual_v2",
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.post(url, json=body, headers=headers) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                logger.error(f"ElevenLabs {resp.status}: {(await resp.text())[:100]}")
+                return None
+    except Exception as e:
+        logger.error(f"ElevenLabs error: {e}")
+        return None
+
+
+async def _tts_gtts(text: str) -> bytes | None:
+    """gTTS — الاحتياطي المجاني"""
+    try:
+        import io
+        from gtts import gTTS
+        tts = gTTS(text=text[:1500], lang='ar', slow=False)
+        buf = io.BytesIO()
+        tts.write_to_fp(buf)
+        buf.seek(0)
+        return buf.read()
+    except ImportError:
+        logger.warning("gTTS غير مثبتة — pip install gTTS")
+        return None
+    except Exception as e:
+        logger.error(f"gTTS error: {e}")
+        return None
+
+
+async def text_to_voice(text: str) -> bytes | None:
+    """
+    تحويل النص لصوت.
+    يحاول ElevenLabs أولاً، ثم gTTS احتياطياً.
+    """
+    text = _clean_tts_text(text)
+    if not text:
+        return None
+
+    # ElevenLabs أولاً
+    audio = await _tts_elevenlabs(text)
+    if audio:
+        return audio
+
+    # gTTS احتياطي
+    logger.info("TTS: ElevenLabs فشل أو غير مفعّل — جاري استخدام gTTS")
+    audio = await asyncio.get_event_loop().run_in_executor(
+        None, lambda: asyncio.run(_tts_gtts(text))
+    )
+    # run_in_executor مع async — نستخدم ThreadPoolExecutor
+    if audio is None:
+        try:
+            import io
+            from gtts import gTTS
+            import concurrent.futures
+            def _sync_gtts():
+                tts = gTTS(text=text[:1500], lang='ar', slow=False)
+                buf = io.BytesIO()
+                tts.write_to_fp(buf)
+                buf.seek(0)
+                return buf.read()
+            loop = asyncio.get_event_loop()
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                audio = await loop.run_in_executor(pool, _sync_gtts)
+        except Exception as e:
+            logger.error(f"gTTS fallback error: {e}")
+            return None
+    return audio
+
+
+async def send_voice_reply(update_or_msg, text: str, caption: str = "") -> bool:
+    """إرسال رد صوتي"""
+    import io
+    audio = await text_to_voice(text)
+    if not audio:
+        return False
+    audio_file = io.BytesIO(audio)
+    audio_file.name = "voice.mp3"
+    msg = update_or_msg.message if hasattr(update_or_msg, 'message') else update_or_msg
+    try:
+        await msg.reply_voice(voice=audio_file, caption=caption or None)
+        return True
+    except Exception as e:
+        logger.error(f"send_voice error: {e}")
+        return False
+
+
+async def call_gemini(prompt: str) -> str:
+    """استدعاء Gemini 3.1 Flash-Lite Preview API"""
+    if not GEMINI_API_KEY:
+        return "⚠️ لم يتم تكوين مفتاح Gemini API. أضف GEMINI_API_KEY في متغيرات البيئة."
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.1-flash-lite-preview:generateContent?key={GEMINI_API_KEY}"
+    body = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 600, "temperature": 0.3}
+    }
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=20)) as session:
+            async with session.post(url, json=body) as resp:
+                if resp.status != 200:
+                    err = await resp.text()
+                    logger.error(f"Gemini API error {resp.status}: {err[:200]}")
+                    return "⚠️ لم أتمكن من الإجابة الآن، حاول مرة أخرى."
+                data = await resp.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+    except Exception as e:
+        logger.error(f"Gemini error: {e}")
+        return "⚠️ حدث خطأ، حاول مرة أخرى."
+
+
+# ===== التسبيح =====
+TASBIH_OPTIONS = [
+    ("سُبْحَانَ اللهِ", "سبحان الله"),
+    ("الحَمْدُ للهِ", "الحمد لله"),
+    ("اللهُ أَكْبَرُ", "الله أكبر"),
+    ("لَا إِلَهَ إِلَّا اللهُ", "لا إله إلا الله"),
+    ("سُبْحَانَ اللهِ وَبِحَمْدِهِ", "سبحان الله وبحمده"),
+    ("أَسْتَغْفِرُ اللهَ", "أستغفر الله"),
+]
+
+async def cmd_khatma_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """قائمة ختمة — يعرض زر ختم القرآن وزر التسبيح"""
+    kb = InlineKeyboardMarkup([
+        [colored_btn("📖 ختم القرآن", callback_data="khatma_quran", style="primary"),
+         colored_btn("📿 التسبيح", callback_data="khatma_tasbih", style="primary")],
+    ])
+    await update.message.reply_text(
+        "📿 *ختمة*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "اختر ما تريد 👇",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+
+async def _show_khatma_status(update_or_query, context, user_id: int, edit=False):
+    """عرض حالة ختم القرآن"""
+    with sqlite3.connect("bot.db") as conn:
+        row = conn.execute(
+            "SELECT current_page, target_days, start_date FROM khatma WHERE user_id=?",
+            (user_id,)
+        ).fetchone()
+
+    if not row:
+        kb = InlineKeyboardMarkup([
+            [colored_btn("🚀 ابدأ ختمة جديدة", callback_data="khatma_start_30", style="success"),],
+            [colored_btn("📅 30 يوم", callback_data="khatma_start_30", style="primary"),
+             colored_btn("📅 60 يوم", callback_data="khatma_start_60", style="primary"),
+             colored_btn("📅 90 يوم", callback_data="khatma_start_90", style="primary")],
+        ])
+        msg = (
+            "📖 *ختم القرآن الكريم*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "القرآن = 604 صفحة\n\n"
+            "اختر مدة الختمة 👇\n"
+            "• 30 يوم = ~20 صفحة يومياً\n"
+            "• 60 يوم = ~10 صفحات يومياً\n"
+            "• 90 يوم = ~7 صفحات يومياً"
+        )
+    else:
+        current, target_days, start_date = row
+        pages_per_day = round(604 / target_days)
+        remaining = 604 - current
+        today = _dt.datetime.now(AMMAN_TZ).date()
+        start = _dt.date.fromisoformat(start_date)
+        days_passed = (today - start).days + 1
+        expected_page = min(604, days_passed * pages_per_day)
+        behind = max(0, expected_page - current)
+        pct = round(current / 604 * 100)
+        bar_filled = round(pct / 10)
+        bar = "█" * bar_filled + "░" * (10 - bar_filled)
+
+        kb = InlineKeyboardMarkup([
+            [colored_btn("✅ قرأت اليوم", callback_data="khatma_read", style="success")],
+            [colored_btn("📄 تحديث الصفحة", callback_data="khatma_update", style="primary"),
+             colored_btn("🔄 ختمة جديدة", callback_data="khatma_reset", style="danger")],
+        ])
+        behind_text = f"\n⚠️ متأخر {behind} صفحة عن الجدول" if behind > 0 else "\n✅ أنت في الموعد!"
+        msg = (
+            f"📖 *ختمتك*\n"
+            f"━━━━━━━━━━━━━━━\n\n"
+            f"📊 التقدم: {current}/604 صفحة ({pct}%)\n"
+            f"[{bar}]\n\n"
+            f"📅 اليوم {days_passed} من {target_days}\n"
+            f"📄 المتبقي: {remaining} صفحة\n"
+            f"📖 يومياً: {pages_per_day} صفحة{behind_text}"
+        )
+
+    if edit:
+        try:
+            await update_or_query.message.edit_text(msg, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            await update_or_query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await update_or_query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+
+async def _show_tasbih(update_or_query, context, edit=False):
+    """عرض شاشة التسبيح"""
+    dhikr_idx = context.user_data.get("tasbih_dhikr", 0)
+    count = context.user_data.get("tasbih_count", 0)
+    target = context.user_data.get("tasbih_target", 33)
+    dhikr_text, dhikr_short = TASBIH_OPTIONS[dhikr_idx % len(TASBIH_OPTIONS)]
+
+    remaining = target - count
+    pct = min(100, round(count / target * 100))
+    bar = "█" * round(pct / 10) + "░" * (10 - round(pct / 10))
+
+    if count >= target:
+        status = f"🎉 أتممت {target} مرة!\n[{bar}]"
+        main_btn = colored_btn(f"🔄 جولة جديدة", callback_data="tasbih_reset", style="success")
+    else:
+        status = f"[{bar}] {count}/{target}"
+        main_btn = colored_btn(f"     {dhikr_text}     ", callback_data="tasbih_tap", style="success")
+
+    kb = InlineKeyboardMarkup([
+        [main_btn],
+        [colored_btn("33 ✦", callback_data="tasbih_t_33", style="primary"),
+         colored_btn("99 ✦", callback_data="tasbih_t_99", style="primary"),
+         colored_btn("100 ✦", callback_data="tasbih_t_100", style="primary")],
+        [colored_btn("◀️", callback_data="tasbih_prev", style="primary"),
+         colored_btn(f"({dhikr_short[:12]})", callback_data="tasbih_info", style="primary"),
+         colored_btn("▶️", callback_data="tasbih_next", style="primary")],
+        [colored_btn("↩️ إعادة", callback_data="tasbih_reset", style="danger")],
+    ])
+    msg = (
+        f"📿 *التسبيح*\n"
+        f"━━━━━━━━━━━━━━━\n\n"
+        f"*{dhikr_text}*\n\n"
+        f"{status}"
+    )
+    if edit:
+        try:
+            await update_or_query.message.edit_text(msg, parse_mode="Markdown", reply_markup=kb)
+        except Exception:
+            await update_or_query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+    else:
+        await update_or_query.message.reply_text(msg, parse_mode="Markdown", reply_markup=kb)
+
+
+async def cmd_duaa(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    d = get_duaa_of_day()
+    text = (
+        "🤲 *دعاء اليوم*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        f"*{d['text']}*\n\n"
+        f"📚 المصدر: {d['source']}\n"
+        f"💡 المعنى: {d['meaning']}"
+    )
+    # خزّن الدعاء الكامل في application.bot_data للـ inline query
+    context.application.bot_data[f"duaa_today"] = d
+    kb = InlineKeyboardMarkup([
+        [colored_btn("📤 شارك الدعاء", switch_inline_query="duaa_today", style="primary"),
+         colored_btn("🔊 استمع للدعاء", callback_data="tts_duaa", style="primary")],
+    ])
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=kb)
+
+
+async def cmd_quiz_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
+    with sqlite3.connect("bot.db") as _c:
+        row = _c.execute("SELECT quiz_score FROM quiz_sessions WHERE user_id=? AND quiz_date=? AND quiz_index=10", (user.id, today)).fetchone()
+    if row:
+        await update.message.reply_text(f"✅ أكملت اختبار اليوم!\nنتيجتك: {row[0]}/10 ⭐\n\nتعال غداً لاختبار جديد 🌙")
+        return
+    import random as _rand
+    questions = _rand.sample(DAILY_QUESTIONS, min(10, len(DAILY_QUESTIONS)))
+    context.user_data["quiz_questions"] = questions
+    context.user_data["quiz_index"] = 0
+    context.user_data["quiz_score"] = 0
+    context.user_data["quiz_date"] = today
+    save_quiz_session(user.id, questions, 0, 0, today)
+    await update.message.reply_text(
+        "🎯 *اختبر معلوماتك*\n━━━━━━━━━━━━━━━\n\n10 أسئلة متنوعة في الفقه والتفسير والسيرة\nستظهر النتيجة الكاملة في النهاية 📊\n\nهيا نبدأ! 💪",
+        parse_mode="Markdown"
+    )
+    await send_quiz_question(update.message, context, questions[0], 1)
+
+
+async def handle_inline_query(update, context):
+    """معالج Inline Query الموحد — يدعم مشاركة البوت، الحديث، القدوة، التحدي"""
+    query = update.inline_query
+    if query is None:
+        return
+
+    q_data = query.query.strip()
+    bot_link = f"https://t.me/{BOT_USERNAME.lstrip('@')}"
+    results = []
+
+    # ===== تحدي الصديق =====
+    # ===== مشاركة آية قرآنية =====
+    if q_data.startswith("ayah_"):
+        parts = q_data.split("_")
+        if len(parts) >= 3:
+            try:
+                s, a = int(parts[1]), int(parts[2])
+                ayah = await fetch_ayah_by_ref(s, a)
+                if ayah:
+                    msg_text = (
+                        f"🌿 *{ayah['text']}*\n\n"
+                        f"📚 {ayah['surah_name']} — الآية {ayah['ayah_num']}\n\n"
+                        "_من بوت راوِي للقرآن والأحاديث النبوية_ 🌙"
+                    )
+                    kb = InlineKeyboardMarkup([[
+                        colored_btn("📲 افتح راوِي", url=bot_link, style="primary")
+                    ]])
+                    results.append(InlineQueryResultArticle(
+                        id="ayah_share",
+                        title=f"📖 {ayah['surah_name']}:{ayah['ayah_num']}",
+                        description=ayah['text'][:80],
+                        input_message_content=InputTextMessageContent(
+                            message_text=msg_text,
+                            parse_mode="Markdown"
+                        ),
+                        reply_markup=kb,
+                    ))
+            except Exception:
+                pass
+
+    if q_data.startswith("challenge_"):
+        challenge_id = q_data.replace("challenge_", "")
+        link = f"https://t.me/{BOT_USERNAME.lstrip('@')}?start=fc_{challenge_id}"
+        msg_text = (
+            "⚔️ تحداني في بوت راوِي الإسلامي!\n\n"
+            "🎯 هل تقدر تتفوق عليّ في 10 أسئلة إسلامية؟\n\n"
+            "👇 اضغط الزر وابدأ التحدي الآن!"
+        )
+        kb = InlineKeyboardMarkup([[
+            colored_btn("⚔️ اقبل التحدي", url=link, style="success")
+        ]])
+        results.append(InlineQueryResultArticle(
+            id="challenge",
+            title="⚔️ شارك تحدي الصديق",
+            description="أرسل دعوة تحدي لصديقك",
+            input_message_content=InputTextMessageContent(message_text=msg_text),
+            reply_markup=kb,
+        ))
+
+    # ===== مشاركة قدوتي اليوم =====
+    elif q_data.startswith("qudwati_"):
+        name = q_data.replace("qudwati_", "")
+        # ابحث عن القصة بالاسم
+        story = next((s for s in QUDWATI_STORIES if s["name"].startswith(name[:10])), get_qudwati_of_day())
+        msg_text = (
+            f"🌟 قدوتي اليوم: {story['name']}\n\n"
+            f"{story['story'][:300]}...\n\n"
+            f"💡 العبرة: {story['lesson']}\n\n"
+            f"تعرّف على قصص الأنبياء والصحابة يومياً 👇"
+        )
+        kb = InlineKeyboardMarkup([[
+            colored_btn("📲 افتح راوِي", url=bot_link, style="primary")
+        ]])
+        results.append(InlineQueryResultArticle(
+            id="qudwati",
+            title=f"🌟 قدوتي: {story['name']}",
+            description=story['lesson'],
+            input_message_content=InputTextMessageContent(message_text=msg_text),
+            reply_markup=kb,
+        ))
+
+    # ===== مشاركة نتيجة التحدي =====
+    elif q_data.startswith("fc_result_"):
+        uid_key = q_data  # fc_result_{user_id}
+        result_msg = context.bot_data.get(uid_key, "")
+        if not result_msg:
+            result_msg = "🎯 انتهى التحدي!\n\nشاركنا نتيجتك في بوت راوِي 🌙"
+        kb = InlineKeyboardMarkup([[
+            colored_btn("⚔️ تحدّني أنت أيضاً!", url=bot_link, style="success")
+        ]])
+        results.append(InlineQueryResultArticle(
+            id="fc_result",
+            title="🎯 شارك نتيجة التحدي",
+            description="أرسل نتيجة التحدي لأصدقائك",
+            input_message_content=InputTextMessageContent(
+                message_text=result_msg,
+                parse_mode="Markdown"
+            ),
+            reply_markup=kb,
+        ))
+
+    # ===== مشاركة دعاء =====
+    elif q_data.startswith("duaa_"):
+        # جلب الدعاء الكامل من bot_data
+        d_full = context.bot_data.get("duaa_today") or {}
+        duaa_text = d_full.get("text", "")
+        duaa_source = d_full.get("source", "")
+        duaa_meaning = d_full.get("meaning", "")
+        if not duaa_text:
+            # fallback
+            from datetime import date as _date
+            _base = _dt.date(2025, 1, 1)
+            _cur = _dt.datetime.now(AMMAN_TZ).date()
+            _day = (_cur - _base).days
+            import importlib
+            _d = DAILY_DUAA[_day % len(DAILY_DUAA)]
+            duaa_text = _d.get("text", "")
+            duaa_source = _d.get("source", "")
+            duaa_meaning = _d.get("meaning", "")
+        msg_text = (
+            f"🤲 *دعاء اليوم*\n"
+            f"━━━━━━━━━━━━━━━\n\n"
+            f"*{duaa_text}*\n\n"
+            f"📚 المصدر: {duaa_source}\n"
+            f"💡 المعنى: {duaa_meaning}\n\n"
+            f"_من بوت راوِي للأحاديث النبوية_ 🌙"
+        )
+        kb = InlineKeyboardMarkup([[
+            colored_btn("📲 افتح راوِي", url=bot_link, style="primary")
+        ]])
+        results.append(InlineQueryResultArticle(
+            id="duaa",
+            title="🤲 شارك دعاء اليوم",
+            description=duaa_text[:80] if duaa_text else "دعاء اليوم",
+            input_message_content=InputTextMessageContent(
+                message_text=msg_text,
+                parse_mode="Markdown"
+            ),
+            reply_markup=kb,
+        ))
+
+    # ===== مشاركة حديث أو مشاركة عامة =====
+    else:
+        msg_text = (
+            "🌙 بوت راوِي للأحاديث النبوية\n\n"
+            "• تحقق من صحة الأحاديث\n"
+            "• اختبر معلوماتك يومياً\n"
+            "• قصص الأنبياء والصحابة كل يوم\n"
+            "• أدعية من القرآن والسنة"
+        )
+        kb = InlineKeyboardMarkup([[
+            colored_btn("📲 افتح راوِي", url=bot_link, style="primary")
+        ]])
+        results.append(InlineQueryResultArticle(
+            id="share_bot",
+            title="📤 شارك بوت راوِي",
+            description="أرسل دعوة لصديقك لاستخدام البوت",
+            input_message_content=InputTextMessageContent(message_text=msg_text),
+            reply_markup=kb,
+        ))
+
+    await query.answer(results, cache_time=60)
+
+
+async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """زر المشاركة — يفتح نافذة اختيار المحادثة مع زر شفاف"""
+    kb = InlineKeyboardMarkup([[
+        colored_btn("📤 دعوة صديق", switch_inline_query="", style="primary")
+    ]])
+    await update.message.reply_text(
+        "📤 *شارك راوِي مع أصدقائك*\n\n"
+        "اضغط الزر أدناه، اختر المحادثة أو الصديق\n"
+        "سيصله زر شفاف يفتح البوت مباشرة 👇",
+        parse_mode="Markdown",
+        reply_markup=kb
+    )
+
+
+
+if __name__ == "__main__":
+    main()
