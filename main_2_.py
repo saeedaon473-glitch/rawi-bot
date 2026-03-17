@@ -1,4 +1,4 @@
-import os
+
 import asyncio
 import logging
 import sqlite3
@@ -3577,60 +3577,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=kb
             )
         return
-
-    # ===== معالج السؤال الديني =====
-    if context.user_data.get("islamic_qa_mode") and text and not text.startswith("/"):
-        context.user_data["islamic_qa_mode"] = False
-        # تحقق من الرصيد مجدداً
-        can_ask, remaining, _ = can_ask_question(user.id)
-        if not can_ask:
-            kb = InlineKeyboardMarkup([[
-                colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="success")
-            ]])
-            await update.message.reply_text(
-                "⚠️ انتهت أسئلتك اليوم!\n"
-                f"يتجدد رصيدك غداً أو اشترِ {QA_EXTRA_STARS} نجوم للمزيد 👇",
-                reply_markup=kb
-            )
-            return
-        wait = await update.message.reply_text("⏳ جاري البحث عن الإجابة...")
-        system = (
-            "أنت عالم إسلامي متخصص في الفقه والعقيدة على منهج أهل السنة والجماعة. "
-            "أجب على الأسئلة الدينية بشكل واضح ومختصر لا يتجاوز 300 كلمة. "
-            "اذكر المصدر (قرآن أو حديث أو إجماع العلماء) عند الإمكان. "
-            "إذا كان السؤال خارج نطاق الدين الإسلامي اعتذر بلطف. "
-            "أجب باللغة العربية فقط."
-        )
-        full_prompt = f"{system}\n\nالسؤال: {text}"
-        answer = await call_gemini(full_prompt)
-        # سجّل الاستخدام فقط بعد نجاح الإجابة
-        if not answer.startswith("⚠️"):
-            increment_qa_usage(user.id)
-        try:
-            await wait.delete()
-        except Exception:
-            pass
-        _, remaining_after, _ = can_ask_question(user.id)
-        rows = []
-        if remaining_after > 0:
-            rows.append([colored_btn(f"❓ سؤال آخر ({remaining_after} متبقي)", callback_data="qa_new", style="primary")])
-        else:
-            rows.append([colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="success")])
-        kb = InlineKeyboardMarkup(rows)
-        await update.message.reply_text(
-            f"❓ *{text}*\n"
-            "━━━━━━━━━━━━━━━\n\n"
-            f"{answer}\n\n"
-            "━━━━━━━━━━━━━━━\n"
-            "_⚠️ للتحقق راجع أهل العلم_",
-            parse_mode="Markdown",
-            reply_markup=kb
-        )
-        return
-
-    # أيضاً أوقف islamic_qa_mode عند ضغط أزرار الكيبورد
-    if text in _KB_BTNS:
-        context.user_data.pop("islamic_qa_mode", None)
 
     if text == "🌟 قدوتي اليوم":
         await cmd_qudwati(update, context)
