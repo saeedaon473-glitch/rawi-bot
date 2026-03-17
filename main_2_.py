@@ -3619,37 +3619,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         can_ask, remaining, is_free = can_ask_question(user.id)
         if can_ask:
             context.user_data["islamic_qa_mode"] = True
-            free_left = min(remaining, QA_FREE_DAILY - get_qa_usage(user.id)["count"])
-            free_left = max(0, free_left)
-            extra_left = remaining - free_left
-            status = f"🆓 مجاني: {free_left}/{QA_FREE_DAILY}"
-            if extra_left > 0:
-                status += f" | ⭐ إضافي: {extra_left}"
-            kb = InlineKeyboardMarkup([[
-                colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="primary")
-            ]])
+            used = get_qa_usage(user.id)["count"]
+            # رسالة واضحة
+            if used == 0:
+                status_line = f"لديك {QA_FREE_DAILY} أسئلة مجانية اليوم 🆓"
+            elif remaining > 0:
+                status_line = f"متبقي {remaining} سؤال من أصل {QA_FREE_DAILY} اليوم"
+            else:
+                status_line = f"متبقي {remaining} سؤال (إضافي مدفوع)"
+
             await update.message.reply_text(
                 f"❓ *سؤال ديني*\n"
                 "━━━━━━━━━━━━━━━\n\n"
-                f"📊 رصيدك اليوم: {remaining} سؤال متبقي\n"
-                f"({status})\n\n"
+                f"📊 {status_line}\n\n"
                 "اكتب سؤالك الديني وسأجيبك من مصادر أهل السنة 👇\n\n"
                 "_مثال: ما حكم صيام يوم السبت منفرداً؟_",
-                parse_mode="Markdown",
-                reply_markup=kb
+                parse_mode="Markdown"
             )
         else:
-            kb = InlineKeyboardMarkup([[
-                colored_btn(f"⭐ أضف 5 أسئلة مقابل {QA_EXTRA_STARS} نجوم", callback_data="qa_buy", style="success")
-            ]])
             await update.message.reply_text(
                 "❓ *سؤال ديني*\n"
                 "━━━━━━━━━━━━━━━\n\n"
                 f"⚠️ استنفدت أسئلتك المجانية اليوم ({QA_FREE_DAILY}/{QA_FREE_DAILY})\n\n"
                 f"يتجدد رصيدك غداً صباحاً 🌅\n\n"
-                f"أو أضف {QA_EXTRA_STARS} نجوم للحصول على 5 أسئلة إضافية اليوم 👇",
+                f"أو أضف {QA_EXTRA_STARS} نجوم للحصول على 5 أسئلة إضافية 👇",
                 parse_mode="Markdown",
-                reply_markup=kb
+                reply_markup=InlineKeyboardMarkup([[
+                    colored_btn(f"⭐ {QA_EXTRA_STARS} نجوم ← 5 أسئلة", callback_data="qa_buy", style="success")
+                ]])
             )
         return
 
