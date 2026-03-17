@@ -1,4 +1,4 @@
-
+import os
 import asyncio
 import logging
 import sqlite3
@@ -1599,7 +1599,7 @@ def main_kb(is_admin=False, **kwargs):
         [KeyboardButton("🌟 قدوتي اليوم"), KeyboardButton("🎯 اختبر معلوماتك")],
         [KeyboardButton("📿 ختمة"), KeyboardButton("❓ سؤال ديني")],
         [KeyboardButton("⚔️ تحدي صديق"), KeyboardButton("📤 مشاركة")],
-        [KeyboardButton("💰 دعم البوت"), KeyboardButton("ℹ️ عن البوت")],
+        [KeyboardButton("💰 دعم البوت"), KeyboardButton("📞 تواصل مع المطور")],
     ]
     if is_admin:
         buttons.append([KeyboardButton("⚙️ لوحة التحكم")])
@@ -3355,7 +3355,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # عند ضغط زر كيبورد — أوقف أوضاع النص السابقة
     if text in _KB_BTNS:
-        for _k in ["quran_search_mode","hadith_search_mode","khatma_update_mode"]:
+        for _k in ["quran_search_mode","hadith_search_mode","khatma_update_mode","contact_dev_mode"]:
             context.user_data.pop(_k, None)
         if text != "🌟 قدوتي اليوم":
             context.user_data["qudwati_waiting"] = False
@@ -3383,18 +3383,93 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             await update.message.reply_text("⚠️ أرسل رقم الصفحة فقط مثل: 150")
         return
-        hadith_text = context.user_data.pop("note_hadith", "")
-        if hadith_text:
-            save_favorite_note(user.id, hadith_text, text[:300])
-            await update.message.reply_text("✅ تم حفظ ملاحظتك على الحديث 📝")
+
+    # معالج رسائل التواصل مع المطور
+    if context.user_data.get("contact_dev_mode"):
+        context.user_data.pop("contact_dev_mode", None)
+        # جمع معلومات المرسل
+        sender_name = user.full_name
+        sender_id = user.id
+        sender_username = f"@{user.username}" if user.username else "بدون يوزر"
+        # أرسل الرسالة لكل الأدمن
+        header = (
+            f"📩 *رسالة جديدة من مستخدم*\n"
+            f"━━━━━━━━━━━━━━━\n"
+            f"👤 {sender_name} ({sender_username})\n"
+            f"🆔 `{sender_id}`\n"
+            f"━━━━━━━━━━━━━━━\n\n"
+        )
+        sent_to_admin = False
+        for admin_id in ADMIN_IDS:
+            try:
+                # لو في نص
+                if update.message.text:
+                    await context.bot.send_message(
+                        admin_id,
+                        header + update.message.text,
+                        parse_mode="Markdown",
+                        reply_markup=InlineKeyboardMarkup([[
+                            colored_btn(f"↩️ رد على {sender_name}", callback_data=f"reply_user_{sender_id}", style="primary")
+                        ]])
+                    )
+                # لو في صورة
+                elif update.message.photo:
+                    await context.bot.send_photo(
+                        admin_id,
+                        update.message.photo[-1].file_id,
+                        caption=header + (update.message.caption or ""),
+                        parse_mode="Markdown",
+                    )
+                # لو في صوت
+                elif update.message.voice:
+                    await context.bot.send_voice(
+                        admin_id,
+                        update.message.voice.file_id,
+                        caption=header,
+                        parse_mode="Markdown",
+                    )
+                # لو في مستند
+                elif update.message.document:
+                    await context.bot.send_document(
+                        admin_id,
+                        update.message.document.file_id,
+                        caption=header + (update.message.caption or ""),
+                        parse_mode="Markdown",
+                    )
+                sent_to_admin = True
+            except Exception as e:
+                logger.error(f"contact_dev send error: {e}")
+
+        if sent_to_admin:
+            await update.message.reply_text(
+                "✅ *تم إرسال رسالتك للمطور*\n\n"
+                "سيتم الرد عليك في أقرب وقت ممكن 🤍",
+                parse_mode="Markdown"
+            )
         else:
-            await update.message.reply_text("⚠️ لم يُعثر على الحديث، حاول مرة أخرى.")
+            await update.message.reply_text("⚠️ حدث خطأ في الإرسال، حاول لاحقاً.")
         return
 
     # معالج أوامر الأدمن التفاعلية
     admin_action = context.user_data.get("admin_action")
     if admin_action and user.id in ADMIN_IDS:
         context.user_data.pop("admin_action", None)
+
+        if admin_action == "reply_user":
+            target_id = context.user_data.pop("reply_to_user_id", None)
+            if target_id and text:
+                try:
+                    await context.bot.send_message(
+                        target_id,
+                        f"📩 *رد من المطور:*\n\n{text}",
+                        parse_mode="Markdown"
+                    )
+                    await update.message.reply_text(f"✅ تم إرسال ردك للمستخدم `{target_id}`", parse_mode="Markdown")
+                except Exception as e:
+                    await update.message.reply_text(f"❌ فشل الإرسال: {e}")
+            else:
+                await update.message.reply_text("⚠️ حدث خطأ، حاول مرة ثانية.")
+            return
 
         if admin_action == "search_user":
             info = get_user_info(text.strip())
@@ -3888,6 +3963,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "اقترح لي حديثا📜":
         await random_suggestion(update, context)
+        return
+
+    if text == "📞 تواصل مع المطور":
+        context.user_data["contact_dev_mode"] = True
+        for _k in ["quran_search_mode","hadith_search_mode","islamic_qa_mode","qudwati_waiting"]:
+            context.user_data.pop(_k, None)
+        await update.message.reply_text(
+            "📞 *تواصل مع المطور*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "اكتب رسالتك وسأوصلها للمطور مباشرة 👇\n\n"
+            "_يمكنك إرسال نص أو صورة أو صوت_",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                colored_btn("❌ إلغاء", callback_data="contact_cancel", style="danger")
+            ]])
+        )
         return
 
     if text == "ℹ️ عن البوت":
@@ -4896,6 +4987,24 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             conn.execute("DELETE FROM khatma WHERE user_id=?", (user.id,))
         await _show_khatma_status(q, context, user.id, edit=True)
 
+    elif q.data == "contact_cancel":
+        await q.answer()
+        context.user_data.pop("contact_dev_mode", None)
+        try:
+            await q.message.edit_text("❌ تم إلغاء التواصل.")
+        except Exception:
+            pass
+
+    elif q.data.startswith("reply_user_"):
+        await q.answer()
+        target_id = int(q.data.split("_")[2])
+        context.user_data["reply_to_user_id"] = target_id
+        context.user_data["admin_action"] = "reply_user"
+        await q.message.reply_text(
+            f"✏️ اكتب ردك على المستخدم `{target_id}`:",
+            parse_mode="Markdown"
+        )
+
     elif q.data == "qa_new":
         await q.answer()
         can_ask, remaining, _ = can_ask_question(user.id)
@@ -5663,21 +5772,25 @@ ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY", "")
 ELEVENLABS_VOICE_ID = os.environ.get("ELEVENLABS_VOICE_ID", "pNInz6obpgDQGcFmaJgB")  # Adam - صوت عربي جيد
 
 # ==================== نظام أسئلة السؤال الديني ====================
-QA_FREE_DAILY = 2       # أسئلة مجانية يومياً
+QA_FREE_DAILY = 5       # أسئلة مجانية يومياً
 QA_EXTRA_STARS = 10     # نجوم مقابل 5 أسئلة إضافية
 QA_EXTRA_BONUS = 5      # عدد الأسئلة الإضافية
 
 def get_qa_usage(user_id: int) -> dict:
-    """جلب استخدام اليوم"""
+    """جلب استخدام اليوم — المستخدم الجديد يبدأ بـ 0"""
     today = _dt.datetime.now(AMMAN_TZ).strftime("%Y-%m-%d")
-    with sqlite3.connect("bot.db") as conn:
-        row = conn.execute(
-            "SELECT count, extra_questions FROM qa_usage WHERE user_id=? AND date=?",
-            (user_id, today)
-        ).fetchone()
-    if row:
-        return {"count": row[0], "extra": row[1], "date": today}
-    return {"count": 0, "extra": 0, "date": today}
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            row = conn.execute(
+                "SELECT count, extra_questions FROM qa_usage WHERE user_id=? AND date=?",
+                (user_id, today)
+            ).fetchone()
+        if row:
+            return {"count": row[0], "extra": row[1], "date": today}
+        # مستخدم جديد أو يوم جديد — يبدأ من الصفر
+        return {"count": 0, "extra": 0, "date": today}
+    except Exception:
+        return {"count": 0, "extra": 0, "date": today}
 
 def increment_qa_usage(user_id: int):
     """زيادة عداد الأسئلة"""
