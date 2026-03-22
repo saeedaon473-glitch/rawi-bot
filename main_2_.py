@@ -434,6 +434,13 @@ if not BOT_TOKEN:
 admin_ids_str = os.environ.get("ADMIN_IDS", "")
 ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
 
+# ═══════════════════════════════════════════════════════════════════
+# نظام الاختبارات في القنوات
+# ═══════════════════════════════════════════════════════════════════
+ACTIVE_CHANNEL_QUIZZES = {}
+CHANNEL_QUIZ_PARTICIPANTS = {}
+
+
 BOT_NAME = "راوِي"
 BOT_USERNAME = "@G4bGN_bot"
 
@@ -1294,133 +1301,6 @@ def save_quiz_session(user_id: int, questions: list, index: int, score: int, dat
 
 # ==================== قدوتي اليوم ====================
 
-QUDWATI_STORIES = [
-
-    {
-        "name": "نوح عليه السلام",
-        "type": "نبي",
-        "story": "🌊 **رحلة الصبر الطويل**\n\n"
-                "تخيّل أن تدعو قومك إلى الحق 950 سنة كاملة! هذا ما فعله نوح عليه السلام.\n\n"
-                "**📖 البداية:**\n"
-                "بدأ نوح دعوته بكل رفق ولين. يدعوهم ليلاً ونهاراً، سراً وعلانية. يقول: \"يا قوم اعبدوا الله ما لكم من إله غيره\". لكنهم رفضوا بإصرار.\n\n"
-                "**💪 الصبر:**\n"
-                "مرت عشرات السنين... ثم مئات! كان قومه يسخرون منه ويضحكون. بعضهم يضع أصابعه في أذنيه حتى لا يسمع كلامه! لكن نوح لم يستسلم أبداً.\n\n"
-                "**⭐ لحظة مؤثرة:**\n"
-                "آمن معه فقط 80 شخصاً من قوم كبير! حتى ابنه الذي ربّاه رفض الإيمان. تخيّل حزن أب على ابنه!\n\n"
-                "**🚢 بناء السفينة:**\n"
-                "أمر الله نوحاً ببناء سفينة عظيمة في وسط الصحراء! قومه يسخرون: \"أصبحت نجاراً يا نوح؟ أين الماء؟\" لكنه استمر بثقة في الله.\n\n"
-                "**⚡ الطوفان:**\n"
-                "فار التنور، انهمر المطر، نبع الماء من الأرض. نادى نوح ابنه: \"اركب معنا\". لكن ابنه رفض: \"سآوي إلى جبل\". قال نوح: \"لا عاصم اليوم من أمر الله إلا من رحم\". وغرق ابنه أمام عينيه.\n\n"
-                "**💡 الدرس:**\n"
-                "الابن ليس ابنك إن لم يكن على دينك. الولاء الحقيقي لله أولاً.",
-        "ayah": "وَلَقَدْ أَرْسَلْنَا نُوحًا إِلَىٰ قَوْمِهِ فَلَبِثَ فِيهِمْ أَلْفَ سَنَةٍ إِلَّا خَمْسِينَ عَامًا فَأَخَذَهُمُ الطُّوفَانُ وَهُمْ ظَالِمُونَ",
-        "ayah_ref": "العنكبوت: 14",
-        "lesson": "الصبر على الدعوة - الثبات رغم قلة الأتباع - الولاء لله فوق كل شيء",
-        "question": "كم سنة لبث نوح في قومه يدعوهم؟",
-        "answer": "950 سنة",
-        "source": "سورة العنكبوت، سورة هود، سورة نوح"
-    },
-    {
-        "name": "إبراهيم عليه السلام (خليل الرحمن)",
-        "type": "نبي",
-        "story": "حطّم إبراهيم عليه السلام الأصنام إلا كبيرها ليعلّم قومه أنها لا تنفع ولا تضر. ألقاه قومه في النار العظيمة، فقال الله للنار: {يَا نَارُ كُونِي بَرْدًا وَسَلَامًا عَلَىٰ إِبْرَاهِيمَ}. أُمر بذبح ابنه إسماعيل اختباراً، فامتثل الأمر، وامتثل إسماعيل بكل رضا. فداه الله بكبش عظيم. بنى إبراهيم وإسماعيل الكعبة المشرفة.",
-        "ayah": "وَإِذْ يَرْفَعُ إِبْرَاهِيمُ الْقَوَاعِدَ مِنَ الْبَيْتِ وَإِسْمَاعِيلُ رَبَّنَا تَقَبَّلْ مِنَّا إِنَّكَ أَنتَ السَّمِيعُ الْعَلِيمُ",
-        "ayah_ref": "البقرة: 127",
-        "lesson": "التوحيد الخالص - التوكل على الله - الطاعة الكاملة",
-        "question": "ماذا قال الله للنار عندما ألقي فيها إبراهيم؟",
-        "answer": "يا نار كوني برداً وسلاماً على إبراهيم",
-        "source": "سورة الأنبياء، سورة الصافات، سورة البقرة"
-    },
-    {
-        "name": "موسى عليه السلام (كليم الله)",
-        "type": "نبي",
-        "story": "كلّم الله موسى تكليماً على جبل الطور. أرسله الله إلى فرعون الذي ادعى الألوهية. أيّده الله بتسع آيات بينات: العصا، اليد، الطوفان، الجراد، القُمّل، الضفادع، الدم، السنين، ونقص الثمرات. شق الله له البحر فعبره وأغرق فرعون وجنوده. أنزل الله عليه التوراة وكلّمه بلا واسطة.",
-        "ayah": "وَكَلَّمَ اللَّهُ مُوسَىٰ تَكْلِيمًا",
-        "ayah_ref": "النساء: 164",
-        "lesson": "الشجاعة في الحق - مواجهة الطغاة - اليقين بنصر الله",
-        "question": "كم آية بينة أيد الله بها موسى؟",
-        "answer": "تسع آيات",
-        "source": "سورة الأعراف، سورة القصص، سورة طه، سورة الإسراء"
-    },
-    {
-        "name": "يوسف عليه السلام (الصديق)",
-        "type": "نبي",
-        "story": "ألقاه إخوته في البئر حسداً. بيع عبداً في مصر. راودته امرأة العزيز عن نفسه فاستعصم، فسُجن ظلماً. فسّر رؤيا الملك فأخرجه من السجن وجعله على خزائن مصر. عفا عن إخوته عندما جاؤوه في المجاعة وقال: {لَا تَثْرِيبَ عَلَيْكُمُ الْيَوْمَ}. جمع الله له أبويه وإخوته في مصر.",
-        "ayah": "لَقَدْ كَانَ فِي يُوسُفَ وَإِخْوَتِهِ آيَاتٌ لِّلسَّائِلِينَ",
-        "ayah_ref": "يوسف: 7",
-        "lesson": "الصبر على الابتلاء - العفاف والعفة - العفو عند المقدرة",
-        "question": "ماذا قال يوسف لإخوته عندما جاؤوه؟",
-        "answer": "لا تثريب عليكم اليوم",
-        "source": "سورة يوسف كاملة"
-    },
-    {
-        "name": "أيوب عليه السلام (الصابر)",
-        "type": "نبي",
-        "story": "ابتلاه الله بذهاب المال والولد والصحة، فصبر ولم يجزع. مرض سنين طويلة حتى تفرق عنه الناس إلا زوجته الصابرة. لم يزدد على الله إلا حسن ظن وصبراً. دعا الله: {أَنِّي مَسَّنِيَ الضُّرُّ وَأَنتَ أَرْحَمُ الرَّاحِمِينَ}، فاستجاب الله له وأعاد عليه صحته وماله وأهله، وزاده ضعف ما كان له.",
-        "ayah": "إِنَّا وَجَدْنَاهُ صَابِرًا نِّعْمَ الْعَبْدُ إِنَّهُ أَوَّابٌ",
-        "ayah_ref": "ص: 44",
-        "lesson": "الصبر على البلاء - حسن الظن بالله - الفرج بعد الشدة",
-        "question": "بماذا وصف الله أيوب في القرآن؟",
-        "answer": "وجدناه صابراً نعم العبد إنه أواب",
-        "source": "سورة الأنبياء، سورة ص"
-    },
-    {
-        "name": "مريم بنت عمران",
-        "type": "صديقة",
-        "story": "اصطفاها الله وطهّرها واصطفاها على نساء العالمين. تعبّدت لله في المحراب، يأتيها رزقها من عند الله. بشّرها الله بعيسى عليه السلام من غير أب معجزة. لما جاءها المخاض انتبذت مكاناً قصياً، ونادى عيسى من تحتها: {أَلَّا تَحْزَنِي قَدْ جَعَلَ رَبُّكِ تَحْتَكِ سَرِيًّا}. أمرت أن لا تكلم الناس، فأشارت إلى عيسى الرضيع فتكلم.",
-        "ayah": "وَإِذْ قَالَتِ الْمَلَائِكَةُ يَا مَرْيَمُ إِنَّ اللَّهَ اصْطَفَاكِ وَطَهَّرَكِ وَاصْطَفَاكِ عَلَىٰ نِسَاءِ الْعَالَمِينَ",
-        "ayah_ref": "آل عمران: 42",
-        "lesson": "الطهارة والعبادة - التوكل على الله - الصبر على الابتلاء",
-        "question": "من هي الصديقة التي اصطفاها الله على نساء العالمين؟",
-        "answer": "مريم بنت عمران",
-        "source": "سورة آل عمران، سورة مريم"
-    },
-    {
-        "name": "أبو بكر الصديق رضي الله عنه",
-        "type": "صحابي",
-        "story": "أول من أسلم من الرجال. صدّق النبي ﷺ في الإسراء والمعراج فسُمي الصديق. رفيق النبي ﷺ في الهجرة، قال الله فيهما: {ثَانِيَ اثْنَيْنِ إِذْ هُمَا فِي الْغَارِ}. أنفق ماله كله في سبيل الله. قاتل المرتدين بعد وفاة النبي ﷺ. جمع القرآن في مصحف واحد. توفي وهو أفضل الأمة بعد نبيها.",
-        "ayah": "ثَانِيَ اثْنَيْنِ إِذْ هُمَا فِي الْغَارِ إِذْ يَقُولُ لِصَاحِبِهِ لَا تَحْزَنْ إِنَّ اللَّهَ مَعَنَا",
-        "ayah_ref": "التوبة: 40",
-        "lesson": "الصدق - الإنفاق في سبيل الله - الصحبة الصالحة",
-        "question": "من هو صاحب رسول الله في الغار؟",
-        "answer": "أبو بكر الصديق",
-        "source": "القرآن الكريم، صحيح البخاري، صحيح مسلم"
-    },
-    {
-        "name": "عمر بن الخطاب رضي الله عنه",
-        "type": "صحابي",
-        "story": "الفاروق الذي فرّق الله به بين الحق والباطل. أسلم فأعز الله به الإسلام، فصلّوا جهراً بعد أن كانوا يصلون سراً. قال النبي ﷺ: «لو كان بعدي نبي لكان عمر». وافق الله قوله في ثلاث: الحجاب، أسرى بدر، مقام إبراهيم. عُرف بالعدل، قال: «متى استعبدتم الناس وقد ولدتهم أمهاتهم أحراراً». استُشهد وهو يصلي الفجر.",
-        "ayah": "وَمَا أَرْسَلْنَاكَ إِلَّا رَحْمَةً لِّلْعَالَمِينَ",
-        "ayah_ref": "الأنبياء: 107",
-        "lesson": "العدل - القوة في الحق - الشجاعة في الدين",
-        "question": "بماذا لقّب عمر بن الخطاب؟",
-        "answer": "الفاروق",
-        "source": "صحيح البخاري، صحيح مسلم، كتب السيرة"
-    },
-    {
-        "name": "عثمان بن عفان رضي الله عنه (ذو النورين)",
-        "type": "صحابي",
-        "story": "تزوج ابنتي النبي ﷺ: رقية ثم بعد وفاتها أم كلثوم، فسُمي ذا النورين. جهّز جيش العسرة كاملاً من ماله. اشترى بئر رومة وجعلها للمسلمين. جمع المسلمين على مصحف واحد (المصحف العثماني). استُشهد وهو يقرأ القرآن، قُتل ظلماً والمصحف بين يديه.",
-        "ayah": "إِنَّمَا يَعْمُرُ مَسَاجِدَ اللَّهِ مَنْ آمَنَ بِاللَّهِ وَالْيَوْمِ الْآخِرِ",
-        "ayah_ref": "التوبة: 18",
-        "lesson": "الإنفاق في سبيل الله - الحياء - حفظ القرآن",
-        "question": "لماذا لُقب عثمان بذي النورين؟",
-        "answer": "لأنه تزوج ابنتي النبي صلى الله عليه وسلم",
-        "source": "صحيح البخاري، صحيح مسلم، كتب السيرة"
-    },
-    {
-        "name": "علي بن أبي طالب رضي الله عنه",
-        "type": "صحابي",
-        "story": "ابن عم النبي ﷺ وزوج ابنته فاطمة. أول من أسلم من الصبيان. بات في فراش النبي ﷺ ليلة الهجرة فداءً له. شجاع لم يُهزم في معركة. باب مدينة العلم كما قال النبي ﷺ: «أنا مدينة العلم وعلي بابها». قال النبي ﷺ له: «أنت مني بمنزلة هارون من موسى». استُشهد وهو يصلي الفجر.",
-        "ayah": "إِنَّمَا وَلِيُّكُمُ اللَّهُ وَرَسُولُهُ وَالَّذِينَ آمَنُوا",
-        "ayah_ref": "المائدة: 55",
-        "lesson": "الشجاعة - العلم - الفداء",
-        "question": "بماذا شبّه النبي علاقته بعلي؟",
-        "answer": "أنت مني بمنزلة هارون من موسى",
-        "source": "صحيح البخاري، صحيح مسلم، كتب السيرة"
-    }
-
-]
 
 def get_qudwati_of_day() -> dict:
     """قصة قدوتي اليوم"""
@@ -1490,10 +1370,9 @@ def main_kb(is_admin=False, **kwargs):
     from telegram import ReplyKeyboardMarkup, KeyboardButton
     buttons = [
         [KeyboardButton("🔍 تحقق من حديث"), KeyboardButton("📖 باحث القرآن")],
-        [KeyboardButton("🤲 دعاء اليوم"), KeyboardButton("🎯 اختبر معلوماتك")],
-        [KeyboardButton("🌟 قدوتي اليوم"), KeyboardButton("🎙️ استمع للقرآن")],
+        [KeyboardButton("🎯 اختبر معلوماتك"), KeyboardButton("🎙️ استمع للقرآن")],
         [KeyboardButton("💬 التحدث مع راوي"), KeyboardButton("❓ سؤال ديني")],
-        [KeyboardButton("⚔️ تحدي صديق"), KeyboardButton("💰 دعم البوت")],
+        [KeyboardButton("💰 دعم البوت")],
         [KeyboardButton("📞 تواصل مع المطور")],
     ]
     if is_admin:
@@ -2315,58 +2194,6 @@ DAILY_QUESTIONS = [
     {"q": 'ما هو الفرق بين النبي والرسول؟', "options": ['لا فرق بينهما', 'الرسول بشر فقط والنبي قد يكون ملكاً', 'الرسول أُوحي إليه بشريعة جديدة والنبي يتبع شريعة من قبله', 'النبي أفضل من الرسول'], "answer": 'الرسول أُوحي إليه بشريعة جديدة والنبي يتبع شريعة من قبله', "explain": 'الرسول أُرسل بشريعة جديدة وكتاب، والنبي يُبلّغ شريعة من قبله'},
 ]
 
-DAILY_DUAA = [
-    {"text": "رَبَّنَا آتِنَا فِي الدُّنْيَا حَسَنَةً وَفِي الْآخِرَةِ حَسَنَةً وَقِنَا عَذَابَ النَّارِ", "source": "القرآن الكريم — البقرة 201", "meaning": "دعاء جامع لخيري الدنيا والآخرة"},
-    {"text": "اللَّهُمَّ إِنِّي أَعُوذُ بِكَ مِنَ الْهَمِّ وَالْحَزَنِ، وَالْعَجْزِ وَالْكَسَلِ، وَالْبُخْلِ وَالْجُبْنِ، وَضَلَعِ الدَّيْنِ وَغَلَبَةِ الرِّجَالِ", "source": "صحيح البخاري", "meaning": "دعاء النبي ﷺ للاستعاذة من آفات النفس"},
-    {"text": "رَبِّ اشْرَحْ لِي صَدْرِي وَيَسِّرْ لِي أَمْرِي وَاحْلُلْ عُقْدَةً مِّن لِّسَانِي يَفْقَهُوا قَوْلِي", "source": "القرآن الكريم — طه 25-28", "meaning": "دعاء موسى عليه السلام بالتوفيق والبيان"},
-    {"text": "اللَّهُمَّ أَصْلِحْ لِي دِينِي الَّذِي هُوَ عِصْمَةُ أَمْرِي، وَأَصْلِحْ لِي دُنْيَايَ الَّتِي فِيهَا مَعَاشِي، وَأَصْلِحْ لِي آخِرَتِي الَّتِي فِيهَا مَعَادِي", "source": "صحيح مسلم", "meaning": "دعاء جامع لإصلاح الدين والدنيا والآخرة"},
-    {"text": "رَبَّنَا لَا تُزِغْ قُلُوبَنَا بَعْدَ إِذْ هَدَيْتَنَا وَهَبْ لَنَا مِن لَّدُنكَ رَحْمَةً إِنَّكَ أَنتَ الْوَهَّابُ", "source": "القرآن الكريم — آل عمران 8", "meaning": "دعاء الثبات على الهداية"},
-    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْعَفْوَ وَالْعَافِيَةَ فِي الدُّنْيَا وَالْآخِرَةِ", "source": "سنن أبي داود وابن ماجه — صحيح", "meaning": "من أجمع الأدعية وأحبها إلى النبي ﷺ"},
-    {"text": "رَبِّ إِنِّي لِمَا أَنزَلْتَ إِلَيَّ مِنْ خَيْرٍ فَقِيرٌ", "source": "القرآن الكريم — القصص 24", "meaning": "دعاء موسى عليه السلام بالافتقار إلى الله"},
-    {"text": "اللَّهُمَّ اغْفِرْ لِي وَارْحَمْنِي وَاهْدِنِي وَعَافِنِي وَارْزُقْنِي", "source": "صحيح مسلم", "meaning": "دعاء جامع علّمه النبي ﷺ"},
-    {"text": "لَا إِلَهَ إِلَّا أَنتَ سُبْحَانَكَ إِنِّي كُنتُ مِنَ الظَّالِمِينَ", "source": "القرآن الكريم — الأنبياء 87", "meaning": "دعاء يونس عليه السلام في بطن الحوت"},
-    {"text": "اللَّهُمَّ أَعِنِّي عَلَى ذِكْرِكَ وَشُكْرِكَ وَحُسْنِ عِبَادَتِكَ", "source": "سنن أبي داود — صحيح", "meaning": "دعاء علّمه النبي ﷺ لمعاذ بن جبل"},
-    {"text": "رَبَّنَا ظَلَمْنَا أَنفُسَنَا وَإِن لَّمْ تَغْفِرْ لَنَا وَتَرْحَمْنَا لَنَكُونَنَّ مِنَ الْخَاسِرِينَ", "source": "القرآن الكريم — الأعراف 23", "meaning": "دعاء آدم وحواء عليهما السلام بالتوبة"},
-    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ عِلْمًا نَافِعًا وَرِزْقًا طَيِّبًا وَعَمَلًا مُتَقَبَّلًا", "source": "سنن ابن ماجه — صحيح", "meaning": "دعاء الصباح النبوي"},
-    {"text": "حَسْبِيَ اللَّهُ لَا إِلَهَ إِلَّا هُوَ عَلَيْهِ تَوَكَّلْتُ وَهُوَ رَبُّ الْعَرْشِ الْعَظِيمِ", "source": "القرآن الكريم — التوبة 129", "meaning": "دعاء التوكل على الله"},
-    {"text": "اللَّهُمَّ إِنِّي أَعُوذُ بِكَ مِنْ عِلْمٍ لَا يَنْفَعُ وَمِنْ قَلْبٍ لَا يَخْشَعُ وَمِنْ نَفْسٍ لَا تَشْبَعُ وَمِنْ دَعْوَةٍ لَا يُسْتَجَابُ لَهَا", "source": "صحيح مسلم", "meaning": "دعاء النبي ﷺ من أربع آفات"},
-    {"text": "رَبِّ زِدْنِي عِلْمًا", "source": "القرآن الكريم — طه 114", "meaning": "أمر الله نبيه بطلب الزيادة من العلم"},
-    {"text": "اللَّهُمَّ أَلِّفْ بَيْنَ قُلُوبِنَا وَأَصْلِحْ ذَاتَ بَيْنِنَا وَاهْدِنَا سُبُلَ السَّلَامِ", "source": "مسند أحمد وسنن أبي داود — صحيح", "meaning": "دعاء الأُلفة والمحبة بين المسلمين"},
-    {"text": "رَبَّنَا هَبْ لَنَا مِنْ أَزْوَاجِنَا وَذُرِّيَّاتِنَا قُرَّةَ أَعْيُنٍ وَاجْعَلْنَا لِلْمُتَّقِينَ إِمَامًا", "source": "القرآن الكريم — الفرقان 74", "meaning": "دعاء عباد الرحمن للذرية الصالحة"},
-    {"text": "اللَّهُمَّ اجْعَلْ فِي قَلْبِي نُورًا وَفِي لِسَانِي نُورًا وَفِي سَمْعِي نُورًا وَفِي بَصَرِي نُورًا", "source": "صحيح البخاري", "meaning": "دعاء النور الشامل من هدي النبي ﷺ"},
-    {"text": "رَبَّنَا اغْفِرْ لَنَا وَلِإِخْوَانِنَا الَّذِينَ سَبَقُونَا بِالْإِيمَانِ", "source": "القرآن الكريم — الحشر 10", "meaning": "دعاء المؤمنين لمن سبقهم بالإيمان"},
-    {"text": "اللَّهُمَّ إِنَّكَ عَفُوٌّ تُحِبُّ الْعَفْوَ فَاعْفُ عَنِّي", "source": "سنن الترمذي — صحيح", "meaning": "دعاء ليلة القدر علّمه النبي ﷺ لعائشة"},
-    {"text": "رَبِّ أَوْزِعْنِي أَنْ أَشْكُرَ نِعْمَتَكَ الَّتِي أَنْعَمْتَ عَلَيَّ وَعَلَى وَالِدَيَّ وَأَنْ أَعْمَلَ صَالِحًا تَرْضَاهُ", "source": "القرآن الكريم — الأحقاف 15", "meaning": "دعاء المؤمن بالشكر على النعم وصلاح العمل"},
-    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْجَنَّةَ وَأَعُوذُ بِكَ مِنَ النَّارِ", "source": "سنن أبي داود — صحيح", "meaning": "من أبسط وأعظم الأدعية"},
-    {"text": "سُبْحَانَكَ اللَّهُمَّ وَبِحَمْدِكَ أَشْهَدُ أَنْ لَا إِلَهَ إِلَّا أَنتَ أَسْتَغْفِرُكَ وَأَتُوبُ إِلَيْكَ", "source": "سنن الترمذي — صحيح", "meaning": "كفارة المجلس"},
-    {"text": "رَبِّ اجْعَلْنِي مُقِيمَ الصَّلَاةِ وَمِن ذُرِّيَّتِي رَبَّنَا وَتَقَبَّلْ دُعَاءِ", "source": "القرآن الكريم — إبراهيم 40", "meaning": "دعاء إبراهيم عليه السلام بإقامة الصلاة"},
-    {"text": "اللَّهُمَّ آتِ نَفْسِي تَقْوَاهَا وَزَكِّهَا أَنتَ خَيْرُ مَن زَكَّاهَا أَنتَ وَلِيُّهَا وَمَوْلَاهَا", "source": "صحيح مسلم", "meaning": "دعاء تزكية النفس"},
-    {"text": "رَبَّنَا أَفْرِغْ عَلَيْنَا صَبْرًا وَثَبِّتْ أَقْدَامَنَا وَانصُرْنَا عَلَى الْقَوْمِ الْكَافِرِينَ", "source": "القرآن الكريم — البقرة 250", "meaning": "دعاء الثبات والنصر"},
-    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ حُبَّكَ وَحُبَّ مَن يُحِبُّكَ وَحُبَّ عَمَلٍ يُقَرِّبُنِي إِلَى حُبِّكَ", "source": "سنن الترمذي — حسن", "meaning": "دعاء طلب محبة الله"},
-    {"text": "رَبَّنَا لَا تُؤَاخِذْنَا إِن نَّسِينَا أَوْ أَخْطَأْنَا", "source": "القرآن الكريم — البقرة 286", "meaning": "من آخر البقرة التي أجاب الله كل دعاء فيها بنعم"},
-    {"text": "اللَّهُمَّ اهْدِنِي وَسَدِّدْنِي", "source": "صحيح مسلم", "meaning": "دعاء الهداية والسداد علّمه النبي ﷺ لعلي"},
-    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ الثَّبَاتَ فِي الْأَمْرِ، وَأَسْأَلُكَ عَزِيمَةَ الرُّشْدِ، وَأَسْأَلُكَ شُكْرَ نِعْمَتِكَ، وَحُسْنَ عِبَادَتِكَ", "source": "سنن النسائي — صحيح", "meaning": "دعاء جامع للثبات والرشد والشكر"},
-    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ الْهُدَى وَالتُّقَى وَالْعَفَافَ وَالْغِنَى", "source": "صحيح مسلم", "meaning": "أربع خصال جمع فيها النبي ﷺ خير الدنيا والآخرة"},
-    {"text": "اللَّهُمَّ مُصَرِّفَ الْقُلُوبِ صَرِّفْ قُلُوبَنَا عَلَى طَاعَتِكَ", "source": "صحيح مسلم", "meaning": "دعاء تثبيت القلب على الطاعة"},
-    {"text": "رَبَّنَا اصْرِفْ عَنَّا عَذَابَ جَهَنَّمَ إِنَّ عَذَابَهَا كَانَ غَرَامًا", "source": "القرآن الكريم — الفرقان 65", "meaning": "دعاء عباد الرحمن للنجاة من عذاب جهنم"},
-    {"text": "اللَّهُمَّ أَحْسِنْ عَاقِبَتَنَا فِي الْأُمُورِ كُلِّهَا، وَأَجِرْنَا مِنْ خِزْيِ الدُّنْيَا وَعَذَابِ الْآخِرَةِ", "source": "المعجم الكبير للطبراني — صحيح", "meaning": "دعاء حسن الخاتمة والنجاة"},
-    {"text": "يَا مُقَلِّبَ الْقُلُوبِ ثَبِّتْ قَلْبِي عَلَى دِينِكَ", "source": "سنن الترمذي — صحيح", "meaning": "كان النبي ﷺ يكثر من هذا الدعاء"},
-    {"text": "اللَّهُمَّ إِنِّي أَعُوذُ بِرِضَاكَ مِنْ سَخَطِكَ، وَبِمُعَافَاتِكَ مِنْ عُقُوبَتِكَ، وَأَعُوذُ بِكَ مِنْكَ", "source": "صحيح مسلم", "meaning": "من دعاء النبي ﷺ في سجوده"},
-    {"text": "رَبَّنَا آمَنَّا فَاغْفِرْ لَنَا وَارْحَمْنَا وَأَنتَ خَيْرُ الرَّاحِمِينَ", "source": "القرآن الكريم — المؤمنون 109", "meaning": "دعاء المؤمنين طالبين المغفرة والرحمة"},
-    {"text": "اللَّهُمَّ اجْعَلْنِي صَبُورًا وَاجْعَلْنِي شَكُورًا وَاجْعَلْنِي فِي عَيْنِي صَغِيرًا وَفِي أَعْيُنِ النَّاسِ كَبِيرًا", "source": "المستدرك للحاكم — صحيح", "meaning": "دعاء التواضع وحسن السيرة"},
-    {"text": "رَبِّ هَبْ لِي حُكْمًا وَأَلْحِقْنِي بِالصَّالِحِينَ", "source": "القرآن الكريم — الشعراء 83", "meaning": "دعاء إبراهيم عليه السلام بالحكمة والصلاح"},
-    {"text": "اللَّهُمَّ اجْعَلْ أَوَّلَ هَذَا النَّهَارِ صَلَاحًا وَأَوْسَطَهُ فَلَاحًا وَآخِرَهُ نَجَاحًا", "source": "سنن أبي داود — حسن", "meaning": "دعاء بركة اليوم من أوله لآخره"},
-    {"text": "رَبَّنَا اغْفِرْ لِي وَلِوَالِدَيَّ وَلِلْمُؤْمِنِينَ يَوْمَ يَقُومُ الْحِسَابُ", "source": "القرآن الكريم — إبراهيم 41", "meaning": "دعاء إبراهيم عليه السلام للمغفرة يوم القيامة"},
-    {"text": "اللَّهُمَّ إِنِّي أَسْأَلُكَ فِعْلَ الْخَيْرَاتِ وَتَرْكَ الْمُنْكَرَاتِ وَحُبَّ الْمَسَاكِينِ", "source": "سنن الترمذي — صحيح", "meaning": "من دعاء الإسراء، طلب فعل الخيرات وحب الفقراء"},
-    {"text": "رَبَّنَا لَا تَجْعَلْنَا فِتْنَةً لِّلْقَوْمِ الظَّالِمِينَ وَنَجِّنَا بِرَحْمَتِكَ مِنَ الْقَوْمِ الْكَافِرِينَ", "source": "القرآن الكريم — يونس 85-86", "meaning": "دعاء المؤمنين مع موسى عليه السلام"},
-    {"text": "اللَّهُمَّ أَنْتَ رَبِّي لَا إِلَهَ إِلَّا أَنْتَ خَلَقْتَنِي وَأَنَا عَبْدُكَ وَأَنَا عَلَى عَهْدِكَ وَوَعْدِكَ مَا اسْتَطَعْتُ", "source": "صحيح البخاري", "meaning": "سيد الاستغفار — من قاله موقناً فمات دخل الجنة"},
-    {"text": "رَبَّنَا آتِنَا مِن لَّدُنكَ رَحْمَةً وَهَيِّئْ لَنَا مِنْ أَمْرِنَا رَشَدًا", "source": "القرآن الكريم — الكهف 10", "meaning": "دعاء أصحاب الكهف بالرحمة والهداية"},
-    {"text": "اللَّهُمَّ إِنِّي أَعُوذُ بِكَ مِنَ الْفَقْرِ وَالْقِلَّةِ وَالذِّلَّةِ وَأَعُوذُ بِكَ مِنْ أَنْ أَظْلِمَ أَوْ أُظْلَمَ", "source": "سنن أبي داود — صحيح", "meaning": "الاستعاذة من الفقر والظلم"},
-    {"text": "رَبِّ أَعُوذُ بِكَ مِنْ هَمَزَاتِ الشَّيَاطِينِ وَأَعُوذُ بِكَ رَبِّ أَن يَحْضُرُونِ", "source": "القرآن الكريم — المؤمنون 97-98", "meaning": "الاستعاذة من وساوس الشياطين"},
-    {"text": "اللَّهُمَّ أَصْلِحْ لِي دِينِي وَوَسِّعْ لِي فِي دَارِي وَبَارِكْ لِي فِيمَا رَزَقْتَنِي", "source": "المستدرك للحاكم — صحيح", "meaning": "دعاء جامع لصلاح الدين والرزق والمسكن"},
-    {"text": "رَبَّنَا اكْشِفْ عَنَّا الْعَذَابَ إِنَّا مُؤْمِنُونَ", "source": "القرآن الكريم — الدخان 12", "meaning": "دعاء رفع البلاء والعذاب"},
-    {"text": "رَبِّ أَدْخِلْنِي مُدْخَلَ صِدْقٍ وَأَخْرِجْنِي مُخْرَجَ صِدْقٍ وَاجْعَل لِّي مِن لَّدُنكَ سُلْطَانًا نَّصِيرًا", "source": "القرآن الكريم — الإسراء 80", "meaning": "دعاء الصدق في الأمور كلها"},
-]
 
 def get_duaa_of_day() -> dict:
     """ارجع دعاء اليوم بناءً على رقم اليوم في السنة"""
@@ -3450,8 +3277,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== أزرار الكيبورد — تأتي أولاً دائماً =====
     _KB_BTNS = {
         "🔍 تحقق من حديث","📖 باحث القرآن",
-        "🤲 دعاء اليوم","🌟 قدوتي اليوم","🎯 اختبر معلوماتك",
-        "⚔️ تحدي صديق","💰 دعم البوت","ℹ️ عن البوت",
+        "🎯 اختبر معلوماتك",
+        "💰 دعم البوت","ℹ️ عن البوت",
         "🕌 الأذكار","🔙 رجوع","⚙️ لوحة التحكم","❓ سؤال ديني",
         "💬 التحدث مع راوي","🎙️ استمع للقرآن",
         "🔙 خروج من راوي","🔙 خروج من الباحث",
@@ -3698,10 +3525,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("اختر نوع الأذكار 👇", reply_markup=kb)
         return
 
-    if text == "🤲 دعاء اليوم":
-        await cmd_duaa(update, context)
-        return
-
+    
     if text == "📖 باحث القرآن":
         for _k in ["hadith_search_mode","islamic_qa_mode","qudwati_waiting"]:
             context.user_data.pop(_k, None)
@@ -3738,10 +3562,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text == "⚔️ تحدي صديق":
-        await cmd_friend_challenge(update, context)
-        return
-
+    
     if text == "💬 التحدث مع راوي":
         if not GROQ_API_KEY:
             await update.message.reply_text(
@@ -3852,10 +3673,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if text == "🌟 قدوتي اليوم":
-        await cmd_qudwati(update, context)
-        return
-
+    
     if text == "📜 اقترح لي حديثاً":
         kb = InlineKeyboardMarkup([
             [colored_btn("📗 البخاري", callback_data="suggest_bukhari", style="primary"),
@@ -6318,6 +6136,534 @@ async def upload_surah_to_channel(bot, reciter: str, surah: int) -> str | None:
         logger.error(f"upload_surah error {reciter} {surah}: {e}")
         return None
 
+# ═══════════════════════════════════════════════════════════════════
+# نظام الاختبارات في القنوات - Channel Quiz System
+# ═══════════════════════════════════════════════════════════════════
+
+import asyncio
+from datetime import datetime, timedelta
+
+# متغيرات عامة لتتبع الاختبارات النشطة
+ACTIVE_CHANNEL_QUIZZES = {}  # {channel_id: quiz_data}
+CHANNEL_QUIZ_PARTICIPANTS = {}  # {quiz_id: {user_id: {lives, score, answered}}}
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: إنشاء اختبار جديد (للأدمن فقط)
+# ═══════════════════════════════════════════════════════════════════
+
+async def cmd_create_channel_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    إنشاء اختبار جديد في القناة
+    الأدمن يختار: أسئلة جاهزة أو كتابة يدوية
+    """
+    user = update.effective_user
+    
+    # التحقق من أن المستخدم أدمن
+    if user.id not in ADMIN_IDS:
+        await update.message.reply_text("⚠️ هذا الأمر للمشرفين فقط!")
+        return
+    
+    # الكيبورد: اختيار نوع الأسئلة
+    keyboard = [
+        [colored_btn("📚 أسئلة جاهزة (من البوت)", callback_data="cq_ready", style="primary")],
+        [colored_btn("✍️ كتابة أسئلة يدوية", callback_data="cq_manual", style="secondary")],
+        [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
+    ]
+    
+    await update.message.reply_text(
+        "🎯 *إنشاء اختبار في القناة*\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "اختر نوع الأسئلة:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    # حفظ الحالة
+    context.user_data["creating_channel_quiz"] = True
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: معالج اختيار الأسئلة
+# ═══════════════════════════════════════════════════════════════════
+
+async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج اختيار نوع الأسئلة"""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+
+    # نظام الاختبارات في القنوات
+    if data.startswith("cq_"):
+        await handle_quiz_type_selection(update, context)
+        return
+    
+    if data.startswith("cqj_"):
+        await handle_quiz_join(update, context)
+        return
+    
+    if data.startswith("cqs_"):
+        await handle_quiz_start(update, context)
+        return
+    
+    if data.startswith("cqa_"):
+        await handle_quiz_answer(update, context)
+        return
+    
+    
+    if data == "cq_ready":
+        # أسئلة جاهزة
+        await query.edit_message_text(
+            "📚 *أسئلة جاهزة*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "كم عدد الأسئلة؟\n"
+            "أرسل رقم من 5 إلى 20:",
+            parse_mode="Markdown"
+        )
+        context.user_data["quiz_type"] = "ready"
+        context.user_data["waiting_quiz_count"] = True
+        
+    elif data == "cq_manual":
+        # أسئلة يدوية
+        await query.edit_message_text(
+            "✍️ *كتابة أسئلة يدوية*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "أرسل الأسئلة بهذا الشكل:\n\n"
+            "```\n"
+            "السؤال: من هو أول من أسلم؟\n"
+            "أ. عمر\n"
+            "ب. أبو بكر\n"
+            "ج. علي\n"
+            "د. عثمان\n"
+            "الإجابة: ب\n"
+            "```\n\n"
+            "افصل كل سؤال بـ `---`",
+            parse_mode="Markdown"
+        )
+        context.user_data["quiz_type"] = "manual"
+        context.user_data["waiting_manual_questions"] = True
+        
+    elif data == "cq_cancel":
+        await query.edit_message_text("❌ تم الإلغاء")
+        context.user_data.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: نشر الاختبار في القناة
+# ═══════════════════════════════════════════════════════════════════
+
+async def publish_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, questions: list, admin_id: int):
+    """
+    نشر الاختبار في القناة
+    """
+    quiz_id = f"cq_{int(datetime.now().timestamp())}"
+    
+    # حفظ بيانات الاختبار
+    ACTIVE_CHANNEL_QUIZZES[channel_id] = {
+        "quiz_id": quiz_id,
+        "questions": questions,
+        "current_question": 0,
+        "admin_id": admin_id,
+        "status": "waiting",  # waiting, active, finished
+        "started_at": None,
+        "message_id": None
+    }
+    
+    CHANNEL_QUIZ_PARTICIPANTS[quiz_id] = {}
+    
+    # رسالة الإعلان
+    text = (
+        "🎯 *اختبار إسلامي جديد!*\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📚 عدد الأسئلة: {len(questions)}\n"
+        f"⏱️ مدة السؤال: 15 ثانية\n"
+        f"❤️ الأرواح: 3 (3 أخطاء = خروج)\n"
+        f"🏆 الفائز: أول من يكمل بدون 3 أخطاء\n\n"
+        f"👥 المشاركين: 0\n\n"
+        "📝 اضغط *انضم* للمشاركة!"
+    )
+    
+    keyboard = [
+        [colored_btn("🎮 انضم للاختبار", callback_data=f"cqj_{quiz_id}", style="success")],
+        [colored_btn("▶️ بدء الاختبار (أدمن)", callback_data=f"cqs_{quiz_id}", style="primary")]
+    ]
+    
+    msg = await context.bot.send_message(
+        chat_id=channel_id,
+        text=text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    
+    ACTIVE_CHANNEL_QUIZZES[channel_id]["message_id"] = msg.message_id
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: الانضمام للاختبار
+# ═══════════════════════════════════════════════════════════════════
+
+async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج انضمام المستخدم للاختبار"""
+    query = update.callback_query
+    await query.answer()
+    
+    quiz_id = query.data.replace("cqj_", "")
+    user_id = query.from_user.id
+    user_name = query.from_user.first_name or "مشارك"
+    
+    # التحقق من أن الاختبار موجود
+    if quiz_id not in CHANNEL_QUIZ_PARTICIPANTS:
+        await query.answer("⚠️ الاختبار غير موجود!", show_alert=True)
+        return
+    
+    # التحقق من أن الاختبار لم يبدأ
+    channel_id = query.message.chat.id
+    quiz_data = ACTIVE_CHANNEL_QUIZZES.get(str(channel_id))
+    
+    if quiz_data and quiz_data["status"] != "waiting":
+        await query.answer("⚠️ الاختبار بدأ بالفعل!", show_alert=True)
+        return
+    
+    # تسجيل المشارك
+    if user_id not in CHANNEL_QUIZ_PARTICIPANTS[quiz_id]:
+        CHANNEL_QUIZ_PARTICIPANTS[quiz_id][user_id] = {
+            "name": user_name,
+            "lives": 3,
+            "score": 0,
+            "answered": [],
+            "active": True
+        }
+        
+        await query.answer(f"✅ تم التسجيل! أهلاً {user_name}", show_alert=True)
+        
+        # تحديث عدد المشاركين في الرسالة
+        count = len(CHANNEL_QUIZ_PARTICIPANTS[quiz_id])
+        
+        text = query.message.text.split("👥 المشاركين:")[0]
+        text += f"👥 المشاركين: {count}\n\n📝 اضغط *انضم* للمشاركة!"
+        
+        await query.edit_message_text(
+            text,
+            parse_mode="Markdown",
+            reply_markup=query.message.reply_markup
+        )
+    else:
+        await query.answer("✅ أنت مسجل بالفعل!", show_alert=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: بدء الاختبار (أدمن فقط)
+# ═══════════════════════════════════════════════════════════════════
+
+async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج بدء الاختبار - للأدمن فقط"""
+    query = update.callback_query
+    
+    quiz_id = query.data.replace("cqs_", "")
+    user_id = query.from_user.id
+    channel_id = str(query.message.chat.id)
+    
+    quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id)
+    
+    if not quiz_data:
+        await query.answer("⚠️ الاختبار غير موجود!", show_alert=True)
+        return
+    
+    # التحقق من أن المستخدم هو الأدمن
+    if user_id != quiz_data["admin_id"]:
+        await query.answer("⚠️ هذا الأمر للمشرف فقط!", show_alert=True)
+        return
+    
+    # التحقق من وجود مشاركين
+    if len(CHANNEL_QUIZ_PARTICIPANTS[quiz_id]) == 0:
+        await query.answer("⚠️ لا يوجد مشاركين!", show_alert=True)
+        return
+    
+    await query.answer("✅ يتم بدء الاختبار...")
+    
+    # تحديث الحالة
+    quiz_data["status"] = "active"
+    quiz_data["started_at"] = datetime.now()
+    
+    # حذف رسالة الإعلان
+    await query.message.delete()
+    
+    # بدء الاختبار
+    asyncio.create_task(run_channel_quiz(context, channel_id, quiz_id))
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: تشغيل الاختبار (المحرك الرئيسي)
+# ═══════════════════════════════════════════════════════════════════
+
+async def run_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, quiz_id: str):
+    """
+    محرك الاختبار - يعرض الأسئلة واحد تلو الآخر
+    """
+    quiz_data = ACTIVE_CHANNEL_QUIZZES[channel_id]
+    questions = quiz_data["questions"]
+    participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+    
+    for idx, q in enumerate(questions):
+        quiz_data["current_question"] = idx
+        
+        # عرض السؤال
+        text = (
+            f"📝 *السؤال {idx + 1}/{len(questions)}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{q['q']}\n\n"
+        )
+        
+        keyboard = []
+        labels = ['أ', 'ب', 'ج', 'د']
+        
+        for i, opt in enumerate(q['options']):
+            keyboard.append([
+                colored_btn(
+                    f"{labels[i]}. {opt}",
+                    callback_data=f"cqa_{quiz_id}_{idx}_{i}",
+                    style="primary"
+                )
+            ])
+        
+        text += f"\n⏱️ الوقت المتبقي: 15 ثانية"
+        
+        msg = await context.bot.send_message(
+            chat_id=channel_id,
+            text=text,
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        quiz_data["current_message_id"] = msg.message_id
+        
+        # انتظار 15 ثانية أو حتى يجاوب الجميع
+        await wait_for_answers(context, channel_id, quiz_id, idx, 15)
+        
+        # حذف السؤال
+        try:
+            await context.bot.delete_message(channel_id, msg.message_id)
+        except:
+            pass
+        
+        # التحقق من وجود فائز
+        winner = check_for_winner(quiz_id, len(questions))
+        if winner:
+            await announce_winner(context, channel_id, quiz_id, winner)
+            return
+    
+    # انتهى الاختبار - إعلان النتائج
+    await announce_results(context, channel_id, quiz_id)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: انتظار الإجابات
+# ═══════════════════════════════════════════════════════════════════
+
+async def wait_for_answers(context, channel_id, quiz_id, question_idx, max_seconds):
+    """
+    انتظار الإجابات - 15 ثانية أو حتى يجاوب الجميع
+    """
+    participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+    active_count = len([p for p in participants.values() if p["active"]])
+    
+    for _ in range(max_seconds):
+        await asyncio.sleep(1)
+        
+        # عدد اللي جاوبوا
+        answered_count = len([
+            p for p in participants.values() 
+            if p["active"] and question_idx in p["answered"]
+        ])
+        
+        # لو كل الناس جاوبوا
+        if answered_count >= active_count:
+            break
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: معالج الإجابة
+# ═══════════════════════════════════════════════════════════════════
+
+async def handle_quiz_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج إجابة المستخدم"""
+    query = update.callback_query
+    
+    parts = query.data.split("_")
+    quiz_id = parts[1]
+    question_idx = int(parts[2])
+    answer_idx = int(parts[3])
+    
+    user_id = query.from_user.id
+    
+    # التحقق من أن المستخدم مشارك
+    if quiz_id not in CHANNEL_QUIZ_PARTICIPANTS or user_id not in CHANNEL_QUIZ_PARTICIPANTS[quiz_id]:
+        await query.answer("⚠️ أنت لست مشاركاً!", show_alert=True)
+        return
+    
+    participant = CHANNEL_QUIZ_PARTICIPANTS[quiz_id][user_id]
+    
+    # التحقق من أنه لم يجب بعد
+    if question_idx in participant["answered"]:
+        await query.answer("⚠️ لقد أجبت بالفعل!", show_alert=True)
+        return
+    
+    # التحقق من أنه ما زال نشط
+    if not participant["active"]:
+        await query.answer("⚠️ لقد خرجت من الاختبار!", show_alert=True)
+        return
+    
+    # الحصول على السؤال
+    channel_id = str(query.message.chat.id)
+    quiz_data = ACTIVE_CHANNEL_QUIZZES[channel_id]
+    question = quiz_data["questions"][question_idx]
+    
+    # التحقق من الإجابة
+    correct_answer = question["answer"]
+    user_answer = question["options"][answer_idx]
+    
+    is_correct = (user_answer == correct_answer)
+    
+    # تسجيل الإجابة
+    participant["answered"].append(question_idx)
+    
+    if is_correct:
+        participant["score"] += 1
+        await query.answer("✅ إجابة صحيحة!", show_alert=True)
+    else:
+        participant["lives"] -= 1
+        await query.answer(f"❌ خطأ! الإجابة: {correct_answer}\n❤️ الأرواح: {participant['lives']}", show_alert=True)
+        
+        # لو خلصت أرواحه
+        if participant["lives"] <= 0:
+            participant["active"] = False
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=f"💔 للأسف خرجت من الاختبار!\n"
+                     f"حصلت على {participant['score']} نقطة."
+            )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: التحقق من وجود فائز
+# ═══════════════════════════════════════════════════════════════════
+
+def check_for_winner(quiz_id, total_questions):
+    """
+    التحقق من وجود فائز
+    الفائز: أول من أجاب على كل الأسئلة بدون خسارة 3 أرواح
+    """
+    participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+    
+    for user_id, data in participants.items():
+        if data["active"] and data["score"] == total_questions:
+            return user_id
+    
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: إعلان الفائز
+# ═══════════════════════════════════════════════════════════════════
+
+async def announce_winner(context, channel_id, quiz_id, winner_id):
+    """إعلان الفائز في القناة"""
+    participant = CHANNEL_QUIZ_PARTICIPANTS[quiz_id][winner_id]
+    
+    text = (
+        "🎉🏆 *تهانينا!* 🏆🎉\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"👑 الفائز: {participant['name']}\n"
+        f"⭐ النقاط: {participant['score']}\n"
+        f"❤️ الأرواح المتبقية: {participant['lives']}\n\n"
+        "🎊 مبروك! 🎊"
+    )
+    
+    await context.bot.send_message(
+        chat_id=channel_id,
+        text=text,
+        parse_mode="Markdown"
+    )
+    
+    # حفظ النقاط في قاعدة البيانات
+    save_quiz_points(winner_id, participant['score'])
+    
+    # تنظيف
+    cleanup_quiz(channel_id, quiz_id)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: إعلان النتائج (بدون فائز)
+# ═══════════════════════════════════════════════════════════════════
+
+async def announce_results(context, channel_id, quiz_id):
+    """إعلان النتائج النهائية"""
+    participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+    
+    # ترتيب حسب النقاط
+    sorted_participants = sorted(
+        participants.items(),
+        key=lambda x: x[1]["score"],
+        reverse=True
+    )
+    
+    text = (
+        "📊 *النتائج النهائية*\n"
+        "━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+    
+    medals = ["🥇", "🥈", "🥉"]
+    
+    for idx, (user_id, data) in enumerate(sorted_participants[:10]):
+        medal = medals[idx] if idx < 3 else f"{idx+1}."
+        text += f"{medal} {data['name']} - {data['score']} نقطة\n"
+    
+    text += f"\n✅ عدد المشاركين: {len(participants)}"
+    
+    await context.bot.send_message(
+        chat_id=channel_id,
+        text=text,
+        parse_mode="Markdown"
+    )
+    
+    # حفظ النقاط للجميع
+    for user_id, data in participants.items():
+        if data["score"] > 0:
+            save_quiz_points(user_id, data["score"])
+    
+    # تنظيف
+    cleanup_quiz(channel_id, quiz_id)
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دوال مساعدة
+# ═══════════════════════════════════════════════════════════════════
+
+def save_quiz_points(user_id, points):
+    """حفظ النقاط في قاعدة البيانات"""
+    try:
+        conn = get_db()
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO user_points (user_id, points, earned_at, source)
+            VALUES (?, ?, datetime('now'), 'channel_quiz')
+        """, (user_id, points))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Error saving quiz points: {e}")
+
+
+def cleanup_quiz(channel_id, quiz_id):
+    """تنظيف بيانات الاختبار"""
+    if channel_id in ACTIVE_CHANNEL_QUIZZES:
+        del ACTIVE_CHANNEL_QUIZZES[channel_id]
+    
+    if quiz_id in CHANNEL_QUIZ_PARTICIPANTS:
+        del CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+
+
+
 def main():
     logger.info("🚀 بدء تشغيل بوت راوِي...")
     init_db()
@@ -6379,6 +6725,9 @@ def main():
 
     # إضافة المعالجات - CommandHandlers أولاً دايماً قبل MessageHandler
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("اختبار_قناة", cmd_create_channel_quiz))
+    app.add_handler(CommandHandler("create_channel_quiz", cmd_create_channel_quiz))
+
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("version", version_command))
     app.add_handler(CommandHandler("donate", donate_command))
