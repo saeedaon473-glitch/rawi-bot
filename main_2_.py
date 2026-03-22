@@ -4115,7 +4115,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if context.user_data.get("quran_search_mode") and text and not text.startswith("/"):
+    if context.user_data.get("quran_search_mode") and text and not text.startswith("/") and text != "🔙 خروج من الباحث":
         # تجاهل زر الخروج - دعه يمر للمعالج الخاص
         if text == "🔙 خروج من الباحث":
             # لا تعالجه هنا - دعه يمر للأسفل
@@ -4212,7 +4212,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     # ===== معالج البحث عن حديث =====
-    if context.user_data.get("hadith_search_mode") and text and not text.startswith("/") and text not in _KB_BTNS:
+    if context.user_data.get("hadith_search_mode") and text and not text.startswith("/") and text not in _KB_BTNS and text != "🔙 خروج من الباحث":
         # تجاهل زر الخروج - دعه يمر للمعالج الخاص
         if text == "🔙 خروج من الباحث":
             # لا تعالجه هنا - دعه يمر للأسفل
