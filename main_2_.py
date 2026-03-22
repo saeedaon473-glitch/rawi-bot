@@ -1492,8 +1492,9 @@ def main_kb(is_admin=False, **kwargs):
         [KeyboardButton("🔍 تحقق من حديث"), KeyboardButton("📖 باحث القرآن")],
         [KeyboardButton("🤲 دعاء اليوم"), KeyboardButton("🎯 اختبر معلوماتك")],
         [KeyboardButton("🌟 قدوتي اليوم"), KeyboardButton("🎙️ استمع للقرآن")],
-        [KeyboardButton("❓ سؤال ديني"), KeyboardButton("⚔️ تحدي صديق")],
-        [KeyboardButton("💰 دعم البوت"), KeyboardButton("📞 تواصل مع المطور")],
+        [KeyboardButton("💬 التحدث مع راوي"), KeyboardButton("❓ سؤال ديني")],
+        [KeyboardButton("⚔️ تحدي صديق"), KeyboardButton("💰 دعم البوت")],
+        [KeyboardButton("📞 تواصل مع المطور")],
     ]
     if is_admin:
         buttons.append([KeyboardButton("⚙️ لوحة التحكم")])
