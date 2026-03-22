@@ -3502,32 +3502,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data.pop("waiting_note", None)
 
     # ===== معالج راوي AI - المحادثة الشاملة =====
-    if context.user_data.get("waiting_for_rawi"):
-        # تجاهل أزرار الخروج - دعها تمر للمعالج الخاص
-        if text in ["🔙 خروج من راوي", "🔙 خروج من الباحث"]:
-            # لا تعالجها هنا - دعها تمر للأسفل
-            pass
-        else:
-            is_admin = user.id in ADMIN_IDS
-            
-            # رسالة انتظار
-            wait_msg = await update.message.reply_text("💬 راوي يفكر في إجابتك...")
-            
-            # الحصول على الإجابة
-            user_name = user.first_name or "أخي"
-            answer = await chat_with_rawi(text, user_name)
-            
-            # حذف رسالة الانتظار
-            await wait_msg.delete()
-            
-            # إرسال الإجابة مع الإبقاء على كيبورد راوي
-            await update.message.reply_text(
-                answer,
-                parse_mode="Markdown",
-                reply_markup=rawi_kb()
-            )
-            # لا نغير waiting_for_rawi - نبقيه True ليستمر الوضع
-            return
+    # معالج راوي - تجاهل أزرار الخروج مباشرة في الشرط
+    if context.user_data.get("waiting_for_rawi") and text not in ["🔙 خروج من راوي", "🔙 خروج من الباحث"]:
+        is_admin = user.id in ADMIN_IDS
+        
+        # رسالة انتظار
+        wait_msg = await update.message.reply_text("💬 راوي يفكر في إجابتك...")
+        
+        # الحصول على الإجابة
+        user_name = user.first_name or "أخي"
+        answer = await chat_with_rawi(text, user_name)
+        
+        # حذف رسالة الانتظار
+        await wait_msg.delete()
+        
+        # إرسال الإجابة مع الإبقاء على كيبورد راوي
+        await update.message.reply_text(
+            answer,
+            parse_mode="Markdown",
+            reply_markup=rawi_kb()
+        )
+        # لا نغير waiting_for_rawi - نبقيه True ليستمر الوضع
+        return
 
 
     # معالج رسائل التواصل مع المطور
@@ -6606,6 +6602,7 @@ QURAN_RECITERS = [
     {"id": "Ghamadi_40kbps",                "page_id": "Ghamadi_40kbps",              "name": "سعد الغامدي"},
     {"id": "Nasser_Alqatami_128kbps",       "page_id": "Nasser_Alqatami_128kbps",     "name": "ناصر القطامي"},
     {"id": "Muhammad_Jibreel_128kbps",      "page_id": "Muhammad_Jibreel_128kbps",    "name": "محمد جبريل"},
+    {"id": "Omar_Aldayatin_128kbps",        "page_id": "Omar_Aldayatin_128kbps",      "name": "عمر بن ضياء الدين"},
 ]
 
 # ربط اسم القارئ بـ edition في cdn.islamic.network
@@ -6622,6 +6619,7 @@ RECITER_EDITIONS = {
     "سعد الغامدي":          "ar.alghamdi",
     "ناصر القطامي":         "ar.alqatami",
     "محمد جبريل":           "ar.muhammadjibril",
+    "عمر بن ضياء الدين":    "ar.omardayatin",
 }
 
 def get_ayah_audio_url(surah: int, ayah: int, reciter_id: str) -> str:
