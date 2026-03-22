@@ -441,6 +441,7 @@ BOT_USERNAME = "@G4bGN_bot"
 QA_FREE_DAILY = 3  # عدد الأسئلة المجانية يومياً
 QA_EXTRA_STARS = 10  # عدد النجوم لشراء 5 أسئلة إضافية
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 
 # ==================== نظام Cache بسيط ====================
 class SimpleCache:
@@ -1859,6 +1860,98 @@ def simplify_query(query: str) -> str:
     simplified = ' '.join(filtered[:3])
     
     return simplified if simplified else query
+
+
+async def chat_with_rawi(question: str, user_name: str = "أخي") -> str:
+    """
+    التحدث مع راوي - AI متخصص في الإجابة على الأسئلة الإسلامية
+    بأسلوب دافئ وواضح ومدعوم بالأدلة
+    """
+    if not GROQ_API_KEY:
+        return "⚠️ ميزة التحدث مع راوي غير متوفرة حالياً. جرّب لاحقاً!"
+    
+    # Prompt احترافي ودافئ
+    system_prompt = """أنت "راوي" - مساعد إسلامي متخصص ودافئ.
+
+🎯 **هويتك:**
+- اسمك "راوي" - صديق المسلم الباحث عن العلم
+- متخصص في الحديث النبوي والعلوم الإسلامية
+- تجيب بأسلوب دافئ وواضح ومدعوم بالأدلة
+
+📚 **مبادئك:**
+1. **الدقة أولاً:** لا تفتي في ما لا تعلم. قل: "هذا يحتاج مراجعة عالم شرعي"
+2. **الدليل:** اذكر الحديث أو الآية إن وُجدت
+3. **الوضوح:** اشرح بلغة بسيطة يفهمها الجميع
+4. **الدفء:** عامل السائل كأخ تحبه وتريد له الخير
+5. **التوازن:** لا إفراط ولا تفريط
+
+🚫 **لا تفعل:**
+- لا تفتي في مسائل معقدة (الطلاق، الميراث، القضايا الفقهية المتخصصة)
+- لا تخترع أحاديث أو تنسب للنبي ﷺ ما لم يقل
+- لا تتحدث بثقة عن خلافات فقهية دون ذكر الآراء
+
+✅ **افعل:**
+- شجّع السائل على الخير
+- ذكّره بفضل العمل الصالح
+- وجّهه لمراجع موثوقة إن احتاج
+- اختم بدعوة صادقة له
+
+📝 **أسلوب الإجابة:**
+- ابدأ بترحيب دافئ
+- أجب مباشرة على السؤال
+- اذكر الدليل إن وُجد
+- أعط نصيحة عملية
+- اختم بدعوة أو تشجيع
+
+💡 **مثال على إجابتك:**
+"السلام عليكم ورحمة الله {user_name} 🌙
+
+[إجابة مباشرة على السؤال]
+
+📚 **الدليل:**
+[حديث أو آية إن وُجد]
+
+✨ **نصيحة عملية:**
+[كيف يطبقه في حياته]
+
+بارك الله فيك، وجعل الله هذا العلم نافعاً لك 🤲"
+
+---
+
+**تذكّر:** أنت صديق، لست واعظاً جافاً. كن دافئاً ومحباً وناصحاً."""
+
+    user_message = f"سؤالي: {question}"
+    
+    try:
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {GROQ_API_KEY}",
+            "Content-Type": "application/json"
+        }
+        
+        body = {
+            "model": "llama-3.3-70b-versatile",
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message}
+            ],
+            "temperature": 0.7,
+            "max_tokens": 1000,
+        }
+        
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, json=body, headers=headers, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    answer = data["choices"][0]["message"]["content"].strip()
+                    return answer
+                else:
+                    return "⚠️ عذراً، حدث خطأ في الاتصال. حاول مرة أخرى."
+        
+    except Exception as e:
+        logger.error(f"Error in chat_with_rawi: {e}")
+        return "⚠️ عذراً، حدث خطأ. حاول مرة أخرى."
+
 
 async def enhance_search_with_ai(query: str) -> str:
     """
@@ -3596,8 +3689,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await cmd_friend_challenge(update, context)
         return
 
+    if text == "💬 التحدث مع راوي":
+        if not GROQ_API_KEY:
+            await update.message.reply_text(
+                "⚠️ ميزة التحدث مع راوي غير متوفرة حالياً.\n"
+                "يرجى المحاولة لاحقاً.",
+                reply_markup=main_kb(is_admin)
+            )
+            return
+        
+        await update.message.reply_text(
+            "💬 **مرحباً بك في راوي!**\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "🤖 أنا مساعدك الإسلامي الذكي\n"
+            "📚 أجيب على أسئلتك الشرعية بأدلة واضحة\n"
+            "💡 أساعدك على فهم الإسلام بعمق\n\n"
+            "**اسألني أي سؤال إسلامي:**\n"
+            "• ما حكم...؟\n"
+            "• كيف أفعل...؟\n"
+            "• ما فضل...؟\n"
+            "• هل يجوز...؟\n\n"
+            "🌟 _أرسل سؤالك الآن وسأجيبك بإذن الله_",
+            parse_mode="Markdown"
+        )
+        
+        # تفعيل وضع الانتظار
+        context.user_data["waiting_for_rawi"] = True
+        return
     
-
     if text == "❓ سؤال ديني":
         for _k in ["quran_search_mode","hadith_search_mode","qudwati_waiting"]:
             context.user_data.pop(_k, None)
@@ -6418,7 +6537,6 @@ async def fetch_quran_search(query: str) -> list:
         ayah_number = None
         
         # نمط: "— سورة محمد، الآية 7"
-        import re
         pattern1 = r'—\s*سورة\s+(\w+)،?\s*الآية\s+(\d+)'
         match1 = re.search(pattern1, clean_query)
         if match1:
@@ -6478,6 +6596,27 @@ async def fetch_quran_search(query: str) -> list:
     except Exception as e:
         logger.error(f"Error in fetch_quran_search: {e}")
         return []
+
+async def cmd_quran_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج باحث القرآن"""
+    await update.message.reply_text(
+        "📖 **باحث القرآن الكريم**\n"
+        "━━━━━━━━━━━━━━━\n\n"
+        "🔍 ابحث في القرآن بعدة طرق:\n\n"
+        "**1️⃣ نص الآية:**\n"
+        "`﴿قُلْ هُوَ اللَّهُ أَحَدٌ﴾`\n\n"
+        "**2️⃣ سورة:آية:**\n"
+        "`الإخلاص:1`\n"
+        "`112:1`\n\n"
+        "**3️⃣ كلمة أو عبارة:**\n"
+        "`التوكل`\n"
+        "`يا أيها الذين آمنوا`\n\n"
+        "📝 _أرسل بحثك الآن..._",
+        parse_mode="Markdown"
+    )
+    # تفعيل وضع البحث
+    context.user_data["quran_search_mode"] = True
+
 
 async def fetch_quran_page(page_num: int) -> list:
     """جلب صفحة كاملة من القرآن — quran.foundation API"""
@@ -7125,4 +7264,4 @@ async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 if __name__ == "__main__":
-    main(
+    main()
