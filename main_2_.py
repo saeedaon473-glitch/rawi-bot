@@ -1881,15 +1881,29 @@ def simplify_query(query: str) -> str:
     return simplified if simplified else query
 
 
-async def chat_with_rawi(question: str, user_name: str = "أخي") -> str:
+async def chat_with_rawi(question: str, user_name: str = "أخي", user_id: int = None, context = None) -> str:
     """
     التحدث مع راوي - AI متخصص في الإجابة على الأسئلة الإسلامية
-    بأسلوب دافئ وواضح ومدعوم بالأدلة
+    بأسلوب دافئ وواضح ومدعوم بالأدلة - مع ذاكرة محادثة
     """
     if not GROQ_API_KEY:
         return "⚠️ ميزة التحدث مع راوي غير متوفرة حالياً. جرّب لاحقاً!"
     
-    # Prompt احترافي ودافئ
+    # الحصول على تاريخ المحادثة
+    if context and user_id:
+        if "rawi_history" not in context.user_data:
+            context.user_data["rawi_history"] = []
+        
+        conversation_history = context.user_data["rawi_history"]
+        
+        # حد أقصى 10 رسائل (5 تبادلات) للحفاظ على الذاكرة
+        if len(conversation_history) > 10:
+            conversation_history = conversation_history[-10:]
+            context.user_data["rawi_history"] = conversation_history
+    else:
+        conversation_history = []
+    
+    # Prompt مختصر
     system_prompt = f"""أنت "راوي" - مساعد إسلامي ذكي في بوت راوي.
 
 **دورك:**
@@ -1909,15 +1923,14 @@ async def chat_with_rawi(question: str, user_name: str = "أخي") -> str:
 - لا تفتي في: الطلاق، الميراث، القضايا المعقدة
 - لا تخترع أحاديث
 - كن مختصراً وواضحاً
+- **أجب بالعربية فقط - ممنوع أي لغة ثانية**
 
 **أسلوب الرد:**
 - للأسئلة الشرعية: السلام عليكم {user_name} 🌙 + إجابة مختصرة + دليل
 - لأسئلة البوت: شرح بسيط + كيفية الاستخدام
 - للمحادثة: رد طبيعي ودافئ
 
-كن مختصراً ومفيداً."""
-    
-    user_message = f"{question}"
+كن مختصراً ومفيداً. **رد بالعربية فقط.**"""
     
     try:
         url = "https://api.groq.com/openai/v1/chat/completions"
@@ -1926,12 +1939,19 @@ async def chat_with_rawi(question: str, user_name: str = "أخي") -> str:
             "Content-Type": "application/json"
         }
         
+        # بناء الرسائل مع التاريخ
+        messages = [{"role": "system", "content": system_prompt}]
+        
+        # إضافة تاريخ المحادثة
+        for msg in conversation_history:
+            messages.append(msg)
+        
+        # إضافة السؤال الحالي
+        messages.append({"role": "user", "content": question})
+        
         body = {
             "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
+            "messages": messages,
             "temperature": 0.7,
             "max_tokens": 1000,
         }
@@ -1941,6 +1961,12 @@ async def chat_with_rawi(question: str, user_name: str = "أخي") -> str:
                 if resp.status == 200:
                     data = await resp.json()
                     answer = data["choices"][0]["message"]["content"].strip()
+                    
+                    # حفظ في التاريخ
+                    if context and user_id:
+                        context.user_data["rawi_history"].append({"role": "user", "content": question})
+                        context.user_data["rawi_history"].append({"role": "assistant", "content": answer})
+                    
                     return answer
                 else:
                     return "⚠️ عذراً، حدث خطأ في الاتصال. حاول مرة أخرى."
@@ -3409,6 +3435,7 @@ async def get_quran_servers() -> dict:
         "علي الحذيفي":           {"server": "https://server8.mp3quran.net/hthfi/",   "surahs": set(range(1,115))},
         "سعد الغامدي":           {"server": "https://server7.mp3quran.net/s_gmd/",   "surahs": set(range(1,115))},
         "محمد اللحيدان":         {"server": "https://server8.mp3quran.net/lhdan/",   "surahs": set(range(1,115))},
+        "عمر بن ضياء الدين":     {"server": "https://server11.mp3quran.net/omar_aldayatin/", "surahs": set(range(1,115))},
     }
     
     _QURAN_SERVERS_CACHE = SERVERS
@@ -3455,9 +3482,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # رسالة انتظار
         wait_msg = await update.message.reply_text("💬 راوي يفكر في إجابتك...")
         
-        # الحصول على الإجابة
+        # الحصول على الإجابة مع الذاكرة
         user_name = user.first_name or "أخي"
-        answer = await chat_with_rawi(text, user_name)
+        answer = await chat_with_rawi(text, user_name, user_id=user.id, context=context)
         
         # حذف رسالة الانتظار
         await wait_msg.delete()
@@ -3745,8 +3772,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if text == "🔙 خروج من راوي":
-        # إيقاف وضع راوي
+        # إيقاف وضع راوي ومسح الذاكرة
         context.user_data["waiting_for_rawi"] = False
+        context.user_data.pop("rawi_history", None)  # مسح تاريخ المحادثة
         
         await update.message.reply_text(
             "👋 تم الخروج من راوي\n\n"
