@@ -1509,6 +1509,15 @@ def rawi_kb():
     ]
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+
+def search_kb(search_type="قرآن"):
+    """كيبورد خاص للبحث - زر خروج فقط"""
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    buttons = [
+        [KeyboardButton("🔙 خروج من الباحث")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 def admin_main_keyboard():
     from telegram import ReplyKeyboardMarkup, KeyboardButton
     buttons = [
@@ -3472,6 +3481,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚔️ تحدي صديق","💰 دعم البوت","ℹ️ عن البوت",
         "🕌 الأذكار","🔙 رجوع","⚙️ لوحة التحكم","❓ سؤال ديني",
         "💬 التحدث مع راوي","🎙️ استمع للقرآن",
+        "🔙 خروج من راوي","🔙 خروج من الباحث",
     }
 
     # عند ضغط زر كيبورد — أوقف أوضاع النص السابقة
@@ -3493,26 +3503,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== معالج راوي AI - المحادثة الشاملة =====
     if context.user_data.get("waiting_for_rawi"):
-        is_admin = user.id in ADMIN_IDS
-        
-        # رسالة انتظار
-        wait_msg = await update.message.reply_text("💬 راوي يفكر في إجابتك...")
-        
-        # الحصول على الإجابة
-        user_name = user.first_name or "أخي"
-        answer = await chat_with_rawi(text, user_name)
-        
-        # حذف رسالة الانتظار
-        await wait_msg.delete()
-        
-        # إرسال الإجابة مع الإبقاء على كيبورد راوي
-        await update.message.reply_text(
-            answer,
-            parse_mode="Markdown",
-            reply_markup=rawi_kb()
-        )
-        # لا نغير waiting_for_rawi - نبقيه True ليستمر الوضع
-        return
+        # تجاهل أزرار الخروج - دعها تمر للمعالج الخاص
+        if text in ["🔙 خروج من راوي", "🔙 خروج من الباحث"]:
+            # لا تعالجها هنا - دعها تمر للأسفل
+            pass
+        else:
+            is_admin = user.id in ADMIN_IDS
+            
+            # رسالة انتظار
+            wait_msg = await update.message.reply_text("💬 راوي يفكر في إجابتك...")
+            
+            # الحصول على الإجابة
+            user_name = user.first_name or "أخي"
+            answer = await chat_with_rawi(text, user_name)
+            
+            # حذف رسالة الانتظار
+            await wait_msg.delete()
+            
+            # إرسال الإجابة مع الإبقاء على كيبورد راوي
+            await update.message.reply_text(
+                answer,
+                parse_mode="Markdown",
+                reply_markup=rawi_kb()
+            )
+            # لا نغير waiting_for_rawi - نبقيه True ليستمر الوضع
+            return
 
 
     # معالج رسائل التواصل مع المطور
@@ -3798,6 +3813,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
+    if text == "🔙 خروج من الباحث":
+        # إيقاف أوضاع البحث
+        context.user_data["quran_search_mode"] = False
+        context.user_data["hadith_search_mode"] = False
+        
+        await update.message.reply_text(
+            "👋 تم الخروج من الباحث\n\n"
+            "يمكنك العودة للبحث في أي وقت! 😊",
+            reply_markup=main_kb(is_admin)
+        )
+        return
+    
     if text == "❓ سؤال ديني":
         for _k in ["quran_search_mode","hadith_search_mode","qudwati_waiting"]:
             context.user_data.pop(_k, None)
@@ -3947,8 +3974,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "  ← `أبو هريرة`\n\n"
             "🔹 موضوع الحديث\n"
             "  ← `فضل الصدقة`\n\n"
-            "✍️ اكتب الآن 👇",
-            parse_mode="Markdown"
+            "✍️ اكتب الآن 👇\n\n"
+            "💡 للخروج: اضغط 🔙 خروج من الباحث",
+            parse_mode="Markdown",
+            reply_markup=search_kb("حديث")
         )
         return
     # ===== معالج البحث القرآني =====
@@ -4087,8 +4116,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if context.user_data.get("quran_search_mode") and text and not text.startswith("/"):
-        context.user_data["quran_search_mode"] = False
-        wait = await update.message.reply_text("🔍 جاري البحث في القرآن الكريم...")
+        # تجاهل زر الخروج - دعه يمر للمعالج الخاص
+        if text == "🔙 خروج من الباحث":
+            # لا تعالجه هنا - دعه يمر للأسفل
+            pass
+        else:
+            # لا نغلق الوضع - نبقيه مفتوح
+            wait = await update.message.reply_text("🔍 جاري البحث في القرآن الكريم...")
         try:
             results = []
             import re as _re
@@ -4175,20 +4209,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as e:
             logger.error(f"Quran search handler error: {e}")
             await wait.edit_text("⚠️ حدث خطأ، حاول مرة ثانية.")
-        return
+            return
 
     # ===== معالج البحث عن حديث =====
     if context.user_data.get("hadith_search_mode") and text and not text.startswith("/") and text not in _KB_BTNS:
-        context.user_data["hadith_search_mode"] = False
+        # تجاهل زر الخروج - دعه يمر للمعالج الخاص
+        if text == "🔙 خروج من الباحث":
+            # لا تعالجه هنا - دعه يمر للأسفل
+            pass
+        else:
+            # لا نغلق الوضع - نبقيه مفتوح
 
-        if len(text) < 3:
-            await update.message.reply_text("⚠️ أرسل نصاً أطول (3 أحرف على الأقل).")
-            return
-        if is_rate_limited(user.id):
-            await update.message.reply_text("⏳ أرسلت طلبات كثيرة، انتظر ثوانٍ قليلة.")
-            return
+            if len(text) < 3:
+                await update.message.reply_text("⚠️ أرسل نصاً أطول (3 أحرف على الأقل).")
+                return
+            if is_rate_limited(user.id):
+                await update.message.reply_text("⏳ أرسلت طلبات كثيرة، انتظر ثوانٍ قليلة.")
+                return
 
-        wait = await update.message.reply_text("⏳ جاري البحث في الدرر السنية...")
+            wait = await update.message.reply_text("⏳ جاري البحث في الدرر السنية...")
         try:
             rawi_match = is_rawi_search(text)
             search_query = rawi_match if rawi_match else text
@@ -4234,7 +4273,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
             except Exception:
                 pass
-        return
+            return
 
     if text == "اقترح لي حديثا📜":
         await random_suggestion(update, context)
@@ -6692,8 +6731,10 @@ async def cmd_quran_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "**3️⃣ كلمة أو عبارة:**\n"
         "`التوكل`\n"
         "`يا أيها الذين آمنوا`\n\n"
-        "📝 _أرسل بحثك الآن..._",
-        parse_mode="Markdown"
+        "📝 _أرسل بحثك الآن..._\n\n"
+        "💡 للخروج: اضغط 🔙 خروج من الباحث",
+        parse_mode="Markdown",
+        reply_markup=search_kb("قرآن")
     )
     # تفعيل وضع البحث
     context.user_data["quran_search_mode"] = True
