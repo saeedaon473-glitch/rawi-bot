@@ -1500,6 +1500,15 @@ def main_kb(is_admin=False, **kwargs):
         buttons.append([KeyboardButton("⚙️ لوحة التحكم")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
+
+def rawi_kb():
+    """كيبورد خاص لوضع راوي - زر خروج فقط"""
+    from telegram import ReplyKeyboardMarkup, KeyboardButton
+    buttons = [
+        [KeyboardButton("🔙 خروج من راوي")]
+    ]
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
 def admin_main_keyboard():
     from telegram import ReplyKeyboardMarkup, KeyboardButton
     buttons = [
@@ -3484,8 +3493,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== معالج راوي AI - المحادثة الشاملة =====
     if context.user_data.get("waiting_for_rawi"):
-        context.user_data["waiting_for_rawi"] = False
-        
         is_admin = user.id in ADMIN_IDS
         
         # رسالة انتظار
@@ -3498,12 +3505,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # حذف رسالة الانتظار
         await wait_msg.delete()
         
-        # إرسال الإجابة
+        # إرسال الإجابة مع الإبقاء على كيبورد راوي
         await update.message.reply_text(
             answer,
             parse_mode="Markdown",
-            reply_markup=main_kb(is_admin)
+            reply_markup=rawi_kb()
         )
+        # لا نغير waiting_for_rawi - نبقيه True ليستمر الوضع
         return
 
 
@@ -3764,18 +3772,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━\n\n"
             "🤖 أنا مساعدك الإسلامي الذكي\n"
             "📚 أجيب على أسئلتك الشرعية بأدلة واضحة\n"
-            "💡 أساعدك على فهم الإسلام بعمق\n\n"
-            "**اسألني أي سؤال إسلامي:**\n"
-            "• ما حكم...؟\n"
-            "• كيف أفعل...؟\n"
-            "• ما فضل...؟\n"
-            "• هل يجوز...؟\n\n"
-            "🌟 _أرسل سؤالك الآن وسأجيبك بإذن الله_",
-            parse_mode="Markdown"
+            "💡 أساعدك على فهم الإسلام وميزات البوت\n\n"
+            "**اسألني أي شيء:**\n"
+            "• أسئلة إسلامية: ما حكم...؟ ما فضل...؟\n"
+            "• عن البوت: كيف أستخدم...؟ ما هي...؟\n"
+            "• محادثة عامة: أي شيء آخر!\n\n"
+            "🌟 _ابدأ الكتابة الآن..._\n\n"
+            "💡 للخروج: اضغط زر 🔙 خروج من راوي",
+            parse_mode="Markdown",
+            reply_markup=rawi_kb()
         )
         
         # تفعيل وضع الانتظار
         context.user_data["waiting_for_rawi"] = True
+        return
+    
+    if text == "🔙 خروج من راوي":
+        # إيقاف وضع راوي
+        context.user_data["waiting_for_rawi"] = False
+        
+        await update.message.reply_text(
+            "👋 تم الخروج من راوي\n\n"
+            "يمكنك العودة في أي وقت! 😊",
+            reply_markup=main_kb(is_admin)
+        )
         return
     
     if text == "❓ سؤال ديني":
