@@ -1373,7 +1373,6 @@ def main_kb(is_admin=False, **kwargs):
         [KeyboardButton("🎯 اختبر معلوماتك"), KeyboardButton("🎙️ استمع للقرآن")],
         [KeyboardButton("💬 التحدث مع راوي"), KeyboardButton("❓ سؤال ديني")],
         [KeyboardButton("💰 دعم البوت")],
-        [KeyboardButton("🎯 اختبار القناة")],
         [KeyboardButton("📞 تواصل مع المطور")],
     ]
     if is_admin:
@@ -3324,6 +3323,134 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=rawi_kb()
         )
         # لا نغير waiting_for_rawi - نبقيه True ليستمر الوضع
+        return
+
+    # ===== معالجات نظام الاختبارات =====
+    
+    # معالج عدد الأسئلة
+    if context.user_data.get("waiting_quiz_count"):
+        context.user_data.pop("waiting_quiz_count", None)
+        
+        try:
+            count = int(text)
+            if count < 5 or count > 20:
+                await update.message.reply_text("⚠️ العدد يجب أن يكون بين 5 و 20")
+                return
+            
+            # اختيار أسئلة عشوائية
+            import random
+            questions = random.sample(DAILY_QUESTIONS, min(count, len(DAILY_QUESTIONS)))
+            
+            context.user_data["quiz_questions"] = questions
+            context.user_data["waiting_channel_id"] = True
+            
+            await update.message.reply_text(
+                f"✅ تم اختيار {len(questions)} سؤال\n\n"
+                "الآن أرسل معرف القناة أو اسمها:\n"
+                "مثال: @my_channel أو -1001234567890"
+            )
+            
+        except ValueError:
+            await update.message.reply_text("⚠️ أرسل رقم صحيح من 5 إلى 20")
+        return
+    
+    # معالج الأسئلة اليدوية
+    if context.user_data.get("waiting_manual_questions"):
+        context.user_data.pop("waiting_manual_questions", None)
+        
+        # تحليل الأسئلة
+        questions = []
+        parts = text.split("---")
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            try:
+                lines = [l.strip() for l in part.split("\n") if l.strip()]
+                
+                # استخراج السؤال
+                question_line = [l for l in lines if l.startswith("السؤال:")][0]
+                question = question_line.replace("السؤال:", "").strip()
+                
+                # استخراج الخيارات
+                options = []
+                for l in lines:
+                    if l.startswith(("أ.", "ب.", "ج.", "د.")):
+                        options.append(l[2:].strip())
+                
+                # استخراج الإجابة
+                answer_line = [l for l in lines if l.startswith("الإجابة:")][0]
+                answer_letter = answer_line.replace("الإجابة:", "").strip()
+                
+                # تحويل الحرف لإجابة
+                answer_map = {"أ": 0, "ب": 1, "ج": 2, "د": 3}
+                answer_idx = answer_map.get(answer_letter, 1)
+                answer = options[answer_idx] if answer_idx < len(options) else options[0]
+                
+                questions.append({
+                    "q": question,
+                    "options": options,
+                    "answer": answer
+                })
+                
+            except Exception as e:
+                logger.error(f"Error parsing question: {e}")
+                continue
+        
+        if len(questions) == 0:
+            await update.message.reply_text(
+                "⚠️ لم أتمكن من فهم الأسئلة!\n\n"
+                "تأكد من الصيغة الصحيحة:\n"
+                "السؤال: ...\n"
+                "أ. ...\n"
+                "ب. ...\n"
+                "الإجابة: ب\n"
+                "---"
+            )
+            return
+        
+        context.user_data["quiz_questions"] = questions
+        context.user_data["waiting_channel_id"] = True
+        
+        await update.message.reply_text(
+            f"✅ تم تحليل {len(questions)} سؤال\n\n"
+            "الآن أرسل معرف القناة أو اسمها:\n"
+            "مثال: @my_channel أو -1001234567890"
+        )
+        return
+    
+    # معالج معرف القناة
+    if context.user_data.get("waiting_channel_id"):
+        context.user_data.pop("waiting_channel_id", None)
+        
+        channel_id = text.strip()
+        questions = context.user_data.get("quiz_questions", [])
+        
+        if not questions:
+            await update.message.reply_text("⚠️ حدث خطأ - لا توجد أسئلة!")
+            return
+        
+        # نشر الاختبار
+        try:
+            await publish_channel_quiz(context, channel_id, questions, user.id)
+            await update.message.reply_text(
+                f"✅ تم نشر الاختبار في القناة!\n\n"
+                f"📚 عدد الأسئلة: {len(questions)}\n"
+                f"📢 القناة: {channel_id}"
+            )
+        except Exception as e:
+            logger.error(f"Error publishing quiz: {e}")
+            await update.message.reply_text(
+                f"⚠️ حدث خطأ في النشر:\n{str(e)}\n\n"
+                "تأكد من:\n"
+                "• البوت Admin في القناة\n"
+                "• معرف القناة صحيح"
+            )
+        
+        # تنظيف
+        context.user_data.pop("quiz_questions", None)
         return
 
 
