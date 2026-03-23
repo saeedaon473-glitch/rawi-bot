@@ -1373,10 +1373,11 @@ def main_kb(is_admin=False, **kwargs):
         [KeyboardButton("🎯 اختبر معلوماتك"), KeyboardButton("🎙️ استمع للقرآن")],
         [KeyboardButton("💬 التحدث مع راوي"), KeyboardButton("❓ سؤال ديني")],
         [KeyboardButton("💰 دعم البوت")],
+        [KeyboardButton("🎯 اختبار القناة")],
         [KeyboardButton("📞 تواصل مع المطور")],
     ]
     if is_admin:
-        buttons.append([KeyboardButton("⚙️ لوحة التحكم")])
+        buttons.append([KeyboardButton("⚙️ لوحة التحكم"), KeyboardButton("🎯 اختبار القناة")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
@@ -3280,7 +3281,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🎯 اختبر معلوماتك",
         "💰 دعم البوت","ℹ️ عن البوت",
         "🕌 الأذكار","🔙 رجوع","⚙️ لوحة التحكم","❓ سؤال ديني",
-        "💬 التحدث مع راوي","🎙️ استمع للقرآن",
+        "💬 التحدث مع راوي","🎙️ استمع للقرآن","🎯 اختبار القناة",
         "🔙 خروج من راوي","🔙 خروج من الباحث",
     }
 
@@ -3725,6 +3726,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in ["💰 دعم البوت", "/donate"]:
         await donate_command(update, context)
         return
+    
+    if text == "🎯 اختبار القناة":
+        # عرض خيارات الاختبار
+        keyboard = [
+            [colored_btn("📚 أسئلة جاهزة (من البوت)", callback_data="cq_ready", style="primary")],
+            [colored_btn("✍️ كتابة أسئلة يدوية", callback_data="cq_manual", style="secondary")],
+            [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
+        ]
+        
+        await update.message.reply_text(
+            "🎯 *إنشاء اختبار في القناة*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "اختر نوع الأسئلة:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        
+        context.user_data["creating_channel_quiz"] = True
+        return
+    
     if text in ["⭐ 1 نجمة", "⭐ 5 نجوم", "⭐ 10 نجوم", "⭐ 25 نجمة", "⭐ 50 نجمة"]:
         if await handle_donation_choice(update, context):
             return
@@ -6356,7 +6377,7 @@ async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════
 
 async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالج بدء الاختبار - للأدمن فقط"""
+    """معالج بدء الاختبار - لأدمن القناة فقط"""
     query = update.callback_query
     
     quiz_id = query.data.replace("cqs_", "")
@@ -6369,9 +6390,17 @@ async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("⚠️ الاختبار غير موجود!", show_alert=True)
         return
     
-    # التحقق من أن المستخدم هو الأدمن
-    if user_id != quiz_data["admin_id"]:
-        await query.answer("⚠️ هذا الأمر للمشرف فقط!", show_alert=True)
+    # التحقق من أن المستخدم أدمن في القناة
+    try:
+        member = await context.bot.get_chat_member(channel_id, user_id)
+        is_admin = member.status in ['creator', 'administrator']
+        
+        if not is_admin:
+            await query.answer("⚠️ هذا الأمر لمشرفي القناة فقط!", show_alert=True)
+            return
+    except Exception as e:
+        logger.error(f"Error checking admin status: {e}")
+        await query.answer("⚠️ حدث خطأ في التحقق من الصلاحيات!", show_alert=True)
         return
     
     # التحقق من وجود مشاركين
@@ -6725,7 +6754,6 @@ def main():
 
     # إضافة المعالجات - CommandHandlers أولاً دايماً قبل MessageHandler
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("اختبار_قناة", cmd_create_channel_quiz))
     app.add_handler(CommandHandler("create_channel_quiz", cmd_create_channel_quiz))
 
     app.add_handler(CommandHandler("help", help_command))
