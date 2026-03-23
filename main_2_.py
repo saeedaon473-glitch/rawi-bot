@@ -6340,24 +6340,6 @@ async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     
     data = query.data
-
-    # نظام الاختبارات في القنوات
-    if data.startswith("cq_"):
-        await handle_quiz_type_selection(update, context)
-        return
-    
-    if data.startswith("cqj_"):
-        await handle_quiz_join(update, context)
-        return
-    
-    if data.startswith("cqs_"):
-        await handle_quiz_start(update, context)
-        return
-    
-    if data.startswith("cqa_"):
-        await handle_quiz_answer(update, context)
-        return
-    
     
     if data == "cq_ready":
         # أسئلة جاهزة
