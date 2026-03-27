@@ -56,10 +56,14 @@ class KeepAliveHandler(BaseHTTPRequestHandler):
 def run_keepalive_server():
     """تشغيل HTTP server في thread منفصل"""
     try:
+        import socket
         server = HTTPServer(('0.0.0.0', 8080), KeepAliveHandler)
+        server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.start_time = time.time()
         logger.info("🌐 Keep-Alive server started on port 8080")
         server.serve_forever()
+    except OSError as e:
+        logger.warning(f"Keep-Alive server: port 8080 in use, skipping: {e}")
     except Exception as e:
         logger.error(f"Keep-Alive server error: {e}")
 
@@ -518,14 +522,46 @@ def get_user_points(user_id: int) -> dict:
     except:
         return {"points": 0, "hadith": 0, "quiz": 0, "search": 0}
 
+def spend_points(user_id: int, cost: int) -> bool:
+    """خصم نقاط من رصيد المستخدم — يُعيد True إذا نجح، False إذا الرصيد غير كافٍ"""
+    try:
+        with sqlite3.connect("bot.db") as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS user_points (
+                    user_id INTEGER PRIMARY KEY,
+                    total_points INTEGER DEFAULT 0,
+                    daily_hadith_count INTEGER DEFAULT 0,
+                    quiz_count INTEGER DEFAULT 0,
+                    search_count INTEGER DEFAULT 0,
+                    last_activity TEXT
+                )
+            """)
+            row = conn.execute("SELECT total_points FROM user_points WHERE user_id=?", (user_id,)).fetchone()
+            current = row[0] if row else 0
+            if current < cost:
+                return False
+            conn.execute(
+                "UPDATE user_points SET total_points = total_points - ? WHERE user_id=?",
+                (cost, user_id)
+            )
+        logger.info(f"[POINTS] User {user_id} spent {cost} points")
+        return True
+    except Exception as e:
+        logger.error(f"spend_points error: {e}")
+        return False
+
 # نقاط للأنشطة
 POINTS_REWARDS = {
     "hadith_search": 2,
+    "surah_search": 2,
     "quiz_complete": 5,
+    "channel_quiz_win": 10,
     "daily_duaa": 1,
     "qudwati": 3,
     "friend_challenge_win": 10,
 }
+# تكلفة المتجر
+STORE_COST_QA_EXTRA = 5   # نقاط مقابل سؤال ديني إضافي واحد
 
 # ==================== نظام Rate Limiting ====================
 class RateLimiter:
@@ -559,8 +595,7 @@ qa_rate_limiter = RateLimiter(max_requests=5, window_seconds=60)
 def colored_btn(text: str, callback_data: str = None, url: str = None,
                 switch_inline_query: str = None, style: str = None) -> InlineKeyboardButton:
     """
-    إنشاء زر ملون باستخدام Bot API 9.4
-    style: 'primary' (أزرق) | 'success' (أخضر) | 'danger' (أحمر)
+    إنشاء زر inline عادي (style مُتجاهل - Telegram لا يدعم button styles)
     """
     kwargs = {}
     if callback_data is not None:
@@ -569,14 +604,7 @@ def colored_btn(text: str, callback_data: str = None, url: str = None,
         kwargs["url"] = url
     if switch_inline_query is not None:
         kwargs["switch_inline_query"] = switch_inline_query
-    api_kw = {}
-    if style:
-        api_kw["style"] = style
-    return InlineKeyboardButton(
-        text=text,
-        api_kwargs=api_kw if api_kw else None,
-        **kwargs
-    )
+    return InlineKeyboardButton(text=text, **kwargs)
 
 # توقيت الأردن UTC+3
 AMMAN_TZ = _dt.timezone(_dt.timedelta(hours=3))
@@ -1375,8 +1403,9 @@ def main_kb(is_admin=False, **kwargs):
         [KeyboardButton("💰 دعم البوت")],
         [KeyboardButton("📞 تواصل مع المطور")],
     ]
+    buttons.append([KeyboardButton("🎯 اختبار القناة")])
     if is_admin:
-        buttons.append([KeyboardButton("⚙️ لوحة التحكم"), KeyboardButton("🎯 اختبار القناة")])
+        buttons.append([KeyboardButton("⚙️ لوحة التحكم")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
 
 
@@ -2193,6 +2222,128 @@ DAILY_QUESTIONS = [
     {"q": 'ما هو اسم صلاة الاستسقاء؟', "options": ['صلاة طلب المطر', 'صلاة الحاجة', 'صلاة الاستخارة', 'صلاة التهجد'], "answer": 'صلاة طلب المطر', "explain": 'صلاة الاستسقاء صلاة مشروعة لطلب المطر من الله'},
     {"q": 'ما هو الفرق بين النبي والرسول؟', "options": ['لا فرق بينهما', 'الرسول بشر فقط والنبي قد يكون ملكاً', 'الرسول أُوحي إليه بشريعة جديدة والنبي يتبع شريعة من قبله', 'النبي أفضل من الرسول'], "answer": 'الرسول أُوحي إليه بشريعة جديدة والنبي يتبع شريعة من قبله', "explain": 'الرسول أُرسل بشريعة جديدة وكتاب، والنبي يُبلّغ شريعة من قبله'},
 ]
+
+# ==================== أسئلة اختبار القناة المتقدمة (100 سؤال) ====================
+CHANNEL_QUIZ_QUESTIONS = [
+    # ── القرآن الكريم ──────────────────────────────────────────────
+    {"q":"ما هي السورة التي ذُكرت فيها البسملة مرتين؟","options":["النمل","الفاتحة","التوبة","البقرة"],"answer":"النمل","explain":"في سورة النمل: بسملة في البداية وبسملة في رسالة سليمان"},
+    {"q":"ما هي أطول كلمة في القرآن الكريم؟","options":["فَأَسْقَيْنَاكُمُوهُ","فَسَيَكْفِيكَهُمُ","أَفَاسْتَكْبَرْتَ","وَلِيُوَفِّيَهُمْ"],"answer":"فَأَسْقَيْنَاكُمُوهُ","explain":"في سورة الحجر آية 22، مكونة من 11 حرفاً"},
+    {"q":"كم عدد السور التي افتتحت بالحروف المقطعة؟","options":["25 سورة","29 سورة","32 سورة","35 سورة"],"answer":"29 سورة","explain":"افتتحت 29 سورة بالحروف المقطعة مثل: الم، طه، يس، حم"},
+    {"q":"ما هي السورة التي تسمى 'أخت الطويلتين'؟","options":["النساء","آل عمران","الأعراف","الأنعام"],"answer":"الأعراف","explain":"سورة الأعراف تسمى أخت الطويلتين (البقرة وآل عمران)"},
+    {"q":"كم سجدة تلاوة في القرآن الكريم عند الجمهور؟","options":["13 سجدة","14 سجدة","15 سجدة","16 سجدة"],"answer":"15 سجدة","explain":"في القرآن 15 سجدة تلاوة عند جمهور العلماء"},
+    {"q":"كم مرة ذُكر اسم 'محمد' صريحاً في القرآن؟","options":["مرة واحدة","مرتان","3 مرات","4 مرات"],"answer":"4 مرات","explain":"ذُكر اسم محمد 4 مرات: آل عمران 144، الأحزاب 40، محمد 2، الفتح 29"},
+    {"q":"ما هي السورة الوحيدة التي لم تبدأ بالبسملة؟","options":["الفيل","التوبة","الإخلاص","المسد"],"answer":"التوبة","explain":"سورة التوبة هي السورة الوحيدة التي لم تبدأ بالبسملة"},
+    {"q":"كم عدد أسماء يوم القيامة في القرآن؟","options":["أكثر من 30","أكثر من 40","أكثر من 50","أكثر من 60"],"answer":"أكثر من 50","explain":"ليوم القيامة أكثر من 50 اسماً: الحاقة، القارعة، الصاخة، الطامة، الواقعة..."},
+    {"q":"ما هي أقصر سورة في القرآن الكريم؟","options":["الكوثر","الإخلاص","الفلق","الناس"],"answer":"الكوثر","explain":"سورة الكوثر هي أقصر سورة في القرآن (3 آيات فقط)"},
+    {"q":"كم عدد السور المكية في القرآن؟","options":["82 سورة","86 سورة","90 سورة","93 سورة"],"answer":"86 سورة","explain":"عدد السور المكية 86 سورة، والمدنية 28 سورة"},
+    {"q":"ما هي السورة التي تُسمى 'قلب القرآن'؟","options":["الفاتحة","يس","الرحمن","الواقعة"],"answer":"يس","explain":"سورة يس تُسمى قلب القرآن كما ورد في الحديث"},
+    {"q":"كم عدد أجزاء القرآن الكريم؟","options":["28 جزءاً","30 جزءاً","32 جزءاً","35 جزءاً"],"answer":"30 جزءاً","explain":"القرآن الكريم 30 جزءاً"},
+    {"q":"ما هي السورة التي ختمت باسم نبيين؟","options":["الأعلى","الشعراء","طه","الصافات"],"answer":"الأعلى","explain":"سورة الأعلى ختمت بـ: صُحُفِ إِبْرَاهِيمَ وَمُوسَىٰ"},
+    {"q":"كم مرة ورد لفظ 'القرآن' في القرآن؟","options":["58 مرة","68 مرة","78 مرة","88 مرة"],"answer":"68 مرة","explain":"ورد لفظ القرآن في القرآن 68 مرة"},
+    {"q":"كم عدد المرات التي ذُكر فيها اسم 'مريم' في القرآن؟","options":["25 مرة","30 مرة","34 مرة","40 مرة"],"answer":"34 مرة","explain":"ذُكرت مريم 34 مرة في القرآن، أكثر من أي امرأة أخرى"},
+    {"q":"ما هي السورة التي نزلت بكاملها دفعة واحدة؟","options":["الكوثر","الفاتحة","الإخلاص","المدثر"],"answer":"الفاتحة","explain":"سورة الفاتحة نزلت دفعة واحدة كاملة"},
+    {"q":"كم عدد السور التي بدأت بـ 'الحمد لله'؟","options":["3 سور","4 سور","5 سور","6 سور"],"answer":"5 سور","explain":"السور التي بدأت بالحمد: الفاتحة، الأنعام، الكهف، سبأ، فاطر"},
+    {"q":"كم عدد السور التي سُميت بأسماء الأنبياء؟","options":["5 سور","6 سور","7 سور","8 سور"],"answer":"6 سور","explain":"يونس، هود، يوسف، إبراهيم، محمد، نوح"},
+    {"q":"كم عدد السور التي سُميت بأسماء حيوانات؟","options":["5 سور","6 سور","7 سور","8 سور"],"answer":"7 سور","explain":"البقرة، الأنعام، النحل، النمل، العنكبوت، الفيل، العاديات"},
+    {"q":"ما هي أول آية نزلت في تحريم الخمر؟","options":["في سورة البقرة","في سورة النساء","في سورة المائدة","في سورة الأعراف"],"answer":"في سورة البقرة","explain":"أول آية في الخمر: يَسْأَلُونَكَ عَنِ الْخَمْرِ وَالْمَيْسِرِ (البقرة 219)"},
+    # ── الحديث النبوي ─────────────────────────────────────────────
+    {"q":"من هو الصحابي الذي قال عنه النبي ﷺ: 'أرحم أمتي بأمتي'؟","options":["أبو بكر الصديق","عمر بن الخطاب","عثمان بن عفان","علي بن أبي طالب"],"answer":"أبو بكر الصديق","explain":"أرحم أمتي بأمتي أبو بكر، وأشدهم في أمر الله عمر"},
+    {"q":"كم عدد أحاديث صحيح البخاري بدون المكرر؟","options":["حوالي 2600","حوالي 3600","حوالي 4600","حوالي 5600"],"answer":"حوالي 2600","explain":"عدد أحاديث البخاري بدون المكرر حوالي 2602 حديث"},
+    {"q":"من هو الصحابي الملقب بـ 'حبر الأمة'؟","options":["عبدالله بن عباس","عبدالله بن عمر","عبدالله بن مسعود","أبو هريرة"],"answer":"عبدالله بن عباس","explain":"لُقب ابن عباس بحبر الأمة وترجمان القرآن"},
+    {"q":"من أكثر الصحابة رواية للحديث؟","options":["أبو هريرة","عبدالله بن عمر","أنس بن مالك","عائشة"],"answer":"أبو هريرة","explain":"روى أبو هريرة 5374 حديثاً"},
+    {"q":"من هو إمام دار الهجرة؟","options":["الإمام مالك","الإمام الشافعي","الإمام أحمد","الإمام أبو حنيفة"],"answer":"الإمام مالك","explain":"الإمام مالك بن أنس إمام دار الهجرة (المدينة المنورة)"},
+    {"q":"كم عدد الأحاديث القدسية التقريبي؟","options":["حوالي 100","حوالي 200","حوالي 300","حوالي 400"],"answer":"حوالي 100","explain":"الأحاديث القدسية حوالي 100 إلى 120 حديثاً"},
+    {"q":"من هو الصحابي الذي قال فيه النبي ﷺ: 'لو كان بعدي نبي لكان عمر'؟","options":["أبو بكر","عمر بن الخطاب","عثمان","علي"],"answer":"عمر بن الخطاب","explain":"من فضائل عمر الفاروق رضي الله عنه"},
+    {"q":"من هو أول من جمع الحديث في كتاب؟","options":["ابن شهاب الزهري","الإمام مالك","الإمام البخاري","ربيعة الرأي"],"answer":"ابن شهاب الزهري","explain":"أول من دون الحديث رسمياً بأمر عمر بن عبد العزيز"},
+    {"q":"ما هو اسم كتاب الإمام مالك في الحديث؟","options":["الموطأ","المسند","الصحيح","السنن"],"answer":"الموطأ","explain":"الموطأ هو كتاب الإمام مالك في الحديث والفقه"},
+    {"q":"من هو الصحابي الملقب بـ 'سيف الله المسلول'؟","options":["عمرو بن العاص","خالد بن الوليد","سعد بن أبي وقاص","أبو عبيدة"],"answer":"خالد بن الوليد","explain":"لقّبه النبي ﷺ بسيف الله المسلول"},
+    {"q":"من هو أول مؤذن في الإسلام؟","options":["عبدالله بن زيد","بلال بن رباح","أبو محذورة","سعد القرظ"],"answer":"بلال بن رباح","explain":"بلال بن رباح هو أول مؤذن في الإسلام"},
+    {"q":"من هو الصحابي الملقب بالفاروق؟","options":["أبو بكر","علي","عمر بن الخطاب","عثمان"],"answer":"عمر بن الخطاب","explain":"لُقّب بالفاروق لأن الله فرّق به بين الحق والباطل"},
+    {"q":"من هو الصحابي الملقب بذي النورين؟","options":["عثمان بن عفان","أبو بكر","علي بن أبي طالب","طلحة"],"answer":"عثمان بن عفان","explain":"لُقّب بذي النورين لزواجه من بنتي النبي ﷺ"},
+    {"q":"من هو الصحابي الملقب بحواري رسول الله؟","options":["أبو بكر","سعد بن أبي وقاص","الزبير بن العوام","طلحة"],"answer":"الزبير بن العوام","explain":"قال النبي ﷺ: لكل نبي حواري وحواريّ الزبير"},
+    {"q":"من هو الصحابي الذي بكى النبي ﷺ حين سمع قراءته؟","options":["أبو موسى الأشعري","معاذ بن جبل","عبدالله بن مسعود","أبي بن كعب"],"answer":"عبدالله بن مسعود","explain":"بكى النبي ﷺ حين سمع قراءة ابن مسعود"},
+    # ── الفقه والأحكام ────────────────────────────────────────────
+    {"q":"ما هو نصاب زكاة الذهب؟","options":["85 جراماً","90 جراماً","95 جراماً","100 جرام"],"answer":"85 جراماً","explain":"نصاب الذهب 85 جراماً من الذهب الخالص"},
+    {"q":"كم عدد مبطلات الصلاة عند جمهور الفقهاء؟","options":["6 مبطلات","8 مبطلات","10 مبطلات","12 مبطل"],"answer":"8 مبطلات","explain":"مبطلات الصلاة ثمانية عند جمهور الفقهاء"},
+    {"q":"ما هي مدة المسح على الخفين للمقيم؟","options":["يوم وليلة","يومان","3 أيام","أسبوع"],"answer":"يوم وليلة","explain":"يمسح المقيم يوماً وليلة (24 ساعة)، والمسافر 3 أيام"},
+    {"q":"كم عدد فرائض الوضوء؟","options":["4 فرائض","6 فرائض","7 فرائض","8 فرائض"],"answer":"6 فرائض","explain":"فرائض الوضوء ستة: النية، غسل الوجه، غسل اليدين، مسح الرأس، غسل الرجلين، الترتيب"},
+    {"q":"ما هو نصاب الفضة للزكاة؟","options":["595 جراماً","612 جراماً","500 جرام","700 جرام"],"answer":"595 جراماً","explain":"نصاب الفضة 595 جراماً (200 درهم إسلامي)"},
+    {"q":"كم عدد شروط صحة الصلاة عند الحنابلة؟","options":["7 شروط","9 شروط","11 شرطاً","13 شرطاً"],"answer":"9 شروط","explain":"شروط صحة الصلاة تسعة"},
+    {"q":"ما هو مقدار الزكاة في الحبوب بالسقي بكُلفة؟","options":["العشر (10%)","نصف العشر (5%)","ربع العشر (2.5%)","الخمس (20%)"],"answer":"نصف العشر (5%)","explain":"ما سُقي بكُلفة فيه نصف العشر، وما سُقي بلا كُلفة فيه العُشر"},
+    {"q":"كم عدد أركان الحج؟","options":["3 أركان","4 أركان","5 أركان","6 أركان"],"answer":"4 أركان","explain":"أركان الحج أربعة: الإحرام، الوقوف بعرفة، طواف الإفاضة، السعي"},
+    {"q":"ما هي أقل مدة للحيض؟","options":["يوم وليلة","3 أيام","5 أيام","7 أيام"],"answer":"يوم وليلة","explain":"أقل الحيض يوم وليلة، وأكثره 15 يوماً عند الجمهور"},
+    {"q":"كم عدد واجبات الحج؟","options":["5 واجبات","7 واجبات","9 واجبات","11 واجباً"],"answer":"7 واجبات","explain":"واجبات الحج سبعة عند الحنابلة"},
+    {"q":"ما هو مقدار زكاة الفطر؟","options":["صاع من طعام","نصف صاع","صاعان","ثلاثة أصواع"],"answer":"صاع من طعام","explain":"زكاة الفطر صاع من طعام البلد (حوالي 2.5 كيلو)"},
+    {"q":"متى يبدأ وقت صلاة العصر؟","options":["إذا صار ظل كل شيء مثله","عند الزوال","قبل الغروب بساعة","عند اصفرار الشمس"],"answer":"إذا صار ظل كل شيء مثله","explain":"يبدأ وقت العصر عند جمهور العلماء إذا صار ظل كل شيء مثله"},
+    {"q":"كم عدد تكبيرات صلاة العيد في الركعة الأولى؟","options":["5 تكبيرات","6 تكبيرات","7 تكبيرات","8 تكبيرات"],"answer":"7 تكبيرات","explain":"في الركعة الأولى 7 تكبيرات، وفي الثانية 5 تكبيرات"},
+    {"q":"ما هو نصاب الإبل للزكاة؟","options":["3 إبل","5 إبل","7 إبل","10 إبل"],"answer":"5 إبل","explain":"نصاب الإبل 5، وفيها شاة واحدة"},
+    {"q":"كم عدد أركان الصلاة عند الحنابلة؟","options":["11 ركناً","12 ركناً","13 ركناً","14 ركناً"],"answer":"14 ركناً","explain":"أركان الصلاة 14 ركناً عند الحنابلة"},
+    {"q":"ما هي المدة التي يجوز فيها قصر الصلاة للمسافر؟","options":["3 أيام","4 أيام","15 يوماً","20 يوماً"],"answer":"4 أيام","explain":"مدة القصر للمسافر 4 أيام عند جمهور العلماء"},
+    {"q":"ما هو نصاب البقر للزكاة؟","options":["20 رأساً","30 رأساً","40 رأساً","50 رأساً"],"answer":"30 رأساً","explain":"نصاب البقر 30 رأساً، وفيها تبيع أو تبيعة"},
+    {"q":"ما هو مقدار دية القتل الخطأ؟","options":["50 من الإبل","100 من الإبل","150 من الإبل","200 من الإبل"],"answer":"100 من الإبل","explain":"دية القتل الخطأ 100 من الإبل أو ما يعادلها"},
+    # ── السيرة والتاريخ ───────────────────────────────────────────
+    {"q":"كم كان عمر النبي ﷺ عندما تزوج خديجة؟","options":["20 سنة","25 سنة","30 سنة","35 سنة"],"answer":"25 سنة","explain":"تزوج النبي ﷺ خديجة وعمره 25 سنة"},
+    {"q":"كم عدد غزوات النبي ﷺ التي قاتل فيها؟","options":["7 غزوات","9 غزوات","11 غزوة","13 غزوة"],"answer":"9 غزوات","explain":"قاتل النبي ﷺ في 9 غزوات من أصل 27 غزوة"},
+    {"q":"من هو أول مولود في الإسلام بعد الهجرة؟","options":["عبدالله بن الزبير","الحسن بن علي","عبدالله بن عمر","أنس بن مالك"],"answer":"عبدالله بن الزبير","explain":"أول مولود للمهاجرين في المدينة هو عبدالله بن الزبير"},
+    {"q":"كم استمرت خلافة أبي بكر الصديق؟","options":["سنة واحدة","سنتان وبضعة أشهر","3 سنوات","4 سنوات"],"answer":"سنتان وبضعة أشهر","explain":"استمرت خلافة أبي بكر من 11-13هـ (سنتين وثلاثة أشهر)"},
+    {"q":"في أي سنة هجرية فُتحت مكة؟","options":["7 هـ","8 هـ","9 هـ","10 هـ"],"answer":"8 هـ","explain":"فُتحت مكة المكرمة في السنة الثامنة من الهجرة في رمضان"},
+    {"q":"كم عدد الذين شهدوا بيعة الرضوان؟","options":["1300","1400","1500","1600"],"answer":"1400","explain":"بايع النبي ﷺ تحت الشجرة 1400 صحابي في الحديبية سنة 6هـ"},
+    {"q":"في أي سنة هجرية كانت غزوة بدر؟","options":["1 هـ","2 هـ","3 هـ","4 هـ"],"answer":"2 هـ","explain":"كانت غزوة بدر الكبرى في 17 رمضان سنة 2هـ"},
+    {"q":"كم استمرت خلافة عمر بن الخطاب؟","options":["8 سنوات","10 سنوات","12 سنة","15 سنة"],"answer":"10 سنوات","explain":"استمرت خلافة عمر من 13-23هـ (10 سنوات وستة أشهر)"},
+    {"q":"في أي سنة هجرية كانت غزوة أحد؟","options":["2 هـ","3 هـ","4 هـ","5 هـ"],"answer":"3 هـ","explain":"كانت غزوة أحد في شوال سنة 3هـ"},
+    {"q":"من هو أول شهيد في الإسلام من النساء؟","options":["سمية بنت خباط","خديجة بنت خويلد","فاطمة بنت الخطاب","أسماء بنت أبي بكر"],"answer":"سمية بنت خباط","explain":"سمية أم عمار بن ياسر، أول شهيدة في الإسلام"},
+    {"q":"كم استمرت خلافة عثمان بن عفان؟","options":["10 سنوات","12 سنة","14 سنة","16 سنة"],"answer":"12 سنة","explain":"استمرت خلافة عثمان من 23-35هـ (حوالي 12 سنة)"},
+    {"q":"في أي سنة هجرية كانت غزوة الخندق؟","options":["4 هـ","5 هـ","6 هـ","7 هـ"],"answer":"5 هـ","explain":"كانت غزوة الخندق في شوال سنة 5هـ"},
+    {"q":"كم كان عدد المسلمين في غزوة بدر؟","options":["313","413","513","613"],"answer":"313","explain":"عدد المسلمين في بدر 313 رجلاً"},
+    {"q":"في أي سنة هجرية كانت حجة الوداع؟","options":["8 هـ","9 هـ","10 هـ","11 هـ"],"answer":"10 هـ","explain":"كانت حجة الوداع في ذي الحجة سنة 10هـ"},
+    {"q":"من هو الصحابي الذي اهتز له عرش الرحمن؟","options":["حمزة بن عبدالمطلب","سعد بن معاذ","مصعب بن عمير","حنظلة بن أبي عامر"],"answer":"سعد بن معاذ","explain":"قال النبي ﷺ: اهتز عرش الرحمن لموت سعد بن معاذ"},
+    {"q":"في أي سنة هجرية توفي النبي ﷺ؟","options":["10 هـ","11 هـ","12 هـ","13 هـ"],"answer":"11 هـ","explain":"توفي النبي ﷺ في 12 ربيع الأول سنة 11هـ"},
+    {"q":"كم استمرت الدعوة السرية في مكة؟","options":["سنة واحدة","سنتان","3 سنوات","4 سنوات"],"answer":"3 سنوات","explain":"استمرت الدعوة السرية 3 سنوات من بداية البعثة"},
+    {"q":"كم عدد المبشرين بالجنة؟","options":["8","9","10","11"],"answer":"10","explain":"العشرة المبشرون بالجنة: أبو بكر، عمر، عثمان، علي، طلحة، الزبير، سعد، سعيد، عبدالرحمن بن عوف، أبو عبيدة"},
+    {"q":"في أي سنة هجرية فُرض الصيام؟","options":["1 هـ","2 هـ","3 هـ","4 هـ"],"answer":"2 هـ","explain":"فُرض صيام رمضان في شعبان سنة 2هـ"},
+    {"q":"كم سنة دامت الدعوة في مكة قبل الهجرة؟","options":["10 سنوات","13 سنة","15 سنة","17 سنة"],"answer":"13 سنة","explain":"دامت الدعوة في مكة 13 سنة قبل الهجرة"},
+    {"q":"من هو أول من استشهد من الأنصار؟","options":["سعد بن معاذ","حارثة بن سراقة","أنس بن النضر","عبدالله بن رواحة"],"answer":"حارثة بن سراقة","explain":"حارثة بن سراقة أول شهيد من الأنصار في بدر"},
+    # ── العقيدة والتوحيد ──────────────────────────────────────────
+    {"q":"كم عدد أنواع التوحيد؟","options":["نوعان","3 أنواع","4 أنواع","5 أنواع"],"answer":"3 أنواع","explain":"توحيد الربوبية، توحيد الألوهية، توحيد الأسماء والصفات"},
+    {"q":"كم عدد نواقض الإسلام؟","options":["7 نواقض","10 نواقض","12 ناقضاً","15 ناقضاً"],"answer":"10 نواقض","explain":"نواقض الإسلام عشرة ذكرها الشيخ محمد بن عبد الوهاب"},
+    {"q":"ما هي أعظم آية في القرآن؟","options":["الفاتحة","آية الكرسي","آخر البقرة","أول الحديد"],"answer":"آية الكرسي","explain":"آية الكرسي أعظم آية في القرآن كما أخبر النبي ﷺ"},
+    {"q":"كم عدد أركان الإيمان؟","options":["5 أركان","6 أركان","7 أركان","8 أركان"],"answer":"6 أركان","explain":"الإيمان بالله، ملائكته، كتبه، رسله، اليوم الآخر، القدر"},
+    {"q":"ما معنى 'لا إله إلا الله'؟","options":["لا معبود بحق إلا الله","لا خالق إلا الله","لا رب إلا الله","كل ما سبق"],"answer":"لا معبود بحق إلا الله","explain":"معنى لا إله إلا الله: لا معبود بحق إلا الله (نفي وإثبات)"},
+    {"q":"كم عدد شروط لا إله إلا الله؟","options":["5 شروط","6 شروط","7 شروط","8 شروط"],"answer":"7 شروط","explain":"العلم، اليقين، الإخلاص، الصدق، المحبة، الانقياد، القبول"},
+    {"q":"من هم الملائكة المكلفون بحفظ الإنسان؟","options":["الكرام الكاتبون","المعقبات","حملة العرش","خزنة الجنة"],"answer":"المعقبات","explain":"المعقبات هم الملائكة الموكلون بحفظ الإنسان"},
+    {"q":"كم عدد الكتب السماوية المذكورة في القرآن؟","options":["3 كتب","4 كتب","5 كتب","6 كتب"],"answer":"5 كتب","explain":"التوراة، الإنجيل، الزبور، القرآن، صحف إبراهيم وموسى"},
+    {"q":"ما هو الركن الأول من أركان الإسلام؟","options":["الصلاة","الشهادتان","الزكاة","الحج"],"answer":"الشهادتان","explain":"الركن الأول: شهادة أن لا إله إلا الله وأن محمداً رسول الله"},
+    {"q":"كم عدد أسماء الله الحسنى؟","options":["77","88","99","100"],"answer":"99","explain":"لله 99 اسماً (مئة إلا واحداً)"},
+    {"q":"ما هو اسم الملك الموكل بالنفخ في الصور؟","options":["ميكائيل","إسرافيل","جبريل","عزرائيل"],"answer":"إسرافيل","explain":"إسرافيل هو الملك الموكل بالنفخ في الصور يوم القيامة"},
+    {"q":"كم عدد أبواب الجنة؟","options":["7 أبواب","8 أبواب","9 أبواب","10 أبواب"],"answer":"8 أبواب","explain":"للجنة ثمانية أبواب، منها باب الريان للصائمين"},
+    {"q":"كم عدد أبواب النار؟","options":["5 أبواب","6 أبواب","7 أبواب","8 أبواب"],"answer":"7 أبواب","explain":"قال تعالى: لَهَا سَبْعَةُ أَبْوَابٍ"},
+    {"q":"من هو الملك الموكل بالقطر (المطر)؟","options":["جبريل","ميكائيل","إسرافيل","رضوان"],"answer":"ميكائيل","explain":"ميكائيل عليه السلام موكل بالقطر والنبات"},
+    {"q":"كم عدد الملائكة الذين يحملون العرش يوم القيامة؟","options":["4 ملائكة","6 ملائكة","8 ملائكة","10 ملائكة"],"answer":"8 ملائكة","explain":"يحمل العرش اليوم أربعة، ويوم القيامة ثمانية كما في الآية"},
+    # ── متنوعة ────────────────────────────────────────────────────
+    {"q":"من هو النبي الذي كان يصنع الدروع؟","options":["موسى","داود","نوح","إدريس"],"answer":"داود","explain":"قال تعالى: وَعَلَّمْنَاهُ صَنْعَةَ لَبُوسٍ لَّكُمْ"},
+    {"q":"كم مرة حج النبي ﷺ بعد الهجرة؟","options":["مرة واحدة","مرتان","3 مرات","4 مرات"],"answer":"مرة واحدة","explain":"حج النبي ﷺ مرة واحدة بعد الهجرة: حجة الوداع سنة 10هـ"},
+    {"q":"من هي أول امرأة بايعت النبي ﷺ من الأنصار؟","options":["أم عمارة","أم سليم","فاطمة بنت قيس","نسيبة بنت كعب"],"answer":"نسيبة بنت كعب","explain":"نسيبة بنت كعب (أم عمارة) من أوائل من بايعن من الأنصار"},
+    {"q":"كم عدد زوجات النبي ﷺ؟","options":["9 زوجات","11 زوجة","13 زوجة","15 زوجة"],"answer":"11 زوجة","explain":"تزوج النبي ﷺ 11 امرأة، توفي عن 9 منهن"},
+    {"q":"من هو النبي الذي آمن به جميع قومه؟","options":["نوح","يونس","هود","صالح"],"answer":"يونس","explain":"قوم يونس آمنوا جميعاً فكشف الله عنهم العذاب"},
+    {"q":"كم عدد أعمام النبي ﷺ؟","options":["8 أعمام","10 أعمام","12 عماً","14 عماً"],"answer":"10 أعمام","explain":"للنبي ﷺ عشرة أعمام، أسلم منهم اثنان: حمزة والعباس"},
+    {"q":"من هو النبي الذي لُقب بذبيح الله؟","options":["إسماعيل","إسحاق","يعقوب","يوسف"],"answer":"إسماعيل","explain":"إسماعيل عليه السلام هو الذبيح على الراجح"},
+    {"q":"ما هي أول عاصمة في الإسلام؟","options":["مكة","المدينة","الكوفة","دمشق"],"answer":"المدينة","explain":"المدينة المنورة هي أول عاصمة إسلامية في عهد النبي ﷺ والخلفاء الراشدين"},
+    {"q":"كم عدد خلفاء الدولة الأموية؟","options":["12 خليفة","14 خليفة","16 خليفة","18 خليفة"],"answer":"14 خليفة","explain":"حكم الدولة الأموية 14 خليفة من معاوية إلى مروان بن محمد"},
+    {"q":"من هو أول من استشهد في الإسلام من الرجال؟","options":["حمزة","الحارث بن أبي هالة","عمير بن الحمام","ياسر"],"answer":"الحارث بن أبي هالة","explain":"الحارث بن أبي هالة ربيب النبي ﷺ أول شهيد من الرجال"},
+    {"q":"ما هو اسم أشهر طريق تجاري في الجزيرة العربية قبل الإسلام؟","options":["طريق الحرير","طريق البخور","طريق اللبان","طريق التوابل"],"answer":"طريق البخور","explain":"طريق البخور كان أشهر طريق تجاري في الجزيرة العربية"},
+    {"q":"كم عدد الحروف الهجائية العربية؟","options":["26 حرفاً","28 حرفاً","30 حرفاً","32 حرفاً"],"answer":"28 حرفاً","explain":"الحروف الهجائية العربية 28 حرفاً"},
+    {"q":"ما هو أول مسجد بُني في الإسلام؟","options":["المسجد النبوي","المسجد الحرام","مسجد قباء","مسجد القبلتين"],"answer":"مسجد قباء","explain":"مسجد قباء هو أول مسجد بُني في الإسلام عند هجرة النبي ﷺ"},
+]
+
+import random as _random
+
+def get_channel_quiz_questions(count: int) -> list:
+    """اختيار أسئلة عشوائية متنوعة لاختبار القناة من بنك الأسئلة الكامل (قديم + جديد)"""
+    # دمج الأسئلة القديمة (DAILY_QUESTIONS) مع الأسئلة الجديدة المتقدمة
+    all_questions = DAILY_QUESTIONS + CHANNEL_QUIZ_QUESTIONS
+    pool = all_questions.copy()
+    _random.shuffle(pool)
+    return pool[:min(count, len(pool))]
 
 
 def get_duaa_of_day() -> dict:
@@ -3273,6 +3424,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text if update.message.text else ""
 
     register_user(user.id, user.username or "", user.full_name)
+    is_admin = user.id in ADMIN_IDS
 
     # ===== أزرار الكيبورد — تأتي أولاً دائماً =====
     _KB_BTNS = {
@@ -3286,7 +3438,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # عند ضغط زر كيبورد — أوقف أوضاع النص السابقة
     if text in _KB_BTNS:
-        for _k in ["quran_search_mode","hadith_search_mode","contact_dev_mode"]:
+        for _k in ["quran_search_mode","hadith_search_mode","contact_dev_mode",
+                   "waiting_one_manual_q","waiting_manual_questions","waiting_quiz_count",
+                   "waiting_channel_id"]:
             context.user_data.pop(_k, None)
         if text != "🌟 قدوتي اليوم":
             context.user_data["qudwati_waiting"] = False
@@ -3294,6 +3448,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data.pop("islamic_qa_mode", None)
         if text != "💬 التحدث مع راوي":
             context.user_data.pop("waiting_for_rawi", None)
+        if text != "🎯 اختبار القناة":
+            context.user_data.pop("creating_channel_quiz", None)
 
     # ===== الأدمن =====
 
@@ -3304,8 +3460,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== معالج راوي AI - المحادثة الشاملة =====
     # معالج راوي - تجاهل أزرار الخروج مباشرة في الشرط
     if context.user_data.get("waiting_for_rawi") and text not in ["🔙 خروج من راوي", "🔙 خروج من الباحث"]:
-        is_admin = user.id in ADMIN_IDS
-        
         # رسالة انتظار
         wait_msg = await update.message.reply_text("💬 راوي يفكر في إجابتك...")
         
@@ -3337,24 +3491,93 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⚠️ العدد يجب أن يكون بين 5 و 20")
                 return
             
-            # اختيار أسئلة عشوائية
-            import random
-            questions = random.sample(DAILY_QUESTIONS, min(count, len(DAILY_QUESTIONS)))
+            # اختيار أسئلة عشوائية متنوعة من بنك الأسئلة المتقدمة
+            questions = get_channel_quiz_questions(count)
             
             context.user_data["quiz_questions"] = questions
             context.user_data["waiting_channel_id"] = True
             
             await update.message.reply_text(
-                f"✅ تم اختيار {len(questions)} سؤال\n\n"
-                "الآن أرسل معرف القناة أو اسمها:\n"
-                "مثال: @my_channel أو -1001234567890"
+                f"✅ *تم اختيار {len(questions)} سؤال متقدم عشوائياً*\n\n"
+                "📢 الآن أرسل معرّف القناة:\n"
+                "`@my_channel` أو `-1001234567890`",
+                parse_mode="Markdown"
             )
             
         except ValueError:
             await update.message.reply_text("⚠️ أرسل رقم صحيح من 5 إلى 20")
         return
     
-    # معالج الأسئلة اليدوية
+    # معالج سؤال يدوي واحد (النظام الجديد)
+    if context.user_data.get("waiting_one_manual_q"):
+        context.user_data.pop("waiting_one_manual_q", None)
+        
+        # تحليل السؤال الواحد
+        lines = [l.strip() for l in text.strip().split("\n") if l.strip()]
+        try:
+            question = ""
+            options = []
+            answer_letter = ""
+            
+            for line in lines:
+                if line.startswith("السؤال:"):
+                    question = line.replace("السؤال:", "").strip()
+                elif line.startswith(("أ.", "ب.", "ج.", "د.")):
+                    options.append(line[2:].strip())
+                elif line.startswith("الإجابة:"):
+                    answer_letter = line.replace("الإجابة:", "").strip()
+            
+            if not question or len(options) < 2 or not answer_letter:
+                raise ValueError("صيغة غير صحيحة")
+            
+            answer_map = {"أ": 0, "ب": 1, "ج": 2, "د": 3}
+            answer_idx = answer_map.get(answer_letter, -1)
+            if answer_idx == -1 or answer_idx >= len(options):
+                raise ValueError("حرف الإجابة غير صحيح")
+            
+            new_q = {
+                "q": question,
+                "options": options,
+                "answer": options[answer_idx]
+            }
+            
+            if "manual_questions" not in context.user_data:
+                context.user_data["manual_questions"] = []
+            context.user_data["manual_questions"].append(new_q)
+            count = len(context.user_data["manual_questions"])
+            
+            # اسأل: هل تريد إضافة سؤال آخر؟
+            keyboard = [
+                [colored_btn("➕ أضف سؤالاً آخر", callback_data="cq_add_more", style="primary")],
+                [colored_btn(f"✅ انتهيت ({count} سؤال)", callback_data="cq_finish_manual", style="success")],
+                [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
+            ]
+            await update.message.reply_text(
+                f"✅ *تم إضافة السؤال {count} بنجاح!*\n\n"
+                f"📌 *{question}*\n"
+                f"🎯 الإجابة: {answer_letter}. {options[answer_idx]}\n\n"
+                "هل تريد إضافة سؤال آخر؟",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+        except Exception as e:
+            context.user_data["waiting_one_manual_q"] = True  # إعادة التفعيل
+            await update.message.reply_text(
+                "⚠️ *صيغة غير صحيحة!*\n\n"
+                "أرسل السؤال بهذا الشكل:\n\n"
+                "```\n"
+                "السؤال: ما هو أول ركن من أركان الإسلام؟\n"
+                "أ. الصلاة\n"
+                "ب. الشهادتان\n"
+                "ج. الصيام\n"
+                "د. الزكاة\n"
+                "الإجابة: ب\n"
+                "```",
+                parse_mode="Markdown"
+            )
+        return
+    
+    # معالج الأسئلة اليدوية (النظام القديم - للتوافق)
     if context.user_data.get("waiting_manual_questions"):
         context.user_data.pop("waiting_manual_questions", None)
         
@@ -3701,17 +3924,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         await update.message.reply_text(
-            "💬 **مرحباً بك في راوي!**\n"
-            "━━━━━━━━━━━━━━━\n\n"
-            "🤖 أنا مساعدك الإسلامي الذكي\n"
-            "📚 أجيب على أسئلتك الشرعية بأدلة واضحة\n"
-            "💡 أساعدك على فهم الإسلام وميزات البوت\n\n"
-            "**اسألني أي شيء:**\n"
-            "• أسئلة إسلامية: ما حكم...؟ ما فضل...؟\n"
-            "• عن البوت: كيف أستخدم...؟ ما هي...؟\n"
-            "• محادثة عامة: أي شيء آخر!\n\n"
-            "🌟 _ابدأ الكتابة الآن..._\n\n"
-            "💡 للخروج: اضغط زر 🔙 خروج من راوي",
+            "💬 *أهلاً! أنا راوي* 🌙\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "مساعدك الإسلامي الذكي — يُجيب على أسئلتك بعلم وأدب.\n\n"
+            "📌 *يمكنك أن تسألني عن:*\n"
+            "• الأحكام الشرعية والفقه\n"
+            "• السيرة النبوية والصحابة\n"
+            "• تفسير القرآن الكريم\n"
+            "• فضائل العبادات والأذكار\n"
+            "• كيفية استخدام ميزات البوت\n\n"
+            "✍️ _اكتب سؤالك الآن..._\n\n"
+            "🔙 للخروج اضغط زر _خروج من راوي_",
             parse_mode="Markdown",
             reply_markup=rawi_kb()
         )
@@ -3855,16 +4078,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     if text == "🎯 اختبار القناة":
-        # عرض خيارات الاختبار
         keyboard = [
-            [colored_btn("📚 أسئلة جاهزة (من البوت)", callback_data="cq_ready", style="primary")],
+            [colored_btn("📚 أسئلة جاهزة من البوت", callback_data="cq_ready", style="primary")],
             [colored_btn("✍️ كتابة أسئلة يدوية", callback_data="cq_manual", style="secondary")],
             [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
         ]
         
         await update.message.reply_text(
             "🎯 *إنشاء اختبار في القناة*\n"
-            "━━━━━━━━━━━━━━━\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📌 *ملاحظة:* فقط مشرفو القناة يستطيعون بدء الاختبار.\n\n"
             "اختر نوع الأسئلة:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard)
@@ -5936,6 +6159,23 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             full_text = full_text[:4000] + "..."
         await q.message.reply_text(full_text, parse_mode="Markdown")
 
+    # ===== اختبار القناة =====
+    elif q.data in ("cq_ready", "cq_manual", "cq_cancel", "cq_add_more", "cq_finish_manual"):
+        await handle_quiz_type_selection(update, context)
+        return
+
+    elif q.data.startswith("cqj_"):
+        await handle_quiz_join(update, context)
+        return
+
+    elif q.data.startswith("cqs_"):
+        await handle_quiz_start(update, context)
+        return
+
+    elif q.data.startswith("cqa_"):
+        await handle_quiz_answer(update, context)
+        return
+
     elif q.data == "qudwati_reveal":
         await q.answer()
         # جلب الجواب من current_qudwati أو من saved
@@ -6302,25 +6542,21 @@ CHANNEL_QUIZ_PARTICIPANTS = {}  # {quiz_id: {user_id: {lives, score, answered}}}
 async def cmd_create_channel_quiz(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     إنشاء اختبار جديد في القناة
-    الأدمن يختار: أسئلة جاهزة أو كتابة يدوية
+    يختار المستخدم: أسئلة جاهزة أو كتابة يدوية
     """
     user = update.effective_user
     
-    # التحقق من أن المستخدم أدمن
-    if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⚠️ هذا الأمر للمشرفين فقط!")
-        return
-    
     # الكيبورد: اختيار نوع الأسئلة
     keyboard = [
-        [colored_btn("📚 أسئلة جاهزة (من البوت)", callback_data="cq_ready", style="primary")],
+        [colored_btn("📚 أسئلة جاهزة من البوت", callback_data="cq_ready", style="primary")],
         [colored_btn("✍️ كتابة أسئلة يدوية", callback_data="cq_manual", style="secondary")],
         [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
     ]
     
     await update.message.reply_text(
         "🎯 *إنشاء اختبار في القناة*\n"
-        "━━━━━━━━━━━━━━━\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        "📌 *ملاحظة:* فقط مشرفو القناة يستطيعون بدء الاختبار.\n\n"
         "اختر نوع الأسئلة:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -6342,23 +6578,24 @@ async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAU
     data = query.data
     
     if data == "cq_ready":
-        # أسئلة جاهزة
         await query.edit_message_text(
-            "📚 *أسئلة جاهزة*\n"
-            "━━━━━━━━━━━━━━━\n\n"
-            "كم عدد الأسئلة؟\n"
-            "أرسل رقم من 5 إلى 20:",
+            "📚 *أسئلة جاهزة من البوت*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "كم عدد الأسئلة تريد؟\n"
+            "أرسل رقماً من *5* إلى *20*:",
             parse_mode="Markdown"
         )
         context.user_data["quiz_type"] = "ready"
         context.user_data["waiting_quiz_count"] = True
         
     elif data == "cq_manual":
-        # أسئلة يدوية
+        context.user_data["quiz_type"] = "manual"
+        context.user_data["manual_questions"] = []
+        context.user_data["waiting_one_manual_q"] = True
         await query.edit_message_text(
             "✍️ *كتابة أسئلة يدوية*\n"
-            "━━━━━━━━━━━━━━━\n\n"
-            "أرسل الأسئلة بهذا الشكل:\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "أرسل السؤال الأول بهذا الشكل:\n\n"
             "```\n"
             "السؤال: من هو أول من أسلم؟\n"
             "أ. عمر\n"
@@ -6366,16 +6603,50 @@ async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAU
             "ج. علي\n"
             "د. عثمان\n"
             "الإجابة: ب\n"
-            "```\n\n"
-            "افصل كل سؤال بـ `---`",
+            "```",
             parse_mode="Markdown"
         )
-        context.user_data["quiz_type"] = "manual"
-        context.user_data["waiting_manual_questions"] = True
+        
+    elif data == "cq_add_more":
+        # إضافة سؤال آخر
+        context.user_data["waiting_one_manual_q"] = True
+        count = len(context.user_data.get("manual_questions", []))
+        await query.edit_message_text(
+            f"✍️ *أرسل السؤال رقم {count + 1}*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "```\n"
+            "السؤال: ...\n"
+            "أ. ...\n"
+            "ب. ...\n"
+            "ج. ...\n"
+            "د. ...\n"
+            "الإجابة: أ\n"
+            "```",
+            parse_mode="Markdown"
+        )
+        
+    elif data == "cq_finish_manual":
+        # إنهاء كتابة الأسئلة والانتقال لاختيار القناة
+        questions = context.user_data.get("manual_questions", [])
+        if len(questions) < 1:
+            await query.answer("⚠️ يجب أن يكون هناك سؤال واحد على الأقل!", show_alert=True)
+            return
+        context.user_data["quiz_questions"] = questions
+        context.user_data["waiting_channel_id"] = True
+        await query.edit_message_text(
+            f"✅ *تم تجميع {len(questions)} سؤال بنجاح!*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "الآن أرسل معرّف القناة أو اسمها:\n"
+            "مثال: `@my_channel` أو `-1001234567890`",
+            parse_mode="Markdown"
+        )
         
     elif data == "cq_cancel":
-        await query.edit_message_text("❌ تم الإلغاء")
-        context.user_data.clear()
+        await query.edit_message_text("❌ تم إلغاء إنشاء الاختبار.")
+        for k in ["creating_channel_quiz", "quiz_type", "manual_questions",
+                  "waiting_one_manual_q", "waiting_quiz_count", "waiting_channel_id",
+                  "quiz_questions"]:
+            context.user_data.pop(k, None)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6386,46 +6657,50 @@ async def publish_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: s
     """
     نشر الاختبار في القناة
     """
-    quiz_id = f"cq_{int(datetime.now().timestamp())}"
-    
-    # حفظ بيانات الاختبار
-    ACTIVE_CHANNEL_QUIZZES[channel_id] = {
-        "quiz_id": quiz_id,
-        "questions": questions,
-        "current_question": 0,
-        "admin_id": admin_id,
-        "status": "waiting",  # waiting, active, finished
-        "started_at": None,
-        "message_id": None
-    }
+    # نستخدم - بدلاً من _ حتى لا يتعارض مع parsing الـ callback_data
+    quiz_id = f"cq-{int(datetime.now().timestamp())}"
     
     CHANNEL_QUIZ_PARTICIPANTS[quiz_id] = {}
     
     # رسالة الإعلان
-    text = (
-        "🎯 *اختبار إسلامي جديد!*\n"
-        "━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📚 عدد الأسئلة: {len(questions)}\n"
-        f"⏱️ مدة السؤال: 15 ثانية\n"
-        f"❤️ الأرواح: 3 (3 أخطاء = خروج)\n"
-        f"🏆 الفائز: أول من يكمل بدون 3 أخطاء\n\n"
-        f"👥 المشاركين: 0\n\n"
-        "📝 اضغط *انضم* للمشاركة!"
+    announce_text = (
+        "🕌 *اختبار إسلامي جديد!*\n"
+        "━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📚 *الأسئلة:* {len(questions)} سؤال متقدم\n"
+        f"⏱️ *الوقت:* 15 ثانية لكل سؤال\n"
+        f"❤️ *الأرواح:* 3 (3 أخطاء = خروج)\n"
+        f"🏆 *الفائز:* أعلى نقاط بأقل أخطاء\n\n"
+        f"👥 *المنضمون:* 0\n\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "✅ اضغط *انضم* للمشاركة\n"
+        "▶️ *مشرف القناة* يبدأ الاختبار"
     )
-    
+
     keyboard = [
-        [colored_btn("🎮 انضم للاختبار", callback_data=f"cqj_{quiz_id}", style="success")],
-        [colored_btn("▶️ بدء الاختبار (أدمن)", callback_data=f"cqs_{quiz_id}", style="primary")]
+        [InlineKeyboardButton("✅ انضم للاختبار", callback_data=f"cqj_{quiz_id}")],
+        [InlineKeyboardButton("▶️ بدء الاختبار", callback_data=f"cqs_{quiz_id}")]
     ]
     
     msg = await context.bot.send_message(
         chat_id=channel_id,
-        text=text,
+        text=announce_text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
     
-    ACTIVE_CHANNEL_QUIZZES[channel_id]["message_id"] = msg.message_id
+    # نحفظ الاختبار بالـ ID الرقمي الفعلي الذي أرجعه Telegram
+    # (المستخدم قد يدخل @username لكن Telegram يعيد الرقم -100xxx)
+    real_channel_id = str(msg.chat_id)
+    
+    ACTIVE_CHANNEL_QUIZZES[real_channel_id] = {
+        "quiz_id": quiz_id,
+        "questions": questions,
+        "current_question": 0,
+        "admin_id": admin_id,
+        "status": "waiting",
+        "started_at": None,
+        "message_id": msg.message_id
+    }
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6435,7 +6710,6 @@ async def publish_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: s
 async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج انضمام المستخدم للاختبار"""
     query = update.callback_query
-    await query.answer()
     
     quiz_id = query.data.replace("cqj_", "")
     user_id = query.from_user.id
@@ -6443,42 +6717,70 @@ async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     # التحقق من أن الاختبار موجود
     if quiz_id not in CHANNEL_QUIZ_PARTICIPANTS:
-        await query.answer("⚠️ الاختبار غير موجود!", show_alert=True)
+        await query.answer("⚠️ الاختبار غير موجود أو انتهى!", show_alert=True)
         return
     
     # التحقق من أن الاختبار لم يبدأ
-    channel_id = query.message.chat.id
-    quiz_data = ACTIVE_CHANNEL_QUIZZES.get(str(channel_id))
+    channel_id = str(query.message.chat.id)
+    quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id)
     
-    if quiz_data and quiz_data["status"] != "waiting":
-        await query.answer("⚠️ الاختبار بدأ بالفعل!", show_alert=True)
+    if not quiz_data:
+        await query.answer("⚠️ الاختبار غير موجود!", show_alert=True)
         return
     
-    # تسجيل المشارك
+    if quiz_data["status"] != "waiting":
+        await query.answer("⚠️ الاختبار بدأ بالفعل، لا يمكن الانضمام الآن!", show_alert=True)
+        return
+    
+    # تسجيل المشارك (حتى لو لم يسجل في البوت من قبل)
     if user_id not in CHANNEL_QUIZ_PARTICIPANTS[quiz_id]:
         CHANNEL_QUIZ_PARTICIPANTS[quiz_id][user_id] = {
             "name": user_name,
             "lives": 3,
             "score": 0,
             "answered": [],
-            "active": True
+            "active": True,
+            "correct": 0,
+            "wrong": 0
         }
         
-        await query.answer(f"✅ تم التسجيل! أهلاً {user_name}", show_alert=True)
+        await query.answer(f"✅ تم تسجيلك! أهلاً {user_name} 🎉", show_alert=True)
         
         # تحديث عدد المشاركين في الرسالة
         count = len(CHANNEL_QUIZ_PARTICIPANTS[quiz_id])
-        
-        text = query.message.text.split("👥 المشاركين:")[0]
-        text += f"👥 المشاركين: {count}\n\n📝 اضغط *انضم* للمشاركة!"
-        
-        await query.edit_message_text(
-            text,
-            parse_mode="Markdown",
-            reply_markup=query.message.reply_markup
+
+        # بناء قائمة الأسماء
+        names_list = "\n".join(
+            f"   {'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else '👤'} {p['name']}"
+            for i, p in enumerate(list(CHANNEL_QUIZ_PARTICIPANTS[quiz_id].values())[:6])
         )
+        if count > 6:
+            names_list += f"\n   ➕ و{count - 6} آخرين"
+
+        text = (
+            "🕌 *اختبار إسلامي جديد!*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📚 *الأسئلة:* {len(quiz_data['questions'])} سؤال متقدم\n"
+            f"⏱️ *الوقت:* 15 ثانية لكل سؤال\n"
+            f"❤️ *الأرواح:* 3 (3 أخطاء = خروج)\n"
+            f"🏆 *الفائز:* أعلى نقاط بأقل أخطاء\n\n"
+            f"👥 *المنضمون: {count}*\n"
+            f"{names_list}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "✅ اضغط *انضم* للمشاركة\n"
+            "▶️ *مشرف القناة* يبدأ الاختبار"
+        )
+        
+        try:
+            await query.edit_message_text(
+                text,
+                parse_mode="Markdown",
+                reply_markup=query.message.reply_markup
+            )
+        except Exception:
+            pass
     else:
-        await query.answer("✅ أنت مسجل بالفعل!", show_alert=True)
+        await query.answer("✅ أنت مسجل بالفعل في الاختبار!", show_alert=True)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6488,45 +6790,98 @@ async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج بدء الاختبار - لأدمن القناة فقط"""
     query = update.callback_query
-    
-    quiz_id = query.data.replace("cqs_", "")
+    # يجب الرد على callback فوراً لتجنب timeout
+    await query.answer()
+
     user_id = query.from_user.id
     channel_id = str(query.message.chat.id)
-    
+
     quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id)
-    
+
     if not quiz_data:
-        await query.answer("⚠️ الاختبار غير موجود!", show_alert=True)
+        await context.bot.send_message(
+            chat_id=channel_id,
+            text="⚠️ الاختبار غير موجود أو انتهى!"
+        )
         return
-    
-    # التحقق من أن المستخدم أدمن في القناة
+
+    quiz_id = quiz_data["quiz_id"]
+
+    if quiz_data["status"] != "waiting":
+        await context.bot.send_message(
+            chat_id=channel_id,
+            text="⚠️ الاختبار بدأ بالفعل!"
+        )
+        return
+
+    # التحقق من صلاحية البدء: أدمن القناة أو منشئ الاختبار أو أدمن البوت
+    is_authorized = False
+
+    # محاولة فحص صلاحية أدمن القناة
     try:
         member = await context.bot.get_chat_member(channel_id, user_id)
-        is_admin = member.status in ['creator', 'administrator']
-        
-        if not is_admin:
-            await query.answer("⚠️ هذا الأمر لمشرفي القناة فقط!", show_alert=True)
-            return
+        if member.status in ('creator', 'administrator'):
+            is_authorized = True
     except Exception as e:
-        logger.error(f"Error checking admin status: {e}")
-        await query.answer("⚠️ حدث خطأ في التحقق من الصلاحيات!", show_alert=True)
+        logger.warning(f"get_chat_member failed for start btn: {e}")
+
+    # fallback: منشئ الاختبار أو أدمن البوت
+    if not is_authorized:
+        if user_id == quiz_data.get("admin_id") or user_id in ADMIN_IDS:
+            is_authorized = True
+
+    if not is_authorized:
+        await context.bot.send_message(
+            chat_id=query.from_user.id,
+            text="⚠️ فقط مشرفو القناة يستطيعون بدء الاختبار!"
+        )
         return
-    
+
     # التحقق من وجود مشاركين
-    if len(CHANNEL_QUIZ_PARTICIPANTS[quiz_id]) == 0:
-        await query.answer("⚠️ لا يوجد مشاركين!", show_alert=True)
+    participants = CHANNEL_QUIZ_PARTICIPANTS.get(quiz_id, {})
+    if len(participants) == 0:
+        await context.bot.send_message(
+            chat_id=channel_id,
+            text="⚠️ لا يوجد مشاركون بعد!\nاضغط *انضم* أولاً ثم ابدأ الاختبار.",
+            parse_mode="Markdown"
+        )
         return
-    
-    await query.answer("✅ يتم بدء الاختبار...")
-    
+
     # تحديث الحالة
     quiz_data["status"] = "active"
     quiz_data["started_at"] = datetime.now()
-    
+
     # حذف رسالة الإعلان
-    await query.message.delete()
-    
-    # بدء الاختبار
+    try:
+        await query.message.delete()
+    except Exception:
+        pass
+
+    # رسالة الانطلاق مع جماليات
+    names_list = "\n".join(
+        f"   {'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else '👤'} {p['name']}"
+        for i, p in enumerate(list(participants.values())[:8])
+    )
+    if len(participants) > 8:
+        names_list += f"\n   ... و{len(participants)-8} آخرين"
+
+    await context.bot.send_message(
+        chat_id=channel_id,
+        text=(
+            "🚀 *انطلق الاختبار الإسلامي!*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"👥 *المشاركون ({len(participants)}):*\n"
+            f"{names_list}\n\n"
+            f"📚 *عدد الأسئلة:* {len(quiz_data['questions'])}\n"
+            f"⏱️ *الوقت:* 15 ثانية لكل سؤال\n"
+            f"❤️ *الأرواح:* 3 أخطاء = خروج\n\n"
+            "3️⃣ ... 2️⃣ ... 1️⃣ ... 🎯 *ابدأ!*"
+        ),
+        parse_mode="Markdown"
+    )
+
+    # تأخير 3 ثوان ثم بدء الأسئلة
+    await asyncio.sleep(3)
     asyncio.create_task(run_channel_quiz(context, channel_id, quiz_id))
 
 
@@ -6541,30 +6896,34 @@ async def run_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, 
     quiz_data = ACTIVE_CHANNEL_QUIZZES[channel_id]
     questions = quiz_data["questions"]
     participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+    labels = ['🔴 أ', '🔵 ب', '🟢 ج', '🟡 د']
+    timer_bar = ["🟩🟩🟩🟩🟩", "🟩🟩🟩🟩⬜", "🟩🟩🟩⬜⬜", "🟩🟩⬜⬜⬜", "🟩⬜⬜⬜⬜", "🟥⬜⬜⬜⬜"]
     
     for idx, q in enumerate(questions):
         quiz_data["current_question"] = idx
         
-        # عرض السؤال
+        # إعداد نص السؤال
+        opts_text = "\n".join(
+            f"{labels[i]}. {opt}" for i, opt in enumerate(q['options'])
+        )
         text = (
-            f"📝 *السؤال {idx + 1}/{len(questions)}*\n"
-            f"━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"{q['q']}\n\n"
+            f"❓ *السؤال {idx + 1} من {len(questions)}*\n"
+            f"══════════════════════\n\n"
+            f"📌 {q['q']}\n\n"
+            f"{opts_text}\n\n"
+            f"⏱️ {timer_bar[0]}  15 ثانية"
         )
         
         keyboard = []
-        labels = ['أ', 'ب', 'ج', 'د']
-        
+        plain_labels = ['أ', 'ب', 'ج', 'د']
         for i, opt in enumerate(q['options']):
             keyboard.append([
                 colored_btn(
-                    f"{labels[i]}. {opt}",
+                    f"{plain_labels[i]}. {opt}",
                     callback_data=f"cqa_{quiz_id}_{idx}_{i}",
                     style="primary"
                 )
             ])
-        
-        text += f"\n⏱️ الوقت المتبقي: 15 ثانية"
         
         msg = await context.bot.send_message(
             chat_id=channel_id,
@@ -6575,13 +6934,38 @@ async def run_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, 
         
         quiz_data["current_message_id"] = msg.message_id
         
-        # انتظار 15 ثانية أو حتى يجاوب الجميع
-        await wait_for_answers(context, channel_id, quiz_id, idx, 15)
+        # انتظار الإجابات مع تحديث العداد
+        await wait_for_answers(context, channel_id, quiz_id, idx, 15, msg)
         
-        # حذف السؤال
+        # كشف الإجابة الصحيحة
+        correct = q["answer"]
+        correct_idx = q["options"].index(correct) if correct in q["options"] else -1
+        answered_count = len([p for p in participants.values() if idx in p.get("answered", [])])
+        
+        result_text = (
+            f"✅ *انتهى وقت السؤال {idx + 1}!*\n"
+            f"══════════════════════\n\n"
+            f"📌 {q['q']}\n\n"
+            f"🎯 الإجابة الصحيحة: *{plain_labels[correct_idx]}. {correct}*\n\n"
+            f"👥 أجاب: {answered_count} من {len([p for p in participants.values() if p.get('active')])}"
+        )
+        
+        try:
+            await context.bot.edit_message_text(
+                chat_id=channel_id,
+                message_id=msg.message_id,
+                text=result_text,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        
+        await asyncio.sleep(3)
+        
+        # حذف رسالة السؤال
         try:
             await context.bot.delete_message(channel_id, msg.message_id)
-        except:
+        except Exception:
             pass
         
         # التحقق من وجود فائز
@@ -6589,6 +6973,11 @@ async def run_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, 
         if winner:
             await announce_winner(context, channel_id, quiz_id, winner)
             return
+        
+        # التحقق من وجود مشاركين نشطين
+        active = [u for u, p in participants.items() if p.get("active")]
+        if not active:
+            break
     
     # انتهى الاختبار - إعلان النتائج
     await announce_results(context, channel_id, quiz_id)
@@ -6598,25 +6987,76 @@ async def run_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, 
 # دالة: انتظار الإجابات
 # ═══════════════════════════════════════════════════════════════════
 
-async def wait_for_answers(context, channel_id, quiz_id, question_idx, max_seconds):
+async def wait_for_answers(context, channel_id, quiz_id, question_idx, max_seconds, msg=None):
     """
-    انتظار الإجابات - 15 ثانية أو حتى يجاوب الجميع
+    انتظار الإجابات - max_seconds ثانية أو حتى يجاوب جميع النشطاء
     """
     participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
-    active_count = len([p for p in participants.values() if p["active"]])
-    
-    for _ in range(max_seconds):
+    timer_bars = [
+        "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩",
+        "🟩🟩🟩🟩🟩🟩🟩🟩🟩⬜",
+        "🟩🟩🟩🟩🟩🟩🟩🟩⬜⬜",
+        "🟩🟩🟩🟩🟩🟩🟩⬜⬜⬜",
+        "🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜",
+        "🟩🟩🟩🟩🟩⬜⬜⬜⬜⬜",
+        "🟨🟨🟨🟨⬜⬜⬜⬜⬜⬜",
+        "🟨🟨🟨⬜⬜⬜⬜⬜⬜⬜",
+        "🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜",
+        "🟧⬜⬜⬜⬜⬜⬜⬜⬜⬜",
+        "🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜",
+    ]
+    # حفظ نسخة من الأزرار الأصلية مرة واحدة
+    original_markup = msg.reply_markup if msg else None
+
+    for sec in range(max_seconds):
         await asyncio.sleep(1)
-        
-        # عدد اللي جاوبوا
+
+        # إعادة حساب النشطاء في كل دورة (مهم: قد يخرج أحدهم أثناء الانتظار)
+        active_count = len([p for p in participants.values() if p.get("active")])
         answered_count = len([
-            p for p in participants.values() 
-            if p["active"] and question_idx in p["answered"]
+            p for p in participants.values()
+            if p.get("active") and question_idx in p.get("answered", [])
         ])
-        
-        # لو كل الناس جاوبوا
+
+        # لو انضم أحد ولم يجب بعد، لا ننتظره إذا أجاب الجميع الآخرون
+        # لو ما في أحد نشط → انهِ مباشرة
+        if active_count == 0:
+            break
+
+        # لو الجميع النشطون أجابوا → انهِ مبكراً
         if answered_count >= active_count:
             break
+
+        # تحديث شريط العداد كل 3 ثوان
+        if msg and sec % 3 == 2:
+            remaining = max_seconds - sec - 1
+            try:
+                quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id, {})
+                q = quiz_data.get("questions", [])[question_idx] if quiz_data else None
+                if q:
+                    plain_labels = ['أ', 'ب', 'ج', 'د']
+                    opts_text = "\n".join(
+                        f"{'🔴' if i==0 else '🔵' if i==1 else '🟢' if i==2 else '🟡'} {plain_labels[i]}. {opt}"
+                        for i, opt in enumerate(q['options'])
+                    )
+                    bar = timer_bars[min(sec * len(timer_bars) // max_seconds, len(timer_bars) - 1)]
+                    updated_text = (
+                        f"❓ *السؤال {question_idx + 1} من {len(quiz_data['questions'])}*\n"
+                        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"📌 {q['q']}\n\n"
+                        f"{opts_text}\n\n"
+                        f"⏱️ {bar}  {remaining}ث\n"
+                        f"✍️ أجاب: {answered_count}/{active_count}"
+                    )
+                    await context.bot.edit_message_text(
+                        chat_id=channel_id,
+                        message_id=msg.message_id,
+                        text=updated_text,
+                        parse_mode="Markdown",
+                        reply_markup=original_markup
+                    )
+            except Exception:
+                pass
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -6627,58 +7067,109 @@ async def handle_quiz_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """معالج إجابة المستخدم"""
     query = update.callback_query
     
+    # callback_data شكله: cqa_{quiz_id}_{idx}_{answer_idx}
+    # quiz_id الآن يستخدم - بدلاً من _ (مثال: cq-1234567890)
+    # لذا split("_") يعطي: ["cqa", "cq-1234567890", "idx", "answer_idx"]
     parts = query.data.split("_")
-    quiz_id = parts[1]
+    if len(parts) < 4:
+        await query.answer("⚠️ بيانات غير صحيحة!", show_alert=True)
+        return
+    
+    quiz_id = parts[1]        # "cq-timestamp"
     question_idx = int(parts[2])
     answer_idx = int(parts[3])
     
     user_id = query.from_user.id
     
-    # التحقق من أن المستخدم مشارك
-    if quiz_id not in CHANNEL_QUIZ_PARTICIPANTS or user_id not in CHANNEL_QUIZ_PARTICIPANTS[quiz_id]:
-        await query.answer("⚠️ أنت لست مشاركاً!", show_alert=True)
+    # التحقق من أن الاختبار موجود
+    if quiz_id not in CHANNEL_QUIZ_PARTICIPANTS:
+        await query.answer("⚠️ انتهى الاختبار!", show_alert=True)
+        return
+    
+    # التحقق من أن المستخدم مشارك - لو مش مسجل، يطلب منه الانضمام
+    if user_id not in CHANNEL_QUIZ_PARTICIPANTS[quiz_id]:
+        await query.answer("⚠️ أنت لم تنضم للاختبار! انضم من رسالة الإعلان.", show_alert=True)
         return
     
     participant = CHANNEL_QUIZ_PARTICIPANTS[quiz_id][user_id]
     
     # التحقق من أنه لم يجب بعد
-    if question_idx in participant["answered"]:
-        await query.answer("⚠️ لقد أجبت بالفعل!", show_alert=True)
+    if question_idx in participant.get("answered", []):
+        await query.answer("⚠️ لقد أجبت على هذا السؤال!", show_alert=True)
         return
     
     # التحقق من أنه ما زال نشط
-    if not participant["active"]:
-        await query.answer("⚠️ لقد خرجت من الاختبار!", show_alert=True)
+    if not participant.get("active"):
+        await query.answer("⚠️ أنت خرجت من الاختبار (نفدت الأرواح)!", show_alert=True)
         return
     
     # الحصول على السؤال
     channel_id = str(query.message.chat.id)
-    quiz_data = ACTIVE_CHANNEL_QUIZZES[channel_id]
+    quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id)
+    if not quiz_data:
+        await query.answer("⚠️ انتهى الاختبار!", show_alert=True)
+        return
+    
+    if question_idx >= len(quiz_data["questions"]):
+        await query.answer("⚠️ سؤال غير صالح!", show_alert=True)
+        return
+    
     question = quiz_data["questions"][question_idx]
     
     # التحقق من الإجابة
     correct_answer = question["answer"]
+    if answer_idx >= len(question["options"]):
+        await query.answer("⚠️ خيار غير صالح!", show_alert=True)
+        return
     user_answer = question["options"][answer_idx]
     
     is_correct = (user_answer == correct_answer)
     
     # تسجيل الإجابة
+    if "answered" not in participant:
+        participant["answered"] = []
     participant["answered"].append(question_idx)
     
     if is_correct:
-        participant["score"] += 1
-        await query.answer("✅ إجابة صحيحة!", show_alert=True)
+        participant["score"] = participant.get("score", 0) + 1
+        participant["correct"] = participant.get("correct", 0) + 1
+        await query.answer("✅ إجابة صحيحة! +1 نقطة", show_alert=True)
     else:
-        participant["lives"] -= 1
-        await query.answer(f"❌ خطأ! الإجابة: {correct_answer}\n❤️ الأرواح: {participant['lives']}", show_alert=True)
+        participant["lives"] = participant.get("lives", 3) - 1
+        participant["wrong"] = participant.get("wrong", 0) + 1
+        remaining_lives = participant["lives"]
+        hearts = "❤️" * remaining_lives + "🖤" * (3 - remaining_lives)
         
-        # لو خلصت أرواحه
-        if participant["lives"] <= 0:
+        if remaining_lives <= 0:
             participant["active"] = False
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=f"💔 للأسف خرجت من الاختبار!\n"
-                     f"حصلت على {participant['score']} نقطة."
+            await query.answer(
+                f"💔 إجابة خاطئة!\n"
+                f"✅ الصحيحة: {correct_answer}\n\n"
+                f"نفدت أرواحك! خرجت من الاختبار.",
+                show_alert=True
+            )
+            # إرسال رسالة خاصة للمشارك (إذا كان مسجل في البوت)
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text=(
+                        f"💔 *خرجت من الاختبار!*\n\n"
+                        f"📊 النتيجة النهائية:\n"
+                        f"✅ صح: {participant.get('correct', 0)}\n"
+                        f"❌ غلط: {participant.get('wrong', 0)}\n"
+                        f"⭐ النقاط: {participant.get('score', 0)}\n\n"
+                        f"حظ أوفر في المرة القادمة! 🌟"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass  # المستخدم لم يبدأ البوت أو حظر البوت
+        else:
+            await query.answer(
+                f"❌ إجابة خاطئة!\n"
+                f"✅ الصحيحة: {correct_answer}\n"
+                f"الأرواح: {hearts}",
+                show_alert=True
             )
 
 
@@ -6802,46 +7293,37 @@ def cleanup_quiz(channel_id, quiz_id):
 
 
 
+async def on_startup(app):
+    """يُشغّل المهام الخلفية بعد بدء البوت - يعمل داخل event loop"""
+    # إشعار الأدمن
+    await startup_notify(app)
+    
+    # تشغيل المهام الخلفية داخل event loop
+    asyncio.create_task(heartbeat(app))
+    asyncio.create_task(internal_self_ping())
+    asyncio.create_task(keep_connections_alive())
+    asyncio.create_task(simulate_activity(app))
+    asyncio.create_task(monitor_database_health())
+    asyncio.create_task(periodic_cleanup(app))
+    logger.info("✅ جميع المهام الخلفية بدأت")
+
+
 def main():
     logger.info("🚀 بدء تشغيل بوت راوِي...")
     init_db()
     
-    # تشغيل Keep-Alive HTTP server
+    # تشغيل Keep-Alive HTTP server في thread منفصل
     from threading import Thread
-    Thread(target=run_keepalive_server, daemon=True).start()
-    logger.info("🌐 Keep-Alive server started on port 8080")
+    keepalive_thread = Thread(target=run_keepalive_server, daemon=True)
+    keepalive_thread.start()
     
     # بناء التطبيق
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .post_init(startup_notify)
+        .post_init(on_startup)
         .build()
     )
-    
-    # تشغيل Heartbeat في الخلفية
-    asyncio.create_task(heartbeat(app))
-    
-    # تشغيل Self-Ping الداخلي
-    asyncio.create_task(internal_self_ping())
-    logger.info("🔄 Internal self-ping started")
-    
-    # تشغيل Connection Management
-    asyncio.create_task(keep_connections_alive())
-    logger.info("🔌 Connection management started")
-    
-    # تشغيل Activity Simulator
-    asyncio.create_task(simulate_activity(app))
-    logger.info("🎯 Activity simulator started")
-    
-    # تشغيل Database Health Monitor
-    asyncio.create_task(monitor_database_health())
-    logger.info("💚 Database health monitor started")
-    logger.info("💓 Heartbeat system started")
-    
-    # تشغيل Memory Cleanup الدوري
-    asyncio.create_task(periodic_cleanup(app))
-    logger.info("🧹 Periodic cleanup started")
 
     # ===== جدولة الإشعارات اليومية =====
     jq = app.job_queue
