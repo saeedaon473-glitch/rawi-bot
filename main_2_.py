@@ -20,8 +20,9 @@ from threading import Thread
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
-from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, InlineQueryHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, InlineQueryHandler, ChosenInlineResultHandler, filters, ContextTypes
 from telegram import InlineQueryResultArticle, InputTextMessageContent
+from islamic_questions import ISLAMIC_QUESTIONS_BY_DIFFICULTY
 
 # ==================== Keep-Alive Server for Replit ====================
 class KeepAliveHandler(BaseHTTPRequestHandler):
@@ -443,9 +444,13 @@ ADMIN_IDS = [int(x) for x in admin_ids_str.split(",") if x.strip().isdigit()]
 # ═══════════════════════════════════════════════════════════════════
 ACTIVE_CHANNEL_QUIZZES = {}
 CHANNEL_QUIZ_PARTICIPANTS = {}
+PENDING_INLINE_QUIZZES = {}    # quiz_id → {questions, time_per_q, difficulty, inline_message_id?}
+ACTIVE_INLINE_QUIZZES = {}     # quiz_id → quiz_data (للاختبارات التي أُرسلت عبر inline)
 
 
 BOT_NAME = "راوِي"
+LOGO_FILE_ID = None  # يُحفظ تلقائياً بعد أول إرسال
+LOGO_PATH = "logo.jpg"  # ضع الصورة بهذا الاسم في نفس مجلد البوت
 BOT_USERNAME = "@G4bGN_bot"
 
 # ==================== إعدادات الأسئلة الدينية ====================
@@ -1399,11 +1404,9 @@ def main_kb(is_admin=False, **kwargs):
     buttons = [
         [KeyboardButton("🔍 تحقق من حديث"), KeyboardButton("📖 باحث القرآن")],
         [KeyboardButton("🎯 اختبر معلوماتك"), KeyboardButton("🎙️ استمع للقرآن")],
-        [KeyboardButton("💬 التحدث مع راوي"), KeyboardButton("❓ سؤال ديني")],
-        [KeyboardButton("💰 دعم البوت")],
-        [KeyboardButton("📞 تواصل مع المطور")],
+        [KeyboardButton("💬 تحدث مع راوي"), KeyboardButton("📢 اختبار القناة")],
+        [KeyboardButton("💰 دعم البوت"),     KeyboardButton("📞 تواصل مع المطور")],
     ]
-    buttons.append([KeyboardButton("🎯 اختبار القناة")])
     if is_admin:
         buttons.append([KeyboardButton("⚙️ لوحة التحكم")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
@@ -1812,31 +1815,28 @@ async def chat_with_rawi(question: str, user_name: str = "أخي", user_id: int 
         conversation_history = []
     
     # Prompt مختصر
-    system_prompt = f"""أنت "راوي" - مساعد إسلامي ذكي في بوت راوي.
+    system_prompt = f"""أنت "راوي" - مساعد ذكي لبوت راوي الإسلامي.
 
 **دورك:**
-1. أجب على الأسئلة الشرعية بدليل من القرآن والسنة
-2. ساعد المستخدمين في استخدام البوت
-3. كن دافئاً ومختصراً
+1. ساعد المستخدم في استخدام ميزات البوت
+2. أجب على أسئلته العامة بأسلوب ودافئ
+3. كن مرشداً لطيفاً ومختصراً
 
-**ميزات البوت:**
-• 🔍 تحقق من حديث - بحث الأحاديث
-• 📖 باحث القرآن - بحث في القرآن
-• 🤲 دعاء اليوم - دعاء يومي
-• 🎯 اختبر معلوماتك - اختبار إسلامي
-• 🌟 قدوتي اليوم - قصص الأنبياء والصحابة
-• 🎙️ استمع للقرآن - تلاوات القراء
-
-**قواعد:**
-- لا تفتي في: الطلاق، الميراث، القضايا المعقدة
-- لا تخترع أحاديث
-- كن مختصراً وواضحاً
-- **أجب بالعربية فقط - ممنوع أي لغة ثانية**
+**ميزات البوت (اشرحها عند السؤال):**
+• 🔍 تحقق من حديث — ابحث عن أي حديث وتحقق من صحته
+• 📖 باحث القرآن — ابحث في آيات القرآن الكريم
+• 🤲 دعاء اليوم — دعاء يومي من القرآن والسنة
+• 🎯 اختبر معلوماتك — اختبار 10 أسئلة يومي
+• 🌟 قدوتي اليوم — قصص الأنبياء والصحابة الكرام
+• 🎙️ استمع للقرآن — استمع لتلاوات أشهر القراء
+• 🎯 اختبار القناة — أنشئ اختباراً تفاعلياً لقناتك على تيليغرام
+• 💰 دعم البوت — ساهم في استمرار البوت
 
 **أسلوب الرد:**
-- للأسئلة الشرعية: السلام عليكم {user_name} 🌙 + إجابة مختصرة + دليل
-- لأسئلة البوت: شرح بسيط + كيفية الاستخدام
-- للمحادثة: رد طبيعي ودافئ
+- مرحّب ودافئ
+- مختصر وواضح
+- **أجب بالعربية فقط**
+- إذا سألك عن موضوع خارج نطاق البوت، أجب بإيجاز وأحلتهم لاستخدام ميزات البوت
 
 كن مختصراً ومفيداً. **رد بالعربية فقط.**"""
     
@@ -2337,11 +2337,19 @@ CHANNEL_QUIZ_QUESTIONS = [
 
 import random as _random
 
-def get_channel_quiz_questions(count: int) -> list:
-    """اختيار أسئلة عشوائية متنوعة لاختبار القناة من بنك الأسئلة الكامل (قديم + جديد)"""
-    # دمج الأسئلة القديمة (DAILY_QUESTIONS) مع الأسئلة الجديدة المتقدمة
-    all_questions = DAILY_QUESTIONS + CHANNEL_QUIZ_QUESTIONS
-    pool = all_questions.copy()
+def get_channel_quiz_questions(count: int, difficulty: str = "مختلط") -> list:
+    """اختيار أسئلة عشوائية من بنك الأسئلة الجديد حسب الصعوبة"""
+    if difficulty == "مختلط":
+        pool = []
+        for lvl in ["سهل", "متوسط", "صعب"]:
+            qs = ISLAMIC_QUESTIONS_BY_DIFFICULTY.get(lvl, [])
+            pool.extend(qs)
+    else:
+        pool = ISLAMIC_QUESTIONS_BY_DIFFICULTY.get(difficulty, [])
+        if not pool:
+            for lvl in ["سهل", "متوسط", "صعب"]:
+                pool.extend(ISLAMIC_QUESTIONS_BY_DIFFICULTY.get(lvl, []))
+    pool = pool.copy()
     _random.shuffle(pool)
     return pool[:min(count, len(pool))]
 
@@ -2423,35 +2431,24 @@ async def cancel_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== معالجات الدعم (التبرع) ====================
 async def donate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إظهار خيارات التبرع"""
+    """طلب المبلغ من المستخدم"""
+    from telegram import ForceReply, ReplyKeyboardRemove
+    context.user_data["waiting_donation_amount"] = True
     await update.message.reply_text(
-        "💰 دعم بوت راوِي\n\n"
-        "يمكنك دعم البوت عن طريق التبرع بالنجوم (Telegram Stars).\n"
-        "اختر المبلغ الذي تريد التبرع به:",
-        reply_markup=donation_keyboard()
+        "💰 *دعم بوت راوِي*\n\n"
+        "يمكنك دعم البوت عن طريق التبرع بالنجوم ⭐ (Telegram Stars).\n\n"
+        "أرسل عدد النجوم التي تريد التبرع بها:\n"
+        "_مثال: اكتب_ `7` _لإرسال 7 نجمات_",
+        parse_mode="Markdown",
+        reply_markup=ReplyKeyboardRemove()
     )
 
-async def handle_donation_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """معالجة اختيار المبلغ وإرسال الفاتورة"""
-    text = update.message.text
-    amount_map = {
-        "⭐ 1 نجمة": 1,
-        "⭐ 5 نجوم": 5,
-        "⭐ 10 نجوم": 10,
-        "⭐ 25 نجمة": 25,
-        "⭐ 50 نجمة": 50,
-        "⭐ 100 نجمة": 100,
-    }
-    if text not in amount_map:
-        return False
-
-    amount = amount_map[text]
-    title = "دعم بوت راوِي"
-    description = f"تبرع بمبلغ {amount} نجمة لدعم استمرارية البوت وتطويره. شكراً لك!"
+async def send_donation_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE, amount: int):
+    """إرسال فاتورة التبرع بمبلغ مخصص"""
+    title = "دعم بوت راوِي ⭐"
+    description = f"تبرع بـ {amount} نجمة لدعم استمرارية بوت راوِي وتطويره. جزاك الله خيراً!"
     payload = f"donation_{amount}"
-    currency = "XTR"
-    # ✅ التصحيح: استخدام LabeledPrice بدلاً من tuple
-    prices = [LabeledPrice(f"{amount} نجمة", amount)]
+    prices = [LabeledPrice(f"⭐ {amount} نجمة", amount)]
 
     await context.bot.send_invoice(
         chat_id=update.effective_chat.id,
@@ -2459,10 +2456,9 @@ async def handle_donation_choice(update: Update, context: ContextTypes.DEFAULT_T
         description=description,
         payload=payload,
         provider_token="",
-        currency=currency,
+        currency="XTR",
         prices=prices
     )
-    return True
 
 async def precheckout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """التحقق من عملية الدفع (يتم قبولها دائماً)"""
@@ -2612,6 +2608,60 @@ async def refund_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(rows) if rows else None)
 
 # ==================== المعالجات ====================
+async def _send_welcome_photo(update: Update, context: ContextTypes.DEFAULT_TYPE, is_admin: bool, is_new: bool):
+    """إرسال رسالة البدء مع صورة الشعار"""
+    global LOGO_FILE_ID
+    user = update.effective_user
+
+    if is_new:
+        caption = (
+            f"﷽\n\n"
+            f"أهلاً {user.first_name}، أنا *راوِي*\n"
+            "━━━━━━━━━━━━━━━\n\n"
+            "رفيقك في البحث عن الأحاديث والقرآن الكريم،\n"
+            "مع قصص الأنبياء والصحابة، والاختبارات والتسبيح.\n\n"
+            "_إن نفعك البوت فادعُ للمطور بظهر الغيب_ 🤍"
+        )
+    else:
+        caption = (
+            f"أهلاً بك {user.first_name} 🌙\n\n"
+            "_إن نفعك البوت فادعُ للمطور بظهر الغيب_ 🤍"
+        )
+
+    try:
+        if LOGO_FILE_ID:
+            msg = await update.message.reply_photo(
+                photo=LOGO_FILE_ID,
+                caption=caption,
+                parse_mode="Markdown",
+                reply_markup=main_kb(is_admin)
+            )
+        elif os.path.exists(LOGO_PATH):
+            with open(LOGO_PATH, "rb") as f:
+                msg = await update.message.reply_photo(
+                    photo=f,
+                    caption=caption,
+                    parse_mode="Markdown",
+                    reply_markup=main_kb(is_admin)
+                )
+            # احفظ الـ file_id لاستخدامه لاحقاً
+            LOGO_FILE_ID = msg.photo[-1].file_id
+        else:
+            # لا توجد صورة — أرسل نصاً عادياً
+            await update.message.reply_text(
+                caption,
+                parse_mode="Markdown",
+                reply_markup=main_kb(is_admin)
+            )
+    except Exception as e:
+        logger.error(f"خطأ في إرسال صورة الترحيب: {e}")
+        await update.message.reply_text(
+            caption,
+            parse_mode="Markdown",
+            reply_markup=main_kb(is_admin)
+        )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     register_user(user.id, user.username or "", user.full_name)
@@ -2702,37 +2752,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
 
     if is_new:
-        # رسالة ترحيب تفاعلية للمستخدم الجديد
-        tour_kb = None  # لا يوجد tour في الرسالة الجديدة
-        await update.message.reply_text(
-            f"🌙 أهلاً {user.first_name}، أنا *راوِي*\n"
-            "━━━━━━━━━━━━━━━\n\n"
-            "🔍 *باحث الحديث*\n"
-            "اضغط الزر ← اكتب الحديث أو اسم الراوي\n\n"
-            "📖 *باحث القرآن*\n"
-            "اضغط الزر ← اكتب كلمات من الآية أو السورة:الآية\n\n"
-            "وفيه كمان:\n"
-            "🌟 قصة يومية من سير الأنبياء والصحابة\n"
-            "🎯 اختبار إسلامي يومي\n"
-            "📿 عداد تسبيح وختم القرآن\n"
-            "❓ سؤال ديني بالذكاء الاصطناعي\n\n"
-            "🤍 _إن نفعك البوت فادعُ للمطور بظهر الغيب_",
-            parse_mode="Markdown"
-        )
-        await update.message.reply_text(
-            "اختر من القائمة 👇",
-            reply_markup=main_kb(is_admin)
-        )
+        await _send_welcome_photo(update, context, is_admin, is_new=True)
     else:
-        await update.message.reply_text(
-            f"🌙 أهلاً بك {user.first_name}\n"
-            "━━━━━━━━━━━━━━━\n\n"
-            "🔍 *باحث الحديث* — اضغط الزر واكتب\n"
-            "📖 *باحث القرآن* — اضغط الزر واكتب\n\n"
-            "🤍 _إن نفعك البوت فادعُ للمطور بظهر الغيب_",
-            parse_mode="Markdown",
-            reply_markup=main_kb(is_admin)
-        )
+        await _send_welcome_photo(update, context, is_admin, is_new=False)
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -3431,8 +3453,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔍 تحقق من حديث","📖 باحث القرآن",
         "🎯 اختبر معلوماتك",
         "💰 دعم البوت","ℹ️ عن البوت",
-        "🕌 الأذكار","🔙 رجوع","⚙️ لوحة التحكم","❓ سؤال ديني",
-        "💬 التحدث مع راوي","🎙️ استمع للقرآن","🎯 اختبار القناة",
+        "🕌 الأذكار","🔙 رجوع","⚙️ لوحة التحكم",
+        "💬 تحدث مع راوي","🎙️ استمع للقرآن","📢 اختبار القناة",
         "🔙 خروج من راوي","🔙 خروج من الباحث",
     }
 
@@ -3440,15 +3462,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text in _KB_BTNS:
         for _k in ["quran_search_mode","hadith_search_mode","contact_dev_mode",
                    "waiting_one_manual_q","waiting_manual_questions","waiting_quiz_count",
-                   "waiting_channel_id"]:
+                   "waiting_channel_id","waiting_donation_amount"]:
             context.user_data.pop(_k, None)
         if text != "🌟 قدوتي اليوم":
             context.user_data["qudwati_waiting"] = False
-        if text != "❓ سؤال ديني":
-            context.user_data.pop("islamic_qa_mode", None)
-        if text != "💬 التحدث مع راوي":
+        context.user_data.pop("islamic_qa_mode", None)
+        if text != "💬 تحدث مع راوي":
             context.user_data.pop("waiting_for_rawi", None)
-        if text != "🎯 اختبار القناة":
+        if text != "📢 اختبار القناة":
             context.user_data.pop("creating_channel_quiz", None)
 
     # ===== الأدمن =====
@@ -3459,7 +3480,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== معالج راوي AI - المحادثة الشاملة =====
     # معالج راوي - تجاهل أزرار الخروج مباشرة في الشرط
-    if context.user_data.get("waiting_for_rawi") and text not in ["🔙 خروج من راوي", "🔙 خروج من الباحث"]:
+    if context.user_data.get("waiting_for_rawi") and text not in ["🔙 خروج من راوي", "🔙 خروج من الباحث", "💬 تحدث مع راوي"]:
         # رسالة انتظار
         wait_msg = await update.message.reply_text("💬 راوي يفكر في إجابتك...")
         
@@ -3489,23 +3510,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             count = int(text)
             if count < 5 or count > 20:
                 await update.message.reply_text("⚠️ العدد يجب أن يكون بين 5 و 20")
+                context.user_data["waiting_quiz_count"] = True
                 return
             
-            # اختيار أسئلة عشوائية متنوعة من بنك الأسئلة المتقدمة
-            questions = get_channel_quiz_questions(count)
-            
+            difficulty = context.user_data.get("quiz_difficulty", "مختلط")
+            questions = get_channel_quiz_questions(count, difficulty)
             context.user_data["quiz_questions"] = questions
-            context.user_data["waiting_channel_id"] = True
             
+            # اختيار وقت السؤال
+            time_kb = InlineKeyboardMarkup([
+                [colored_btn("⚡ 10 ثانية", callback_data="cq_time_10", style="danger"),
+                 colored_btn("⏱ 15 ثانية", callback_data="cq_time_15", style="primary")],
+                [colored_btn("🕐 20 ثانية", callback_data="cq_time_20", style="success"),
+                 colored_btn("🕑 30 ثانية", callback_data="cq_time_30", style="secondary")],
+            ])
             await update.message.reply_text(
-                f"✅ *تم اختيار {len(questions)} سؤال متقدم عشوائياً*\n\n"
-                "📢 الآن أرسل معرّف القناة:\n"
-                "`@my_channel` أو `-1001234567890`",
-                parse_mode="Markdown"
+                f"✅ *تم اختيار {len(questions)} سؤال* [{difficulty}]\n\n"
+                "⏱ *كم ثانية لكل سؤال؟*",
+                parse_mode="Markdown",
+                reply_markup=time_kb
             )
             
         except ValueError:
             await update.message.reply_text("⚠️ أرسل رقم صحيح من 5 إلى 20")
+            context.user_data["waiting_quiz_count"] = True
         return
     
     # معالج سؤال يدوي واحد (النظام الجديد)
@@ -3648,7 +3676,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get("waiting_channel_id"):
         context.user_data.pop("waiting_channel_id", None)
         
-        channel_id = text.strip()
+        # تحليل الرابط وتحويله إلى معرّف صالح
+        raw = text.strip()
+        # إزالة البادئات https://t.me/ أو t.me/
+        import re as _re
+        _m = _re.match(r'^(?:https?://)?t(?:elegram)?\.me/([^/\s]+)', raw, _re.IGNORECASE)
+        if _m:
+            channel_id = "@" + _m.group(1)
+        elif raw.lstrip("-").isdigit():
+            channel_id = raw  # رقم مباشر مثل -1001234567890
+        elif raw.startswith("@"):
+            channel_id = raw
+        else:
+            channel_id = "@" + raw  # نفترض أنه اسم مستخدم بدون @
+
         questions = context.user_data.get("quiz_questions", [])
         
         if not questions:
@@ -3657,11 +3698,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # نشر الاختبار
         try:
-            await publish_channel_quiz(context, channel_id, questions, user.id)
+            time_per_q = context.user_data.pop("quiz_time_per_q", 15)
+            difficulty = context.user_data.pop("quiz_difficulty", "مختلط")
+            await publish_channel_quiz(context, channel_id, questions, user.id, time_per_q=time_per_q, difficulty=difficulty)
+            diff_emoji = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(difficulty, "🎯")
             await update.message.reply_text(
-                f"✅ تم نشر الاختبار في القناة!\n\n"
-                f"📚 عدد الأسئلة: {len(questions)}\n"
-                f"📢 القناة: {channel_id}"
+                f"✅ *تم نشر الاختبار في القناة!*\n\n"
+                f"📚 الأسئلة: {len(questions)}\n"
+                f"{diff_emoji} الصعوبة: {difficulty}\n"
+                f"⏱ الوقت: {time_per_q} ثانية / سؤال\n"
+                f"📢 القناة: {channel_id}",
+                parse_mode="Markdown"
             )
         except Exception as e:
             logger.error(f"Error publishing quiz: {e}")
@@ -3914,7 +3961,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     
-    if text == "💬 التحدث مع راوي":
+    if text in ("💬 تحدث مع راوي", "💬 التحدث مع راوي"):
         if not GROQ_API_KEY:
             await update.message.reply_text(
                 "⚠️ ميزة التحدث مع راوي غير متوفرة حالياً.\n"
@@ -3926,20 +3973,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "💬 *أهلاً! أنا راوي* 🌙\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            "مساعدك الإسلامي الذكي — يُجيب على أسئلتك بعلم وأدب.\n\n"
-            "📌 *يمكنك أن تسألني عن:*\n"
-            "• الأحكام الشرعية والفقه\n"
-            "• السيرة النبوية والصحابة\n"
-            "• تفسير القرآن الكريم\n"
-            "• فضائل العبادات والأذكار\n"
-            "• كيفية استخدام ميزات البوت\n\n"
-            "✍️ _اكتب سؤالك الآن..._\n\n"
-            "🔙 للخروج اضغط زر _خروج من راوي_",
+            "مساعدك الذكي لبوت راوِي — هنا لمساعدتك!\n\n"
+            "🌟 *مميزات البوت:*\n"
+            "• 🔍 *تحقق من حديث* — ابحث وتحقق من صحة أي حديث\n"
+            "• 📖 *باحث القرآن* — ابحث في آيات القرآن الكريم\n"
+            "• 🤲 *دعاء اليوم* — دعاء مختار يومياً\n"
+            "• 🎯 *اختبر معلوماتك* — 10 أسئلة يومية تفاعلية\n"
+            "• 🌟 *قدوتي اليوم* — قصص الأنبياء والصحابة\n"
+            "• 🎙️ *استمع للقرآن* — تلاوات أشهر القراء\n"
+            "• 🎯 *اختبار القناة* — اختبار تفاعلي لقناتك\n\n"
+            "✍️ _اكتب سؤالك أو اطلب مساعدة..._\n\n"
+            "🔙 للخروج اضغط _خروج من راوي_",
             parse_mode="Markdown",
             reply_markup=rawi_kb()
         )
         
-        # تفعيل وضع الانتظار
         context.user_data["waiting_for_rawi"] = True
         return
     
@@ -3967,51 +4015,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
     
-    if text == "❓ سؤال ديني":
-        for _k in ["quran_search_mode","hadith_search_mode","qudwati_waiting"]:
-            context.user_data.pop(_k, None)
-        can_ask, remaining, is_free = can_ask_question(user.id)
-        if can_ask:
-            # فحص rate limit
-            if not qa_rate_limiter.is_allowed(user.id):
-                await update.message.reply_text(
-                    "⏳ الرجاء الانتظار قليلاً قبل إرسال سؤال آخر\n"
-                    "الحد الأقصى: 5 أسئلة في الدقيقة"
-                )
-                return
-        
-            context.user_data["islamic_qa_mode"] = True
-            used = get_qa_usage(user.id)["count"]
-            # رسالة واضحة
-            if used == 0:
-                status_line = f"لديك {QA_FREE_DAILY} أسئلة مجانية اليوم 🆓"
-            elif remaining > 0:
-                status_line = f"متبقي {remaining} سؤال من أصل {QA_FREE_DAILY} اليوم"
-            else:
-                status_line = f"متبقي {remaining} سؤال (إضافي مدفوع)"
-
-            await update.message.reply_text(
-                f"❓ *سؤال ديني*\n"
-                "━━━━━━━━━━━━━━━\n\n"
-                f"📊 {status_line}\n\n"
-                "اكتب سؤالك الديني وسأجيبك من مصادر أهل السنة 👇\n\n"
-                "_مثال: ما حكم صيام يوم السبت منفرداً؟_",
-                parse_mode="Markdown"
-            )
-        else:
-            await update.message.reply_text(
-                "❓ *سؤال ديني*\n"
-                "━━━━━━━━━━━━━━━\n\n"
-                f"⚠️ استنفدت أسئلتك المجانية اليوم ({QA_FREE_DAILY}/{QA_FREE_DAILY})\n\n"
-                f"يتجدد رصيدك غداً صباحاً 🌅\n\n"
-                f"أو أضف {QA_EXTRA_STARS} نجوم للحصول على 5 أسئلة إضافية 👇",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    colored_btn(f"⭐ {QA_EXTRA_STARS} نجوم ← 5 أسئلة", callback_data="qa_buy", style="success")
-                ]])
-            )
-        return
-
     if text == "🎙️ استمع للقرآن":
         for _k in ["hadith_search_mode","quran_search_mode","islamic_qa_mode"]:
             context.user_data.pop(_k, None)
@@ -4077,18 +4080,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await donate_command(update, context)
         return
     
-    if text == "🎯 اختبار القناة":
+    if text == "📢 اختبار القناة":
         keyboard = [
-            [colored_btn("📚 أسئلة جاهزة من البوت", callback_data="cq_ready", style="primary")],
-            [colored_btn("✍️ كتابة أسئلة يدوية", callback_data="cq_manual", style="secondary")],
+            [colored_btn("🟢 سهل", callback_data="cq_diff_سهل", style="success"),
+             colored_btn("🟡 متوسط", callback_data="cq_diff_متوسط", style="primary")],
+            [colored_btn("🔴 صعب", callback_data="cq_diff_صعب", style="danger"),
+             colored_btn("🎲 مختلط", callback_data="cq_diff_مختلط", style="secondary")],
+            [colored_btn("✍️ أسئلة يدوية", callback_data="cq_manual", style="secondary")],
             [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
         ]
         
         await update.message.reply_text(
             "🎯 *إنشاء اختبار في القناة*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "📌 *ملاحظة:* فقط مشرفو القناة يستطيعون بدء الاختبار.\n\n"
-            "اختر نوع الأسئلة:",
+            "📌 البوت يجب أن يكون *مشرفاً* في القناة\n\n"
+            "اختر مستوى الصعوبة:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -4096,9 +4102,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["creating_channel_quiz"] = True
         return
     
-    if text in ["⭐ 1 نجمة", "⭐ 5 نجوم", "⭐ 10 نجوم", "⭐ 25 نجمة", "⭐ 50 نجمة"]:
-        if await handle_donation_choice(update, context):
-            return
+    # معالج مبلغ التبرع المكتوب
+    if context.user_data.get("waiting_donation_amount"):
+        context.user_data.pop("waiting_donation_amount", None)
+        try:
+            amount = int(text.strip())
+            if amount < 1:
+                await update.message.reply_text(
+                    "⚠️ الحد الأدنى للتبرع هو نجمة واحدة ⭐",
+                    reply_markup=main_kb(is_admin)
+                )
+                return
+            if amount > 2500:
+                await update.message.reply_text(
+                    "⚠️ الحد الأقصى للتبرع هو 2500 نجمة.\nأرسل عدداً بين 1 و 2500.",
+                    reply_markup=main_kb(is_admin)
+                )
+                return
+            await send_donation_invoice(update, context, amount)
+        except ValueError:
+            await update.message.reply_text(
+                "⚠️ يرجى إرسال رقم صحيح فقط.\nمثال: اكتب `50` للتبرع بـ 50 نجمة.",
+                parse_mode="Markdown",
+                reply_markup=main_kb(is_admin)
+            )
+        return
     if text == "🔙 رجوع":
         with sqlite3.connect("bot.db") as _c3:
             _row3 = _c3.execute("SELECT daily_hadith, adhkar_sub FROM users WHERE user_id=?", (user.id,)).fetchone()
@@ -4143,7 +4171,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # معالج قدوتي — فقط لو لا يوجد وضع نص آخر نشط
     _active_mode = (
-        context.user_data.get("islamic_qa_mode") or
         context.user_data.get("quran_search_mode") or
         context.user_data.get("hadith_search_mode")
     )
@@ -4184,58 +4211,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ الإجابة الصحيحة:\n{correct_answer}",
                 parse_mode="Markdown"
             )
-        return
-
-    # معالج السؤال الديني
-    if context.user_data.get("islamic_qa_mode") and text and text not in _KB_BTNS and not text.startswith("/"):
-        context.user_data["islamic_qa_mode"] = False
-        # تحقق من الرصيد
-        can_ask, remaining, _ = can_ask_question(user.id)
-        if not can_ask:
-            await update.message.reply_text(
-                f"⚠️ *انتهت أسئلتك اليوم!*\n\n"
-                f"استخدمت {QA_FREE_DAILY}/{QA_FREE_DAILY} أسئلة مجانية.\n"
-                f"يتجدد رصيدك غداً 🌅\n\n"
-                f"أو ادفع {QA_EXTRA_STARS} نجوم للحصول على 5 أسئلة إضافية 👇",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[
-                    colored_btn(f"⭐ {QA_EXTRA_STARS} نجوم ← 5 أسئلة", callback_data="qa_buy", style="success")
-                ]])
-            )
-            return
-        # خصم سؤال أولاً
-        increment_qa_usage(user.id)
-        _, remaining_after, _ = can_ask_question(user.id)
-        wait = await update.message.reply_text(f"⏳ جاري البحث... (متبقي: {remaining_after} سؤال)")
-        system = (
-            "أنت عالم إسلامي على منهج أهل السنة والجماعة. "
-            "أجب بشكل واضح مختصر لا يتجاوز 300 كلمة مع ذكر المصدر. "
-            "إذا كان السؤال خارج الدين اعتذر بلطف. أجب بالعربية فقط."
-        )
-        answer = await call_gemini(f"{system}\n\nالسؤال: {text}")
-        # لو فشل الـ API أعِد الخصم
-        if answer.startswith("⚠️"):
-            decrement_qa_usage(user.id)
-            remaining_after = remaining
-        try:
-            await wait.delete()
-        except Exception:
-            pass
-        rows = []
-        if remaining_after > 0:
-            rows.append([colored_btn(f"❓ سؤال آخر ({remaining_after} متبقٍ)", callback_data="qa_new", style="primary")])
-        else:
-            rows.append([colored_btn(f"⭐ {QA_EXTRA_STARS} نجوم ← 5 أسئلة إضافية", callback_data="qa_buy", style="success")])
-        rows.append([colored_btn("📋 سجل أسئلتي", callback_data="qa_history", style="primary")])
-        await update.message.reply_text(
-            f"❓ *{text}*\n"
-            "━━━━━━━━━━━━━━━\n\n"
-            f"{answer}\n\n"
-            "━━━━━━━━━━━━━━━\n"
-            "_⚠️ للتحقق راجع أهل العلم_",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(rows)
-        )
         return
 
     # ===== معالج البحث القرآني =====
@@ -6160,7 +6135,8 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.message.reply_text(full_text, parse_mode="Markdown")
 
     # ===== اختبار القناة =====
-    elif q.data in ("cq_ready", "cq_manual", "cq_cancel", "cq_add_more", "cq_finish_manual"):
+    elif q.data in ("cq_ready", "cq_manual", "cq_cancel", "cq_add_more", "cq_finish_manual") or \
+         q.data.startswith("cq_diff_") or q.data.startswith("cq_time_"):
         await handle_quiz_type_selection(update, context)
         return
 
@@ -6576,17 +6552,54 @@ async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAU
     await query.answer()
     
     data = query.data
-    
-    if data == "cq_ready":
+
+    # معالج اختيار الصعوبة
+    if data.startswith("cq_diff_"):
+        difficulty = data.replace("cq_diff_", "")
+        context.user_data["quiz_difficulty"] = difficulty
+        context.user_data["quiz_type"] = "ready"
+        context.user_data["waiting_quiz_count"] = True
+        diff_emoji = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(difficulty, "🎯")
         await query.edit_message_text(
-            "📚 *أسئلة جاهزة من البوت*\n"
+            f"*{diff_emoji} مستوى الصعوبة: {difficulty}*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "كم عدد الأسئلة تريد؟\n"
             "أرسل رقماً من *5* إلى *20*:",
             parse_mode="Markdown"
         )
+        return
+
+    # معالج اختيار وقت كل سؤال
+    if data.startswith("cq_time_"):
+        time_per_q = int(data.replace("cq_time_", ""))
+        context.user_data["quiz_time_per_q"] = time_per_q
+        await query.edit_message_text(
+            f"✅ *وقت كل سؤال: {time_per_q} ثانية*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "📢 أرسل رابط القناة أو معرّفها:\n"
+            "`@my_channel` أو `-1001234567890`",
+            parse_mode="Markdown"
+        )
+        context.user_data["waiting_channel_id"] = True
+        return
+
+    if data == "cq_ready":
+        keyboard = [
+            [colored_btn("🟢 سهل", callback_data="cq_diff_سهل", style="success"),
+             colored_btn("🟡 متوسط", callback_data="cq_diff_متوسط", style="primary")],
+            [colored_btn("🔴 صعب", callback_data="cq_diff_صعب", style="danger"),
+             colored_btn("🎲 مختلط", callback_data="cq_diff_مختلط", style="secondary")],
+            [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
+        ]
+        await query.edit_message_text(
+            "📚 *أسئلة جاهزة من البوت*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "اختر مستوى الصعوبة:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
         context.user_data["quiz_type"] = "ready"
-        context.user_data["waiting_quiz_count"] = True
+        return
         
     elif data == "cq_manual":
         context.user_data["quiz_type"] = "manual"
@@ -6653,21 +6666,21 @@ async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAU
 # دالة: نشر الاختبار في القناة
 # ═══════════════════════════════════════════════════════════════════
 
-async def publish_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, questions: list, admin_id: int):
+async def publish_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, questions: list, admin_id: int, time_per_q: int = 15, difficulty: str = "مختلط"):
     """
     نشر الاختبار في القناة
     """
-    # نستخدم - بدلاً من _ حتى لا يتعارض مع parsing الـ callback_data
     quiz_id = f"cq-{int(datetime.now().timestamp())}"
-    
     CHANNEL_QUIZ_PARTICIPANTS[quiz_id] = {}
+    diff_emoji = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(difficulty, "🎯")
     
     # رسالة الإعلان
     announce_text = (
         "🕌 *اختبار إسلامي جديد!*\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"📚 *الأسئلة:* {len(questions)} سؤال متقدم\n"
-        f"⏱️ *الوقت:* 15 ثانية لكل سؤال\n"
+        f"📚 *الأسئلة:* {len(questions)} سؤال\n"
+        f"{diff_emoji} *الصعوبة:* {difficulty}\n"
+        f"⏱️ *الوقت:* {time_per_q} ثانية لكل سؤال\n"
         f"❤️ *الأرواح:* 3 (3 أخطاء = خروج)\n"
         f"🏆 *الفائز:* أعلى نقاط بأقل أخطاء\n\n"
         f"👥 *المنضمون:* 0\n\n"
@@ -6699,7 +6712,9 @@ async def publish_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: s
         "admin_id": admin_id,
         "status": "waiting",
         "started_at": None,
-        "message_id": msg.message_id
+        "message_id": msg.message_id,
+        "time_per_q": time_per_q,
+        "difficulty": difficulty,
     }
 
 
@@ -6710,46 +6725,117 @@ async def publish_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: s
 async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج انضمام المستخدم للاختبار"""
     query = update.callback_query
-    
+    # لا نجيب هنا — نجيب داخل كل فرع حسب الحالة
+
     quiz_id = query.data.replace("cqj_", "")
     user_id = query.from_user.id
     user_name = query.from_user.first_name or "مشارك"
-    
-    # التحقق من أن الاختبار موجود
-    if quiz_id not in CHANNEL_QUIZ_PARTICIPANTS:
-        await query.answer("⚠️ الاختبار غير موجود أو انتهى!", show_alert=True)
+    is_inline = query.message is None   # رسالة inline → message=None
+
+    # ─── وضع Inline ───────────────────────────────────────────────
+    if is_inline:
+        inline_msg_id = query.inline_message_id
+
+        # إذا لم يكن الاختبار نشطاً بعد، ننقله من المعلّقة → النشطة
+        if quiz_id not in ACTIVE_INLINE_QUIZZES:
+            pending = PENDING_INLINE_QUIZZES.get(quiz_id)
+            if not pending:
+                await query.answer("⚠️ الاختبار غير موجود أو انتهى!", show_alert=True)
+                return
+            pending["inline_message_id"] = inline_msg_id
+            PENDING_INLINE_QUIZZES.pop(quiz_id, None)
+            CHANNEL_QUIZ_PARTICIPANTS[quiz_id] = {}
+            ACTIVE_INLINE_QUIZZES[quiz_id] = {
+                "quiz_id": quiz_id,
+                "questions": pending["questions"],
+                "current_question": 0,
+                "admin_id": user_id,
+                "status": "waiting",
+                "started_at": None,
+                "inline_message_id": inline_msg_id,
+                "time_per_q": pending.get("time_per_q", 15),
+                "difficulty": pending.get("difficulty", "مختلط"),
+            }
+
+        quiz_data = ACTIVE_INLINE_QUIZZES[quiz_id]
+        if quiz_data["status"] != "waiting":
+            await query.answer("⚠️ الاختبار بدأ بالفعل!", show_alert=True)
+            return
+
+        if user_id not in CHANNEL_QUIZ_PARTICIPANTS[quiz_id]:
+            CHANNEL_QUIZ_PARTICIPANTS[quiz_id][user_id] = {
+                "name": user_name, "lives": 3, "score": 0,
+                "answered": [], "active": True, "correct": 0, "wrong": 0
+            }
+            await query.answer(f"✅ تم تسجيلك! أهلاً {user_name} 🎉", show_alert=True)
+        else:
+            await query.answer("✅ أنت مسجل بالفعل في الاختبار!", show_alert=True)
+            return
+
+        # تحديث الرسالة لعرض المشاركين
+        count = len(CHANNEL_QUIZ_PARTICIPANTS[quiz_id])
+        names_list = "\n".join(
+            f"   {'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else '👤'} {p['name']}"
+            for i, p in enumerate(list(CHANNEL_QUIZ_PARTICIPANTS[quiz_id].values())[:6])
+        )
+        if count > 6:
+            names_list += f"\n   ➕ و{count - 6} آخرين"
+        _tpq = quiz_data.get("time_per_q", 15)
+        _diff = quiz_data.get("difficulty", "مختلط")
+        _de = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(_diff, "🎯")
+        text = (
+            "🕌 *اختبار إسلامي جديد!*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📚 *الأسئلة:* {len(quiz_data['questions'])} سؤال\n"
+            f"{_de} *الصعوبة:* {_diff}\n"
+            f"⏱️ *الوقت:* {_tpq} ثانية لكل سؤال\n"
+            f"❤️ *الأرواح:* 3 (3 أخطاء = خروج)\n\n"
+            f"👥 *المنضمون: {count}*\n"
+            f"{names_list}\n\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "✅ اضغط *انضم* للمشاركة\n"
+            "▶️ *مشرف القناة* يبدأ الاختبار"
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ انضم للاختبار", callback_data=f"cqj_{quiz_id}")],
+            [InlineKeyboardButton("▶️ بدء الاختبار", callback_data=f"cqs_{quiz_id}")]
+        ])
+        try:
+            await context.bot.edit_message_text(
+                inline_message_id=inline_msg_id,
+                text=text,
+                parse_mode="Markdown",
+                reply_markup=kb
+            )
+        except Exception:
+            pass
         return
-    
-    # التحقق من أن الاختبار لم يبدأ
+
+    # ─── وضع قناة عادي ────────────────────────────────────────────
     channel_id = str(query.message.chat.id)
     quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id)
-    
+
     if not quiz_data:
         await query.answer("⚠️ الاختبار غير موجود!", show_alert=True)
         return
-    
+
+    if quiz_id not in CHANNEL_QUIZ_PARTICIPANTS:
+        await query.answer("⚠️ الاختبار غير موجود أو انتهى!", show_alert=True)
+        return
+
     if quiz_data["status"] != "waiting":
         await query.answer("⚠️ الاختبار بدأ بالفعل، لا يمكن الانضمام الآن!", show_alert=True)
         return
-    
-    # تسجيل المشارك (حتى لو لم يسجل في البوت من قبل)
+
+    # تسجيل المشارك
     if user_id not in CHANNEL_QUIZ_PARTICIPANTS[quiz_id]:
         CHANNEL_QUIZ_PARTICIPANTS[quiz_id][user_id] = {
-            "name": user_name,
-            "lives": 3,
-            "score": 0,
-            "answered": [],
-            "active": True,
-            "correct": 0,
-            "wrong": 0
+            "name": user_name, "lives": 3, "score": 0,
+            "answered": [], "active": True, "correct": 0, "wrong": 0
         }
-        
         await query.answer(f"✅ تم تسجيلك! أهلاً {user_name} 🎉", show_alert=True)
-        
-        # تحديث عدد المشاركين في الرسالة
-        count = len(CHANNEL_QUIZ_PARTICIPANTS[quiz_id])
 
-        # بناء قائمة الأسماء
+        count = len(CHANNEL_QUIZ_PARTICIPANTS[quiz_id])
         names_list = "\n".join(
             f"   {'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else '👤'} {p['name']}"
             for i, p in enumerate(list(CHANNEL_QUIZ_PARTICIPANTS[quiz_id].values())[:6])
@@ -6757,11 +6843,15 @@ async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if count > 6:
             names_list += f"\n   ➕ و{count - 6} آخرين"
 
+        _tpq = quiz_data.get('time_per_q', 15)
+        _diff = quiz_data.get('difficulty', 'مختلط')
+        _diff_emoji = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(_diff, "🎯")
         text = (
             "🕌 *اختبار إسلامي جديد!*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📚 *الأسئلة:* {len(quiz_data['questions'])} سؤال متقدم\n"
-            f"⏱️ *الوقت:* 15 ثانية لكل سؤال\n"
+            f"📚 *الأسئلة:* {len(quiz_data['questions'])} سؤال\n"
+            f"{_diff_emoji} *الصعوبة:* {_diff}\n"
+            f"⏱️ *الوقت:* {_tpq} ثانية لكل سؤال\n"
             f"❤️ *الأرواح:* 3 (3 أخطاء = خروج)\n"
             f"🏆 *الفائز:* أعلى نقاط بأقل أخطاء\n\n"
             f"👥 *المنضمون: {count}*\n"
@@ -6770,7 +6860,6 @@ async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "✅ اضغط *انضم* للمشاركة\n"
             "▶️ *مشرف القناة* يبدأ الاختبار"
         )
-        
         try:
             await query.edit_message_text(
                 text,
@@ -6790,74 +6879,109 @@ async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """معالج بدء الاختبار - لأدمن القناة فقط"""
     query = update.callback_query
-    # يجب الرد على callback فوراً لتجنب timeout
-    await query.answer()
+    # لا نجيب هنا — نجيب داخل كل فرع
 
     user_id = query.from_user.id
-    channel_id = str(query.message.chat.id)
+    quiz_id = query.data.replace("cqs_", "")
+    is_inline = query.message is None
 
+    # ─── وضع Inline ───────────────────────────────────────────────
+    if is_inline:
+        inline_msg_id = query.inline_message_id
+
+        # إذا لم يكن نشطاً بعد، ننقله من المعلّقة
+        if quiz_id not in ACTIVE_INLINE_QUIZZES:
+            pending = PENDING_INLINE_QUIZZES.get(quiz_id)
+            if not pending:
+                await query.answer("⚠️ الاختبار غير موجود أو انتهى!", show_alert=True)
+                return
+            pending["inline_message_id"] = inline_msg_id
+            PENDING_INLINE_QUIZZES.pop(quiz_id, None)
+            CHANNEL_QUIZ_PARTICIPANTS[quiz_id] = {}
+            ACTIVE_INLINE_QUIZZES[quiz_id] = {
+                "quiz_id": quiz_id,
+                "questions": pending["questions"],
+                "current_question": 0,
+                "admin_id": user_id,
+                "status": "waiting",
+                "started_at": None,
+                "inline_message_id": inline_msg_id,
+                "time_per_q": pending.get("time_per_q", 15),
+                "difficulty": pending.get("difficulty", "مختلط"),
+            }
+
+        quiz_data = ACTIVE_INLINE_QUIZZES[quiz_id]
+        if quiz_data["status"] != "waiting":
+            await query.answer("⚠️ الاختبار بدأ بالفعل!", show_alert=True)
+            return
+
+        if quiz_id not in CHANNEL_QUIZ_PARTICIPANTS:
+            CHANNEL_QUIZ_PARTICIPANTS[quiz_id] = {}
+        participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+        # سجّل المشغّل تلقائياً إن لم يكن أحد انضم
+        if len(participants) == 0:
+            user_name = query.from_user.first_name or "مشارك"
+            participants[user_id] = {"name": user_name, "score": 0, "answers": 0}
+
+        # شغّل الاختبار inline مباشرة
+        await query.answer("✅ يبدأ الاختبار الآن!", show_alert=False)
+        asyncio.create_task(run_inline_quiz(context, quiz_id))
+        return
+
+    # ─── وضع قناة عادي ────────────────────────────────────────────
+    channel_id = str(query.message.chat.id)
     quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id)
 
     if not quiz_data:
-        await context.bot.send_message(
-            chat_id=channel_id,
-            text="⚠️ الاختبار غير موجود أو انتهى!"
-        )
+        await query.answer("⚠️ الاختبار غير موجود أو انتهى!", show_alert=True)
         return
-
-    quiz_id = quiz_data["quiz_id"]
 
     if quiz_data["status"] != "waiting":
-        await context.bot.send_message(
-            chat_id=channel_id,
-            text="⚠️ الاختبار بدأ بالفعل!"
-        )
+        await query.answer("⚠️ الاختبار بدأ بالفعل!", show_alert=True)
         return
 
-    # التحقق من صلاحية البدء: أدمن القناة أو منشئ الاختبار أو أدمن البوت
-    is_authorized = False
+    await query.answer()  # إزالة مؤشر التحميل
 
-    # محاولة فحص صلاحية أدمن القناة
+    # التحقق من الصلاحية
+    is_authorized = False
     try:
         member = await context.bot.get_chat_member(channel_id, user_id)
         if member.status in ('creator', 'administrator'):
             is_authorized = True
     except Exception as e:
         logger.warning(f"get_chat_member failed for start btn: {e}")
-
-    # fallback: منشئ الاختبار أو أدمن البوت
     if not is_authorized:
         if user_id == quiz_data.get("admin_id") or user_id in ADMIN_IDS:
             is_authorized = True
-
     if not is_authorized:
-        await context.bot.send_message(
-            chat_id=query.from_user.id,
-            text="⚠️ فقط مشرفو القناة يستطيعون بدء الاختبار!"
-        )
+        try:
+            await context.bot.send_message(chat_id=user_id, text="⚠️ فقط مشرفو القناة يستطيعون بدء الاختبار!")
+        except Exception:
+            pass
         return
 
-    # التحقق من وجود مشاركين
-    participants = CHANNEL_QUIZ_PARTICIPANTS.get(quiz_id, {})
+    # استخدم quiz_id من quiz_data للتأكد من التطابق
+    stored_quiz_id = quiz_data.get("quiz_id", quiz_id)
+    if stored_quiz_id not in CHANNEL_QUIZ_PARTICIPANTS:
+        CHANNEL_QUIZ_PARTICIPANTS[stored_quiz_id] = {}
+    participants = CHANNEL_QUIZ_PARTICIPANTS[stored_quiz_id]
+    # سجّل الضاغط على بدء تلقائياً إن لم يكن أحد انضم
     if len(participants) == 0:
-        await context.bot.send_message(
-            chat_id=channel_id,
-            text="⚠️ لا يوجد مشاركون بعد!\nاضغط *انضم* أولاً ثم ابدأ الاختبار.",
-            parse_mode="Markdown"
-        )
-        return
+        user_name = query.from_user.first_name or "مشارك"
+        participants[user_id] = {"name": user_name, "score": 0, "answers": 0}
+    quiz_id = stored_quiz_id  # تزامن المفتاح
 
-    # تحديث الحالة
     quiz_data["status"] = "active"
     quiz_data["started_at"] = datetime.now()
 
-    # حذف رسالة الإعلان
     try:
         await query.message.delete()
     except Exception:
         pass
 
-    # رسالة الانطلاق مع جماليات
+    _tpq = quiz_data.get("time_per_q", 15)
+    _diff = quiz_data.get("difficulty", "مختلط")
+    _de = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(_diff, "🎯")
     names_list = "\n".join(
         f"   {'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else '👤'} {p['name']}"
         for i, p in enumerate(list(participants.values())[:8])
@@ -6873,14 +6997,14 @@ async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👥 *المشاركون ({len(participants)}):*\n"
             f"{names_list}\n\n"
             f"📚 *عدد الأسئلة:* {len(quiz_data['questions'])}\n"
-            f"⏱️ *الوقت:* 15 ثانية لكل سؤال\n"
+            f"{_de} *الصعوبة:* {_diff}\n"
+            f"⏱️ *الوقت:* {_tpq} ثانية لكل سؤال\n"
             f"❤️ *الأرواح:* 3 أخطاء = خروج\n\n"
             "3️⃣ ... 2️⃣ ... 1️⃣ ... 🎯 *ابدأ!*"
         ),
         parse_mode="Markdown"
     )
 
-    # تأخير 3 ثوان ثم بدء الأسئلة
     await asyncio.sleep(3)
     asyncio.create_task(run_channel_quiz(context, channel_id, quiz_id))
 
@@ -6896,11 +7020,16 @@ async def run_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, 
     quiz_data = ACTIVE_CHANNEL_QUIZZES[channel_id]
     questions = quiz_data["questions"]
     participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+    time_per_q = quiz_data.get("time_per_q", 15)
+    difficulty = quiz_data.get("difficulty", "مختلط")
+    diff_emoji = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(difficulty, "🎯")
     labels = ['🔴 أ', '🔵 ب', '🟢 ج', '🟡 د']
     timer_bar = ["🟩🟩🟩🟩🟩", "🟩🟩🟩🟩⬜", "🟩🟩🟩⬜⬜", "🟩🟩⬜⬜⬜", "🟩⬜⬜⬜⬜", "🟥⬜⬜⬜⬜"]
     
     for idx, q in enumerate(questions):
         quiz_data["current_question"] = idx
+        category = q.get("category", "")
+        category_line = f"🏷️ {category}\n" if category else ""
         
         # إعداد نص السؤال
         opts_text = "\n".join(
@@ -6908,10 +7037,12 @@ async def run_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, 
         )
         text = (
             f"❓ *السؤال {idx + 1} من {len(questions)}*\n"
-            f"══════════════════════\n\n"
+            f"══════════════════════\n"
+            f"{category_line}"
+            f"{diff_emoji} {difficulty}\n\n"
             f"📌 {q['q']}\n\n"
             f"{opts_text}\n\n"
-            f"⏱️ {timer_bar[0]}  15 ثانية"
+            f"⏱️ {timer_bar[0]}  {time_per_q} ثانية"
         )
         
         keyboard = []
@@ -6935,7 +7066,7 @@ async def run_channel_quiz(context: ContextTypes.DEFAULT_TYPE, channel_id: str, 
         quiz_data["current_message_id"] = msg.message_id
         
         # انتظار الإجابات مع تحديث العداد
-        await wait_for_answers(context, channel_id, quiz_id, idx, 15, msg)
+        await wait_for_answers(context, channel_id, quiz_id, idx, time_per_q, msg)
         
         # كشف الإجابة الصحيحة
         correct = q["answer"]
@@ -7103,9 +7234,12 @@ async def handle_quiz_answer(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await query.answer("⚠️ أنت خرجت من الاختبار (نفدت الأرواح)!", show_alert=True)
         return
     
-    # الحصول على السؤال
-    channel_id = str(query.message.chat.id)
-    quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id)
+    # الحصول على السؤال — دعم الوضعين (inline وعادي)
+    if query.message is None:
+        quiz_data = ACTIVE_INLINE_QUIZZES.get(quiz_id)
+    else:
+        channel_id = str(query.message.chat.id)
+        quiz_data = ACTIVE_CHANNEL_QUIZZES.get(channel_id)
     if not quiz_data:
         await query.answer("⚠️ انتهى الاختبار!", show_alert=True)
         return
@@ -7353,6 +7487,7 @@ def main():
 
     # Inline Mode — للمشاركة بزر شفاف
     app.add_handler(InlineQueryHandler(handle_inline_query))
+    app.add_handler(ChosenInlineResultHandler(handle_chosen_inline_result))
 
     # معالجات الدفع
     app.add_handler(PreCheckoutQueryHandler(precheckout_callback))
@@ -7578,81 +7713,49 @@ def get_page_audio_url(page_num: int, page_id: str) -> str:
     """رابط صوت صفحة كاملة من everyayah.com — PageNNN.mp3"""
     return f"https://everyayah.com/data/{page_id}/PageMp3s/Page{page_num:03d}.mp3"
 
+def strip_arabic_diacritics(text: str) -> str:
+    """إزالة التشكيل والحركات العربية للبحث الأدق"""
+    import re as _re_d
+    return _re_d.sub(r'[\u064B-\u065F\u0670\u0640]', '', text).strip()
+
 async def fetch_quran_search(query: str) -> list:
     """
-    بحث محسّن في القرآن - يدعم عدة صيغ:
-    1. نص الآية فقط
-    2. نص الآية مع السورة والرقم
-    3. سورة:آية (مثل: محمد:7)
+    بحث في القرآن الكريم بنص الآية:
+    - يزيل التشكيل من الاستعلام لمطابقة أدق
+    - يبحث في نسخة ar.simple (بدون تشكيل)
+    - يجلب النص الكامل بالتشكيل من fetch_ayah_by_ref
     """
     try:
-        # تنظيف النص من علامات الآيات والزخرفة
         clean_query = query.strip()
-        clean_query = clean_query.replace('﴿', '').replace('﴾', '')
-        clean_query = clean_query.replace('﴾', '').replace('﴿', '')
-        clean_query = clean_query.strip()
-        
-        # فحص إذا في صيغة "سورة:آية" أو "— سورة X، الآية Y"
-        surah_name = None
-        ayah_number = None
-        
-        # نمط: "— سورة محمد، الآية 7"
-        pattern1 = r'—\s*سورة\s+(\w+)،?\s*الآية\s+(\d+)'
-        match1 = re.search(pattern1, clean_query)
-        if match1:
-            surah_name = match1.group(1)
-            ayah_number = int(match1.group(2))
-            # حذف هذا الجزء من النص
-            clean_query = re.sub(pattern1, '', clean_query).strip()
-        
-        # نمط: "محمد:7" أو "محمد : 7"
-        pattern2 = r'(\w+)\s*:\s*(\d+)'
-        match2 = re.search(pattern2, clean_query)
-        if match2 and not match1:
-            surah_name = match2.group(1)
-            ayah_number = int(match2.group(2))
-            # استخدم هذا للبحث المباشر
-            clean_query = ""
-        
+        clean_query = clean_query.replace('﴿', '').replace('﴾', '').strip()
+        # إزالة التشكيل للمطابقة الأدق
+        search_query = strip_arabic_diacritics(clean_query)
+        if not search_query:
+            return []
+
         results = []
-        
-        # إذا عندنا سورة ورقم، ابحث مباشرة
-        if surah_name and ayah_number:
-            # البحث في القرآن بالسورة والرقم
-            url = f"https://api.alquran.cloud/v1/ayah/{surah_name}:{ayah_number}/ar.alafasy"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get('code') == 200:
-                            ayah_data = data['data']
-                            results.append({
-                                'text': ayah_data['text'],
-                                'surah': ayah_data['surah']['name'],
-                                'number': ayah_data['numberInSurah'],
-                                'surah_number': ayah_data['surah']['number']
-                            })
-                            return results
-        
-        # بحث عادي في النص
-        if clean_query:
-            # استخدام API بحث القرآن
-            search_url = f"https://api.alquran.cloud/v1/search/{urllib.parse.quote(clean_query)}/all/ar"
-            async with aiohttp.ClientSession() as session:
-                async with session.get(search_url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        if data.get('code') == 200 and 'matches' in data['data']:
-                            for match in data['data']['matches'][:10]:
-                                results.append({
-                                    'text': match['text'],
-                                    'surah': match['surah']['name'],
-                                    'number': match['numberInSurah'],
-                                    'surah_number': match['surah']['number']
-                                })
-        
+        # البحث في النسخة البسيطة (بدون تشكيل) — يعطي نتائج أفضل
+        search_url = (
+            f"https://api.alquran.cloud/v1/search/"
+            f"{urllib.parse.quote(search_query)}/all/ar.simple"
+        )
+        async with aiohttp.ClientSession() as session:
+            async with session.get(search_url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if (data.get('code') == 200
+                            and 'data' in data
+                            and 'matches' in data['data']):
+                        matches = data['data']['matches'][:5]
+                        for match in matches:
+                            s_num = match['surah']['number']
+                            a_num = match['numberInSurah']
+                            # جلب النص الكامل مع التشكيل بنفس صيغة fetch_ayah_by_ref
+                            full = await fetch_ayah_by_ref(s_num, a_num)
+                            if full:
+                                results.append(full)
         return results
-        
+
     except Exception as e:
         logger.error(f"Error in fetch_quran_search: {e}")
         return []
@@ -8290,6 +8393,67 @@ async def handle_inline_query(update, context):
             reply_markup=kb,
         ))
 
+    # ===== اختبار القناة inline =====
+    elif q_data == "" or q_data.startswith("quiz"):
+        # نقدّم 4 خيارات اختبار بمستويات مختلفة
+        for diff, emoji, desc in [
+            ("سهل",    "🟢", "7 أسئلة سهلة للمبتدئين"),
+            ("متوسط",  "🟡", "7 أسئلة متوسطة الصعوبة"),
+            ("صعب",    "🔴", "7 أسئلة صعبة للمتمكنين"),
+            ("مختلط",  "🎲", "7 أسئلة متنوعة المستويات"),
+        ]:
+            q_id = f"cq-{diff}-{int(datetime.now().timestamp())}"
+            questions = get_channel_quiz_questions(7, diff)
+            PENDING_INLINE_QUIZZES[q_id] = {
+                "questions": questions,
+                "time_per_q": 15,
+                "difficulty": diff,
+            }
+            diff_txt = (
+                f"🕌 *اختبار إسلامي — {emoji} {diff}*\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📚 *الأسئلة:* 7 أسئلة\n"
+                f"{emoji} *الصعوبة:* {diff}\n"
+                f"⏱️ *الوقت:* 15 ثانية لكل سؤال\n"
+                f"❤️ *الأرواح:* 3 أخطاء = خروج\n\n"
+                f"👥 *المنضمون:* 0\n\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                "✅ اضغط *انضم* للمشاركة\n"
+                "▶️ *مشرف القناة* يبدأ الاختبار"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ انضم للاختبار", callback_data=f"cqj_{q_id}")],
+                [InlineKeyboardButton("▶️ بدء الاختبار", callback_data=f"cqs_{q_id}")]
+            ])
+            results.append(InlineQueryResultArticle(
+                id=q_id,
+                title=f"{emoji} اختبار {diff} — 7 أسئلة",
+                description=desc,
+                input_message_content=InputTextMessageContent(
+                    message_text=diff_txt,
+                    parse_mode="Markdown"
+                ),
+                reply_markup=kb,
+            ))
+        # أضف خيار المشاركة العامة أيضاً
+        msg_text = (
+            "🌙 بوت راوِي للأحاديث النبوية\n\n"
+            "• تحقق من صحة الأحاديث\n"
+            "• اختبر معلوماتك يومياً\n"
+            "• قصص الأنبياء والصحابة كل يوم\n"
+            "• أدعية من القرآن والسنة"
+        )
+        kb = InlineKeyboardMarkup([[
+            colored_btn("📲 افتح راوِي", url=bot_link, style="primary")
+        ]])
+        results.append(InlineQueryResultArticle(
+            id="share_bot",
+            title="📤 شارك بوت راوِي",
+            description="أرسل دعوة لصديقك لاستخدام البوت",
+            input_message_content=InputTextMessageContent(message_text=msg_text),
+            reply_markup=kb,
+        ))
+
     # ===== مشاركة حديث أو مشاركة عامة =====
     else:
         msg_text = (
@@ -8310,7 +8474,190 @@ async def handle_inline_query(update, context):
             reply_markup=kb,
         ))
 
-    await query.answer(results, cache_time=60)
+    await query.answer(results, cache_time=0)
+
+async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """يُسجّل inline_message_id عند اختيار نتيجة inline quiz"""
+    result = update.chosen_inline_result
+    if not result:
+        return
+    chosen_id = result.result_id          # هو نفسه quiz_id مثل cq-سهل-1234567890
+    inline_msg_id = result.inline_message_id
+    if chosen_id in PENDING_INLINE_QUIZZES and inline_msg_id:
+        PENDING_INLINE_QUIZZES[chosen_id]["inline_message_id"] = inline_msg_id
+        logger.info(f"Inline quiz {chosen_id} linked to inline_message_id={inline_msg_id}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+# دالة: تشغيل الاختبار Inline (يعدّل الرسالة الواحدة)
+# ═══════════════════════════════════════════════════════════════════
+
+async def run_inline_quiz(context: ContextTypes.DEFAULT_TYPE, quiz_id: str):
+    """يشغّل الاختبار بالكامل عبر تعديل رسالة inline واحدة"""
+    quiz_data = ACTIVE_INLINE_QUIZZES.get(quiz_id)
+    if not quiz_data:
+        return
+    inline_msg_id = quiz_data["inline_message_id"]
+    questions = quiz_data["questions"]
+    participants = CHANNEL_QUIZ_PARTICIPANTS[quiz_id]
+    time_per_q = quiz_data.get("time_per_q", 15)
+    difficulty = quiz_data.get("difficulty", "مختلط")
+    diff_emoji = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(difficulty, "🎯")
+    labels = ['🔴 أ', '🔵 ب', '🟢 ج', '🟡 د']
+    plain_labels = ['أ', 'ب', 'ج', 'د']
+
+    quiz_data["status"] = "active"
+    quiz_data["started_at"] = datetime.now()
+
+    # رسالة البداية
+    names = "\n".join(
+        f"   {'🥇' if i==0 else '🥈' if i==1 else '🥉' if i==2 else '👤'} {p['name']}"
+        for i, p in enumerate(list(participants.values())[:5])
+    )
+    start_text = (
+        f"🚀 *الاختبار يبدأ الآن!*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"{diff_emoji} *المستوى:* {difficulty}\n"
+        f"📚 *الأسئلة:* {len(questions)}\n"
+        f"⏱️ *الوقت:* {time_per_q}ث / سؤال\n\n"
+        f"👥 المشاركون:\n{names}"
+    )
+    try:
+        await context.bot.edit_message_text(
+            inline_message_id=inline_msg_id,
+            text=start_text,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"run_inline_quiz start edit failed: {e}")
+
+    await asyncio.sleep(3)
+
+    for idx, q in enumerate(questions):
+        quiz_data["current_question"] = idx
+        category = q.get("category", "")
+        category_line = f"🏷️ {category}\n" if category else ""
+
+        opts_text = "\n".join(f"{labels[i]}. {opt}" for i, opt in enumerate(q['options']))
+        question_text = (
+            f"❓ *السؤال {idx+1} من {len(questions)}*\n"
+            f"══════════════════════\n"
+            f"{category_line}"
+            f"{diff_emoji} {difficulty}\n\n"
+            f"📌 {q['q']}\n\n"
+            f"{opts_text}\n\n"
+            f"⏱️ 🟩🟩🟩🟩🟩  {time_per_q} ثانية"
+        )
+        answer_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"🔴 أ. {q['options'][0][:25]}", callback_data=f"cqa_{quiz_id}_{idx}_0"),
+             InlineKeyboardButton(f"🔵 ب. {q['options'][1][:25]}", callback_data=f"cqa_{quiz_id}_{idx}_1")] if len(q['options']) > 1 else [],
+            [InlineKeyboardButton(f"🟢 ج. {q['options'][2][:25]}", callback_data=f"cqa_{quiz_id}_{idx}_2"),
+             InlineKeyboardButton(f"🟡 د. {q['options'][3][:25]}", callback_data=f"cqa_{quiz_id}_{idx}_3")] if len(q['options']) > 3 else [],
+        ])
+        try:
+            await context.bot.edit_message_text(
+                inline_message_id=inline_msg_id,
+                text=question_text,
+                parse_mode="Markdown",
+                reply_markup=answer_kb
+            )
+        except Exception as e:
+            logger.error(f"run_inline_quiz question edit failed: {e}")
+
+        # انتظار الإجابات
+        timer_bars = [
+            "🟩🟩🟩🟩🟩🟩🟩🟩🟩🟩", "🟩🟩🟩🟩🟩🟩🟩🟩🟩⬜",
+            "🟩🟩🟩🟩🟩🟩🟩🟩⬜⬜", "🟩🟩🟩🟩🟩🟩🟩⬜⬜⬜",
+            "🟩🟩🟩🟩🟩🟩⬜⬜⬜⬜", "🟩🟩🟩🟩🟩⬜⬜⬜⬜⬜",
+            "🟨🟨🟨🟨⬜⬜⬜⬜⬜⬜", "🟨🟨🟨⬜⬜⬜⬜⬜⬜⬜",
+            "🟧🟧⬜⬜⬜⬜⬜⬜⬜⬜", "🟥⬜⬜⬜⬜⬜⬜⬜⬜⬜",
+        ]
+        bar_step = max(1, time_per_q // len(timer_bars))
+        for sec in range(time_per_q):
+            await asyncio.sleep(1)
+            active_count = len([p for p in participants.values() if p.get("active")])
+            answered = len([p for p in participants.values() if p.get("active") and idx in p.get("answered", [])])
+            if active_count == 0 or answered >= active_count:
+                break
+            if sec % bar_step == 0 and sec > 0:
+                bar_idx = min(sec // bar_step, len(timer_bars)-1)
+                remaining = time_per_q - sec
+                updated_text = (
+                    f"❓ *السؤال {idx+1} من {len(questions)}*\n"
+                    f"══════════════════════\n"
+                    f"{category_line}"
+                    f"{diff_emoji} {difficulty}\n\n"
+                    f"📌 {q['q']}\n\n"
+                    f"{opts_text}\n\n"
+                    f"⏱️ {timer_bars[bar_idx]}  {remaining}ث"
+                )
+                try:
+                    await context.bot.edit_message_text(
+                        inline_message_id=inline_msg_id,
+                        text=updated_text,
+                        parse_mode="Markdown",
+                        reply_markup=answer_kb
+                    )
+                except Exception:
+                    pass
+
+        # كشف الإجابة الصحيحة
+        correct = q["answer"]
+        correct_idx = q["options"].index(correct) if correct in q["options"] else -1
+        answered_count = len([p for p in participants.values() if p.get("active") and idx in p.get("answered", [])])
+        active_now = len([p for p in participants.values() if p.get("active")])
+        result_text = (
+            f"✅ *الإجابة الصحيحة:*\n"
+            f"{labels[correct_idx] if correct_idx >= 0 else '?'}. {correct}\n\n"
+            f"👥 أجاب: {answered_count} من {active_now}"
+        )
+        try:
+            await context.bot.edit_message_text(
+                inline_message_id=inline_msg_id,
+                text=result_text,
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+
+        # فحص الفائز أو إنهاء
+        active = [uid for uid, p in participants.items() if p.get("active")]
+        if not active:
+            break
+
+    # النتائج النهائية
+    active_parts = {uid: p for uid, p in participants.items() if p.get("active")}
+    all_parts = {uid: p for uid, p in participants.items()}
+    sorted_p = sorted(all_parts.items(), key=lambda x: (-x[1].get("score", 0), x[1].get("wrong", 0)))
+    medals = ["🥇", "🥈", "🥉"]
+    rows = []
+    for i, (uid, p) in enumerate(sorted_p[:10]):
+        m = medals[i] if i < 3 else f"{i+1}."
+        rows.append(f"{m} {p['name']} — {p.get('score',0)} ✅ {p.get('wrong',0)} ❌")
+    leaderboard = "\n".join(rows) if rows else "لا يوجد مشاركون"
+    winner = sorted_p[0][1]["name"] if sorted_p else "—"
+    final_text = (
+        f"🏁 *انتهى الاختبار!*\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"🏆 *الفائز:* {winner}\n\n"
+        f"📊 *النتائج النهائية:*\n{leaderboard}\n\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🌙 بوت راوِي الإسلامي"
+    )
+    try:
+        await context.bot.edit_message_text(
+            inline_message_id=inline_msg_id,
+            text=final_text,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        logger.error(f"run_inline_quiz final edit failed: {e}")
+
+    # تنظيف
+    ACTIVE_INLINE_QUIZZES.pop(quiz_id, None)
+    CHANNEL_QUIZ_PARTICIPANTS.pop(quiz_id, None)
+
 
 async def cmd_share(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """زر المشاركة — يفتح نافذة اختيار المحادثة مع زر شفاف"""
