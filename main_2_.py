@@ -22,7 +22,13 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton, LabeledPrice
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, PreCheckoutQueryHandler, InlineQueryHandler, ChosenInlineResultHandler, filters, ContextTypes
 from telegram import InlineQueryResultArticle, InputTextMessageContent
-from islamic_questions import ISLAMIC_QUESTIONS_BY_DIFFICULTY
+from islamic_questions import (
+    ISLAMIC_QUESTIONS,
+    get_questions_by_difficulty,
+    get_all_questions,
+    get_random_questions,
+    get_mixed_difficulty_questions,
+)
 
 # ==================== Keep-Alive Server for Replit ====================
 class KeepAliveHandler(BaseHTTPRequestHandler):
@@ -906,7 +912,15 @@ def clear_error_logs():
     conn.close()
 
 def parse_dorar_html(html: str) -> list:
-    """استخراج الأحاديث من HTML الدرر"""
+    """
+    استخراج الأحاديث من HTML الدرر — البنية الصحيحة:
+      <div class="hadith">N - نص الحديث</div>
+      <div class="hadith-info">
+          <span class="info-subtitle">الراوي:</span> اسم الراوي
+          ...
+      </div>
+      --------------
+    """
     import re as _re
 
     SITTA = [
@@ -915,70 +929,69 @@ def parse_dorar_html(html: str) -> list:
         "سنن النسائي", "سنن ابن ماجه",
     ]
 
-    def extract_field(chunk, label):
-        m = _re.search(
-            r'<span class="info-subtitle">' + _re.escape(label) + r'[^<]*</span>(.*?)(?=<span class="info-subtitle"|</div>)',
-            chunk, _re.DOTALL
-        )
-        if m:
-            return _re.sub(r'<[^>]+>', '', m.group(1)).strip()
-        return ""
-
-    def clean_text(t):
+    def clean_html(t: str) -> str:
+        """إزالة وسوم HTML وتنظيف المسافات"""
         t = _re.sub(r'<[^>]+>', ' ', t)
         t = t.replace('&nbsp;', ' ').replace('&amp;', '&')
-        t = t.replace('&lt;', '<').replace('&gt;', '>')
-        # invisible unicode chars
+        t = t.replace('&lt;', '<').replace('&gt;', '>').replace('&quot;', '"')
         t = _re.sub(r'[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]', '', t)
         t = _re.sub(r'\s+', ' ', t).strip()
         return t
 
+    def extract_info_field(info_html: str, label: str) -> str:
+        """استخراج حقل من <div class='hadith-info'>"""
+        m = _re.search(
+            r'<span class="info-subtitle">' + _re.escape(label) +
+            r'[^<]*</span>(.*?)(?=<span class="info-subtitle"|</div>|$)',
+            info_html, _re.DOTALL
+        )
+        if m:
+            return clean_html(m.group(1)).strip()
+        return ""
+
     results = []
-    chunks = _re.split(r'(?=<div class="hadith")', html)
-    chunks = [c for c in chunks if '<div class="hadith"' in c]
 
-    for i, chunk in enumerate(chunks[:30]):
-        # استخرج النص — جرب أكثر من طريقة
-        text = ""
+    # ── نقسم بالفاصل بين الأحاديث ──────────────────────────────────────
+    sections = _re.split(r'-{3,}', html)
 
-        # طريقة 1: span hadith
-        m1 = _re.search(r'<span[^>]*class=["\']hadith["\'][^>]*>(.*?)</span>', chunk, _re.DOTALL)
-        if m1:
-            text = clean_text(m1.group(1))
+    for i, section in enumerate(sections[:30]):
+        # استخرج نص الحديث من <div class="hadith">
+        m_text = _re.search(
+            r'<div class="hadith"[^>]*>(.*?)</div>',
+            section, _re.DOTALL
+        )
+        if not m_text:
+            continue
+        raw_text = m_text.group(1)
 
-        # طريقة 2: النص بين div hadith وأول span info-subtitle
-        if not text:
-            m2 = _re.search(r'<div class="hadith"[^>]*>(.*?)(?=<span class="info-subtitle"|<div class="info")', chunk, _re.DOTALL)
-            if m2:
-                text = clean_text(m2.group(1))
+        # أزل <span class="search-keys"> لكن احتفظ بالنص الداخلي
+        text = _re.sub(r'<span[^>]*>', '', raw_text)
+        text = _re.sub(r'</span>', '', text)
+        text = clean_html(text)
 
-        # طريقة 3: كل النص قبل الراوي
-        if not text:
-            full = clean_text(chunk.split('<span class="info-subtitle">')[0] if '<span class="info-subtitle">' in chunk else chunk[:500])
-            if 'الراوي:' in full:
-                text = full[:full.find('الراوي:')].strip()
-            else:
-                text = full[:300].strip()
-
-        # تنظيف إضافي
-        text = _re.sub(r'^\s*\d+\s*[-–]\s*', '', text)
-        if 'الراوي:' in text:
-            text = text[:text.find('الراوي:')].strip()
+        # أزل ترقيم البداية "1 - " أو "١ - "
+        text = _re.sub(r'^\s*\d+\s*[-–]\s*', '', text).strip()
         text = text.strip('.')
 
         if not text or len(text) < 10:
             continue
 
-        rawi    = extract_field(chunk, "الراوي:")
-        mohdith = extract_field(chunk, "المحدث:")
-        source  = extract_field(chunk, "المصدر:")
-        grade   = extract_field(chunk, "خلاصة حكم المحدث:")
+        # استخرج البيانات من <div class="hadith-info">
+        m_info = _re.search(
+            r'<div class="hadith-info"[^>]*>(.*?)</div>',
+            section, _re.DOTALL
+        )
+        info_html = m_info.group(1) if m_info else ""
+
+        rawi    = extract_info_field(info_html, "الراوي:")
+        mohdith = extract_info_field(info_html, "المحدث:")
+        source  = extract_info_field(info_html, "المصدر:")
+        grade   = extract_info_field(info_html, "خلاصة حكم المحدث:")
+
+        # نظّف الراوي من الأقواس [ ]
+        rawi = rawi.strip('[]').strip()
 
         in_sitta = any(k in source for k in SITTA)
-        if not in_sitta and not source:
-            info_m = _re.search(r'class="info"[^>]*>(.*?)(?=<div class="hadith"|$)', chunk, _re.DOTALL)
-            if info_m:
-                in_sitta = any(k in info_m.group(1) for k in SITTA)
 
         results.append({
             "id": f"api_{i}",
@@ -992,14 +1005,14 @@ def parse_dorar_html(html: str) -> list:
             "_in_sitta": in_sitta,
         })
 
-    # أولوية الترتيب: صحيح مسلم > البخاري > بقية الستة
+    if not results:
+        return []
+
+    # ── ترتيب الأولويات ─────────────────────────────────────────────────
     PRIORITY = {
-        "صحيح مسلم": 0,
-        "صحيح البخاري": 1,
-        "سنن أبي داود": 2,
-        "سنن الترمذي": 3,
-        "سنن النسائي": 4,
-        "سنن ابن ماجه": 5,
+        "صحيح البخاري": 0, "صحيح مسلم": 1,
+        "سنن أبي داود": 2, "سنن الترمذي": 3,
+        "سنن النسائي": 4, "سنن ابن ماجه": 5,
     }
 
     def sort_key(r):
@@ -1009,15 +1022,12 @@ def parse_dorar_html(html: str) -> list:
                 return rank
         return 9
 
-    # فلتر: الكتب الستة فقط - صارم 100%
+    # ── فلتر الكتب الستة (ناعم: إذا ما وجد نرجع الكل مرتباً) ──────────
     sitta = [r for r in results if r["_in_sitta"]]
-    
-    # إذا ما في نتائج من الستة، نرجع قائمة فاضية (بدل إرجاع كل النتائج)
+    final = sitta if sitta else results  # fallback: كل النتائج
+
     if not sitta:
-        logger.info("[DORAR] لا توجد نتائج من الكتب الستة")
-        return []
-    
-    final = sitta
+        logger.info("[DORAR] لا توجد نتائج من الكتب الستة — إرجاع كل النتائج")
 
     final.sort(key=sort_key)
 
@@ -1095,21 +1105,43 @@ def get_spell_suggestion(query: str) -> str:
             return suggestion
     return ""
 
+def normalize_arabic(text: str) -> str:
+    """إزالة التشكيل وتوحيد الهمزات والألفات للمقارنة"""
+    import re as _re
+    # أزل التشكيل (حركات)
+    text = _re.sub(r'[\u064B-\u065F\u0670]', '', text)
+    # وحّد الهمزات والألفات
+    text = text.replace('أ', 'ا').replace('إ', 'ا').replace('آ', 'ا')
+    text = text.replace('ة', 'ه').replace('ى', 'ي').replace('ؤ', 'و').replace('ئ', 'ي')
+    return text.strip()
+
 def is_rawi_search(query: str) -> str:
     """
     هل يبحث المستخدم باسم راوٍ؟
-    يرجع query مناسب للـ API أو فارغ
+    يرجع اسم الراوي المطابق أو فارغ
     """
-    q = query.strip()
-    # تحقق من الرواة المعروفين
-    for rawi in KNOWN_RAWIS:
-        if rawi in q or q in rawi:
-            return rawi
-    # أي اسم يبدو راوياً (أبو، ابن، + اسم)
     import re as _re
-    if _re.match(r'^(أبو|ابن|أم|عبد)\s+\w+', q):
+    q = query.strip()
+    q_norm = normalize_arabic(q)
+    # تحقق من الرواة المعروفين (مقارنة بدون تشكيل)
+    for rawi in KNOWN_RAWIS:
+        rawi_norm = normalize_arabic(rawi)
+        if rawi_norm in q_norm or q_norm in rawi_norm:
+            return rawi
+    # أي اسم يبدو راوياً (أبو، ابن، أم، عبد + اسم)
+    if _re.match(r'^(أبو|ابن|أم|عبد|بنت)\s+\w+', q):
         return q
     return ""
+
+def filter_by_rawi(results: list, rawi_name: str) -> list:
+    """فلترة النتائج للأحاديث التي رواها هذا الصحابي تحديداً"""
+    rawi_norm = normalize_arabic(rawi_name)
+    filtered = [
+        r for r in results
+        if rawi_norm in normalize_arabic(r.get("rawi", ""))
+    ]
+    # إذا لم نجد بعد الفلترة، نرجع الكل بترتيبه الأصلي
+    return filtered if filtered else results
 
 # ترتيب مصادر الحديث حسب الأولوية
 _SOURCE_PRIORITY = {
@@ -2337,18 +2369,20 @@ CHANNEL_QUIZ_QUESTIONS = [
 
 import random as _random
 
-def get_channel_quiz_questions(count: int, difficulty: str = "مختلط") -> list:
-    """اختيار أسئلة عشوائية من بنك الأسئلة الجديد حسب الصعوبة"""
-    if difficulty == "مختلط":
-        pool = []
-        for lvl in ["سهل", "متوسط", "صعب"]:
-            qs = ISLAMIC_QUESTIONS_BY_DIFFICULTY.get(lvl, [])
-            pool.extend(qs)
-    else:
-        pool = ISLAMIC_QUESTIONS_BY_DIFFICULTY.get(difficulty, [])
+def get_channel_quiz_questions(count: int, difficulty: str = "مختلط", category: str = None) -> list:
+    """اختيار أسئلة عشوائية حسب التصنيف والصعوبة"""
+    if category and difficulty != "مختلط":
+        pool = get_questions_by_category_and_difficulty(category, difficulty)
         if not pool:
-            for lvl in ["سهل", "متوسط", "صعب"]:
-                pool.extend(ISLAMIC_QUESTIONS_BY_DIFFICULTY.get(lvl, []))
+            pool = get_questions_by_category(category)
+    elif category:
+        pool = get_questions_by_category(category)
+    elif difficulty != "مختلط":
+        pool = get_questions_by_difficulty(difficulty)
+    else:
+        pool = get_all_questions()
+    if not pool:
+        pool = get_all_questions()
     pool = pool.copy()
     _random.shuffle(pool)
     return pool[:min(count, len(pool))]
@@ -3514,10 +3548,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             
             difficulty = context.user_data.get("quiz_difficulty", "مختلط")
-            questions = get_channel_quiz_questions(count, difficulty)
+            category   = context.user_data.get("quiz_category")
+            questions  = get_channel_quiz_questions(count, difficulty, category)
             context.user_data["quiz_questions"] = questions
-            
-            # اختيار وقت السؤال
+            cat_label   = category if category else "مختلط"
+            diff_emoji  = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(difficulty, "🎯")
+            cat_icons   = {"عقيدة": "🕋", "قرآن": "📖", "حديث": "📚",
+                           "فقه": "⚖️", "سيرة": "📜", "تاريخ": "🏛️"}
+            cat_icon    = cat_icons.get(cat_label, "🎲")
+
             time_kb = InlineKeyboardMarkup([
                 [colored_btn("⚡ 10 ثانية", callback_data="cq_time_10", style="danger"),
                  colored_btn("⏱ 15 ثانية", callback_data="cq_time_15", style="primary")],
@@ -3525,8 +3564,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                  colored_btn("🕑 30 ثانية", callback_data="cq_time_30", style="secondary")],
             ])
             await update.message.reply_text(
-                f"✅ *تم اختيار {len(questions)} سؤال* [{difficulty}]\n\n"
-                "⏱ *كم ثانية لكل سؤال؟*",
+                f"✅ *تم اختيار {len(questions)} سؤال*\n"
+                f"{cat_icon} التصنيف: {cat_label}\n"
+                f"{diff_emoji} الصعوبة: {difficulty}\n\n"
+                "4️⃣ *كم ثانية لكل سؤال؟*",
                 parse_mode="Markdown",
                 reply_markup=time_kb
             )
@@ -3700,11 +3741,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             time_per_q = context.user_data.pop("quiz_time_per_q", 15)
             difficulty = context.user_data.pop("quiz_difficulty", "مختلط")
+            category   = context.user_data.pop("quiz_category", None)
             await publish_channel_quiz(context, channel_id, questions, user.id, time_per_q=time_per_q, difficulty=difficulty)
             diff_emoji = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(difficulty, "🎯")
+            cat_icons  = {"عقيدة": "🕋", "قرآن": "📖", "حديث": "📚",
+                          "فقه": "⚖️", "سيرة": "📜", "تاريخ": "🏛️"}
+            cat_label  = category if category else "مختلط"
+            cat_icon   = cat_icons.get(cat_label, "🎲")
             await update.message.reply_text(
                 f"✅ *تم نشر الاختبار في القناة!*\n\n"
                 f"📚 الأسئلة: {len(questions)}\n"
+                f"{cat_icon} التصنيف: {cat_label}\n"
                 f"{diff_emoji} الصعوبة: {difficulty}\n"
                 f"⏱ الوقت: {time_per_q} ثانية / سؤال\n"
                 f"📢 القناة: {channel_id}",
@@ -4082,23 +4129,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if text == "📢 اختبار القناة":
         keyboard = [
-            [colored_btn("🟢 سهل", callback_data="cq_diff_سهل", style="success"),
-             colored_btn("🟡 متوسط", callback_data="cq_diff_متوسط", style="primary")],
-            [colored_btn("🔴 صعب", callback_data="cq_diff_صعب", style="danger"),
-             colored_btn("🎲 مختلط", callback_data="cq_diff_مختلط", style="secondary")],
+            [colored_btn("🕋 عقيدة", callback_data="cq_cat_عقيدة", style="primary"),
+             colored_btn("📖 قرآن",  callback_data="cq_cat_قرآن",  style="primary")],
+            [colored_btn("📚 حديث",  callback_data="cq_cat_حديث",  style="primary"),
+             colored_btn("⚖️ فقه",   callback_data="cq_cat_فقه",   style="primary")],
+            [colored_btn("📜 سيرة",  callback_data="cq_cat_سيرة",  style="primary"),
+             colored_btn("🏛️ تاريخ", callback_data="cq_cat_تاريخ", style="primary")],
+            [colored_btn("🎲 مختلط (كل التصنيفات)", callback_data="cq_cat_مختلط", style="secondary")],
             [colored_btn("✍️ أسئلة يدوية", callback_data="cq_manual", style="secondary")],
-            [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
+            [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")],
         ]
-        
         await update.message.reply_text(
             "🎯 *إنشاء اختبار في القناة*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
             "📌 البوت يجب أن يكون *مشرفاً* في القناة\n\n"
-            "اختر مستوى الصعوبة:",
+            "1️⃣ اختر *التصنيف* أولاً:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        
         context.user_data["creating_channel_quiz"] = True
         return
     
@@ -4270,8 +4318,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             import re as _re2
             t_clean = _re2.sub(r'^سورة\s*', '', t).strip()  # يحذف "سورة " من البداية
             name_only = t_clean in QURAN_SURAHS
-            # لو ما لقى — جرب مطابقة جزئية
-            if not name_only and not num_ref and not name_ref:
+            # لو ما لقى — جرب مطابقة جزئية، لكن فقط إذا كان النص قصيراً (اسم سورة وليس آية)
+            # النص الطويل (أكثر من كلمتين أو 15 حرف) يُعامَل كبحث نصي لا اسم سورة
+            is_short_text = len(t_clean.split()) <= 2 and len(t_clean) <= 15
+            if not name_only and not num_ref and not name_ref and is_short_text:
                 for sn in QURAN_SURAHS:
                     if t_clean in sn or sn in t_clean:
                         t_clean = sn
@@ -4347,34 +4397,75 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== معالج البحث عن حديث =====
     if context.user_data.get("hadith_search_mode") and text and not text.startswith("/") and text not in _KB_BTNS and text != "🔙 خروج من الباحث":
-        # تجاهل زر الخروج - دعه يمر للمعالج الخاص
-        if text == "🔙 خروج من الباحث":
-            # لا تعالجه هنا - دعه يمر للأسفل
-            pass
+
+        if len(text) < 3:
+            await update.message.reply_text("⚠️ أرسل نصاً أطول (3 أحرف على الأقل).")
+            return
+        if is_rate_limited(user.id):
+            await update.message.reply_text("⏳ أرسلت طلبات كثيرة، انتظر ثوانٍ قليلة.")
+            return
+
+        # تحديد نوع البحث
+        rawi_match = is_rawi_search(text)
+        if rawi_match:
+            wait = await update.message.reply_text(f"🔍 أبحث عن أحاديث الراوي: *{rawi_match}*...", parse_mode="Markdown")
         else:
-            # لا نغلق الوضع - نبقيه مفتوح
-
-            if len(text) < 3:
-                await update.message.reply_text("⚠️ أرسل نصاً أطول (3 أحرف على الأقل).")
-                return
-            if is_rate_limited(user.id):
-                await update.message.reply_text("⏳ أرسلت طلبات كثيرة، انتظر ثوانٍ قليلة.")
-                return
-
             wait = await update.message.reply_text("⏳ جاري البحث في الدرر السنية...")
-        try:
-            rawi_match = is_rawi_search(text)
-            search_query = rawi_match if rawi_match else text
-            logger.info(f"[HADITH SEARCH] user={user.id} query={search_query[:50]}")
-            results = await search_dorar_api(search_query)
-            logger.info(f"[HADITH SEARCH] results={len(results)}")
 
-            if not results:
-                suggestion = get_spell_suggestion(text)
-                if suggestion and suggestion != text:
-                    results = await smart_hadith_search(suggestion)
-                    if results:
-                        await wait.edit_text(f"🔍 لم أجد نتائج لـ «{text}»، أبحث عن «{suggestion}»...")
+        try:
+            results = []
+            searched_label = text  # للرسالة النهائية
+
+            # ── بحث بالراوي ─────────────────────────────────────────
+            if rawi_match:
+                logger.info(f"[HADITH SEARCH] رواي: {rawi_match}")
+                raw_results = await search_dorar_api(rawi_match)
+                # فلترة: فقط الأحاديث التي يكون الراوي فيها هو المطلوب
+                results = filter_by_rawi(raw_results, rawi_match)
+                logger.info(f"[HADITH SEARCH] راوي → {len(raw_results)} خام، {len(results)} بعد الفلترة")
+                # إذا لم نجد كافياً، جرب بحثاً أشمل بالنص
+                if len(results) < 3:
+                    extra = await search_dorar_api(text)
+                    extra_filtered = filter_by_rawi(extra, rawi_match)
+                    seen = {r.get("text", "")[:80] for r in results}
+                    for r in extra_filtered:
+                        if r.get("text", "")[:80] not in seen:
+                            results.append(r)
+                            seen.add(r.get("text", "")[:80])
+
+            # ── بحث بالنص أو الموضوع ─────────────────────────────────
+            else:
+                clean_q = clean_search_query(text)
+                logger.info(f"[HADITH SEARCH] نص/موضوع: '{clean_q}'")
+                results = await search_dorar_api(clean_q)
+
+                # إذا النتائج قليلة، جرب تبسيط الاستعلام
+                if len(results) < 3:
+                    simplified = simplify_query(text)
+                    if simplified and simplified != clean_q:
+                        logger.info(f"[HADITH SEARCH] تبسيط: '{simplified}'")
+                        extra = await search_dorar_api(simplified)
+                        seen = {r.get("text", "")[:80] for r in results}
+                        for r in extra:
+                            if r.get("text", "")[:80] not in seen:
+                                results.append(r)
+                                seen.add(r.get("text", "")[:80])
+
+                # إذا لا يزال قليل، جرب الاقتراح الإملائي
+                if len(results) < 2:
+                    suggestion = get_spell_suggestion(text)
+                    if suggestion and suggestion != text:
+                        logger.info(f"[HADITH SEARCH] إملائي: '{suggestion}'")
+                        spell_results = await search_dorar_api(suggestion)
+                        if spell_results:
+                            await wait.edit_text(f"🔍 أبحث عن *{suggestion}*...", parse_mode="Markdown")
+                            searched_label = suggestion
+                            seen = {r.get("text", "")[:80] for r in results}
+                            for r in spell_results:
+                                if r.get("text", "")[:80] not in seen:
+                                    results.append(r)
+
+            logger.info(f"[HADITH SEARCH] النتائج النهائية: {len(results)}")
 
             if results:
                 log_search(user.id, text)
@@ -4388,26 +4479,28 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 url = f"https://dorar.net/hadith/search?q={urllib.parse.quote(text)}"
                 suggestion = get_spell_suggestion(text)
-                kb = [[colored_btn("🔍 ابحث في الدرر السنية", url=url, style="primary")]]
-                if suggestion:
-                    kb.append([colored_btn(f"✏️ ابحث عن: {suggestion}", callback_data=f"spell_{suggestion[:50]}", style="primary")])
-                spell_hint = f"\n\n💡 هل تقصد: *{suggestion}*؟" if suggestion else ""
+                kb = [[colored_btn("🔍 ابحث في الدرر السنية مباشرة", url=url, style="primary")]]
+                if suggestion and suggestion != text:
+                    kb.append([colored_btn(f"✏️ جرب: {suggestion}", callback_data=f"spell_{suggestion[:50]}", style="primary")])
+                tips = (
+                    "💡 *نصائح للبحث:*\n"
+                    "• بحث بنص: «إنما الأعمال بالنيات»\n"
+                    "• بحث براوٍ: «أبو هريرة» أو «ابن عمر»\n"
+                    "• بحث بموضوع: «الصدق» أو «الأمانة»"
+                )
                 await wait.edit_text(
-                    f"⚠️ لم أجد نتائج لـ «{text}»{spell_hint}\n\n"
-                    "💡 جرّب كلمة أو كلمتان من نص الحديث",
+                    f"⚠️ لم أجد نتائج لـ «{searched_label}»\n\n{tips}",
                     reply_markup=InlineKeyboardMarkup(kb),
                     parse_mode="Markdown"
                 )
+
         except Exception as e:
             logger.error(f"[HADITH SEARCH ERROR] {e}", exc_info=True)
             try:
-                await wait.edit_text(
-                    "⚠️ تعذّر الاتصال بقاعدة البيانات\n"
-                    "انتظر ثوانٍ وحاول مجدداً 🔄"
-                )
+                await wait.edit_text("⚠️ تعذّر الاتصال بالدرر السنية\nانتظر ثوانٍ وحاول مجدداً 🔄")
             except Exception:
                 pass
-            return
+        return  # انتهى معالج البحث — لا تكمل للمعالجات الأخرى
 
     if text == "اقترح لي حديثا📜":
         await random_suggestion(update, context)
@@ -6136,7 +6229,7 @@ async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== اختبار القناة =====
     elif q.data in ("cq_ready", "cq_manual", "cq_cancel", "cq_add_more", "cq_finish_manual") or \
-         q.data.startswith("cq_diff_") or q.data.startswith("cq_time_"):
+         q.data.startswith("cq_cat_") or q.data.startswith("cq_diff_") or q.data.startswith("cq_time_"):
         await handle_quiz_type_selection(update, context)
         return
 
@@ -6553,18 +6646,52 @@ async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAU
     
     data = query.data
 
-    # معالج اختيار الصعوبة
+    # ── اختيار التصنيف ──
+    if data.startswith("cq_cat_"):
+        raw_cat = data.replace("cq_cat_", "")
+        category = None if raw_cat == "مختلط" else raw_cat
+        context.user_data["quiz_category"] = category
+        context.user_data["quiz_type"] = "ready"
+        cat_label = raw_cat if raw_cat != "مختلط" else "مختلط (كل التصنيفات)"
+        cat_icons = {"عقيدة": "🕋", "قرآن": "📖", "حديث": "📚",
+                     "فقه": "⚖️", "سيرة": "📜", "تاريخ": "🏛️", "مختلط": "🎲"}
+        icon = cat_icons.get(raw_cat, "📂")
+        keyboard = [
+            [colored_btn("🟢 سهل",    callback_data="cq_diff_سهل",    style="success"),
+             colored_btn("🟡 متوسط",  callback_data="cq_diff_متوسط",  style="primary")],
+            [colored_btn("🔴 صعب",    callback_data="cq_diff_صعب",    style="danger"),
+             colored_btn("🎲 مختلط",  callback_data="cq_diff_مختلط",  style="secondary")],
+            [colored_btn("❌ إلغاء",  callback_data="cq_cancel",       style="danger")],
+        ]
+        await query.edit_message_text(
+            f"{icon} *التصنيف: {cat_label}*\n"
+            "━━━━━━━━━━━━━━━━━━━━\n\n"
+            "2️⃣ اختر *مستوى الصعوبة*:",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(keyboard)
+        )
+        return
+
+    # ── اختيار الصعوبة ──
     if data.startswith("cq_diff_"):
         difficulty = data.replace("cq_diff_", "")
+        category   = context.user_data.get("quiz_category")
         context.user_data["quiz_difficulty"] = difficulty
         context.user_data["quiz_type"] = "ready"
         context.user_data["waiting_quiz_count"] = True
         diff_emoji = {"سهل": "🟢", "متوسط": "🟡", "صعب": "🔴", "مختلط": "🎲"}.get(difficulty, "🎯")
+        cat_label  = category if category else "مختلط"
+        cat_icons  = {"عقيدة": "🕋", "قرآن": "📖", "حديث": "📚",
+                      "فقه": "⚖️", "سيرة": "📜", "تاريخ": "🏛️"}
+        cat_icon   = cat_icons.get(cat_label, "🎲")
+        pool_size  = len(get_channel_quiz_questions(100, difficulty, category))
         await query.edit_message_text(
-            f"*{diff_emoji} مستوى الصعوبة: {difficulty}*\n"
+            f"{cat_icon} *التصنيف:* {cat_label}\n"
+            f"{diff_emoji} *الصعوبة:* {difficulty}\n"
+            f"📦 *المتاح:* {pool_size} سؤال\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "كم عدد الأسئلة تريد؟\n"
-            "أرسل رقماً من *5* إلى *20*:",
+            "3️⃣ كم عدد الأسئلة تريد؟\n"
+            f"أرسل رقماً من *5* إلى *{min(20, pool_size)}*:",
             parse_mode="Markdown"
         )
         return
@@ -6585,16 +6712,19 @@ async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAU
 
     if data == "cq_ready":
         keyboard = [
-            [colored_btn("🟢 سهل", callback_data="cq_diff_سهل", style="success"),
-             colored_btn("🟡 متوسط", callback_data="cq_diff_متوسط", style="primary")],
-            [colored_btn("🔴 صعب", callback_data="cq_diff_صعب", style="danger"),
-             colored_btn("🎲 مختلط", callback_data="cq_diff_مختلط", style="secondary")],
-            [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")]
+            [colored_btn("🕋 عقيدة", callback_data="cq_cat_عقيدة", style="primary"),
+             colored_btn("📖 قرآن",  callback_data="cq_cat_قرآن",  style="primary")],
+            [colored_btn("📚 حديث",  callback_data="cq_cat_حديث",  style="primary"),
+             colored_btn("⚖️ فقه",   callback_data="cq_cat_فقه",   style="primary")],
+            [colored_btn("📜 سيرة",  callback_data="cq_cat_سيرة",  style="primary"),
+             colored_btn("🏛️ تاريخ", callback_data="cq_cat_تاريخ", style="primary")],
+            [colored_btn("🎲 مختلط (كل التصنيفات)", callback_data="cq_cat_مختلط", style="secondary")],
+            [colored_btn("❌ إلغاء", callback_data="cq_cancel", style="danger")],
         ]
         await query.edit_message_text(
             "📚 *أسئلة جاهزة من البوت*\n"
             "━━━━━━━━━━━━━━━━━━━━\n\n"
-            "اختر مستوى الصعوبة:",
+            "1️⃣ اختر *التصنيف* أولاً:",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
@@ -6658,7 +6788,8 @@ async def handle_quiz_type_selection(update: Update, context: ContextTypes.DEFAU
         await query.edit_message_text("❌ تم إلغاء إنشاء الاختبار.")
         for k in ["creating_channel_quiz", "quiz_type", "manual_questions",
                   "waiting_one_manual_q", "waiting_quiz_count", "waiting_channel_id",
-                  "quiz_questions"]:
+                  "quiz_questions", "quiz_category", "quiz_difficulty",
+                  "quiz_time_per_q"]:
             context.user_data.pop(k, None)
 
 
@@ -6743,13 +6874,15 @@ async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await query.answer("⚠️ الاختبار غير موجود أو انتهى!", show_alert=True)
                 return
             pending["inline_message_id"] = inline_msg_id
+            quiz_creator_id = pending.get("creator_id")
             PENDING_INLINE_QUIZZES.pop(quiz_id, None)
             CHANNEL_QUIZ_PARTICIPANTS[quiz_id] = {}
             ACTIVE_INLINE_QUIZZES[quiz_id] = {
                 "quiz_id": quiz_id,
                 "questions": pending["questions"],
                 "current_question": 0,
-                "admin_id": user_id,
+                "admin_id": quiz_creator_id,
+                "creator_id": quiz_creator_id,
                 "status": "waiting",
                 "started_at": None,
                 "inline_message_id": inline_msg_id,
@@ -6794,7 +6927,7 @@ async def handle_quiz_join(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{names_list}\n\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "✅ اضغط *انضم* للمشاركة\n"
-            "▶️ *مشرف القناة* يبدأ الاختبار"
+            "▶️ *من أرسل الاختبار* فقط يستطيع البدء"
         )
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ انضم للاختبار", callback_data=f"cqj_{quiz_id}")],
@@ -6888,13 +7021,24 @@ async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ─── وضع Inline ───────────────────────────────────────────────
     if is_inline:
         inline_msg_id = query.inline_message_id
+        logger.info(f"[QUIZ_START] user_id={user_id} quiz_id={quiz_id} inline_msg_id={inline_msg_id}")
 
         # إذا لم يكن نشطاً بعد، ننقله من المعلّقة
         if quiz_id not in ACTIVE_INLINE_QUIZZES:
             pending = PENDING_INLINE_QUIZZES.get(quiz_id)
             if not pending:
+                logger.warning(f"[QUIZ_START] quiz_id={quiz_id} not in PENDING nor ACTIVE")
                 await query.answer("⚠️ الاختبار غير موجود أو انتهى!", show_alert=True)
                 return
+
+            # التحقق: فقط المنشئ أو الأدمن يستطيع البدء
+            creator_id = pending.get("creator_id")
+            logger.info(f"[QUIZ_START] PENDING path: creator_id={creator_id} user_id={user_id} match={user_id == creator_id}")
+            if creator_id and user_id != creator_id and user_id not in ADMIN_IDS:
+                logger.warning(f"[QUIZ_START] BLOCKED: user_id={user_id} != creator_id={creator_id}")
+                await query.answer("⚠️ فقط من أنشأ الاختبار يستطيع بدءه!", show_alert=True)
+                return
+
             pending["inline_message_id"] = inline_msg_id
             PENDING_INLINE_QUIZZES.pop(quiz_id, None)
             CHANNEL_QUIZ_PARTICIPANTS[quiz_id] = {}
@@ -6903,12 +7047,22 @@ async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "questions": pending["questions"],
                 "current_question": 0,
                 "admin_id": user_id,
+                "creator_id": creator_id or user_id,
                 "status": "waiting",
                 "started_at": None,
                 "inline_message_id": inline_msg_id,
                 "time_per_q": pending.get("time_per_q", 15),
                 "difficulty": pending.get("difficulty", "مختلط"),
             }
+        else:
+            # الاختبار موجود بالفعل في ACTIVE — تحقق من المنشئ
+            quiz_data_check = ACTIVE_INLINE_QUIZZES[quiz_id]
+            creator_id = quiz_data_check.get("creator_id")
+            logger.info(f"[QUIZ_START] ACTIVE path: creator_id={creator_id} user_id={user_id} match={user_id == creator_id}")
+            if creator_id and user_id != creator_id and user_id not in ADMIN_IDS:
+                logger.warning(f"[QUIZ_START] BLOCKED (ACTIVE): user_id={user_id} != creator_id={creator_id}")
+                await query.answer("⚠️ فقط من أنشأ الاختبار يستطيع بدءه!", show_alert=True)
+                return
 
         quiz_data = ACTIVE_INLINE_QUIZZES[quiz_id]
         if quiz_data["status"] != "waiting":
@@ -6922,6 +7076,10 @@ async def handle_quiz_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(participants) == 0:
             user_name = query.from_user.first_name or "مشارك"
             participants[user_id] = {"name": user_name, "score": 0, "answers": 0}
+
+        # ضع status = "starting" فوراً لمنع double-start قبل run_inline_quiz
+        quiz_data["status"] = "starting"
+        logger.info(f"[QUIZ_START] Starting quiz {quiz_id} by user_id={user_id}")
 
         # شغّل الاختبار inline مباشرة
         await query.answer("✅ يبدأ الاختبار الآن!", show_alert=False)
@@ -7722,7 +7880,7 @@ async def fetch_quran_search(query: str) -> list:
     """
     بحث في القرآن الكريم بنص الآية:
     - يزيل التشكيل من الاستعلام لمطابقة أدق
-    - يبحث في نسخة ar.simple (بدون تشكيل)
+    - يبحث عبر qurancdn.com API
     - يجلب النص الكامل بالتشكيل من fetch_ayah_by_ref
     """
     try:
@@ -7734,26 +7892,49 @@ async def fetch_quran_search(query: str) -> list:
             return []
 
         results = []
-        # البحث في النسخة البسيطة (بدون تشكيل) — يعطي نتائج أفضل
+        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+
+        # البحث عبر qurancdn.com — API موثوق ويدعم البحث العربي
         search_url = (
-            f"https://api.alquran.cloud/v1/search/"
-            f"{urllib.parse.quote(search_query)}/all/ar.simple"
+            f"https://api.qurancdn.com/api/qdc/search"
+            f"?q={urllib.parse.quote(search_query)}&size=5"
         )
         async with aiohttp.ClientSession() as session:
-            async with session.get(search_url, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            async with session.get(search_url, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    if (data.get('code') == 200
-                            and 'data' in data
-                            and 'matches' in data['data']):
-                        matches = data['data']['matches'][:5]
-                        for match in matches:
-                            s_num = match['surah']['number']
-                            a_num = match['numberInSurah']
-                            # جلب النص الكامل مع التشكيل بنفس صيغة fetch_ayah_by_ref
+                    verses = data.get('result', {}).get('verses', [])
+                    for verse in verses[:5]:
+                        verse_key = verse.get('verse_key', '')
+                        if ':' in verse_key:
+                            parts = verse_key.split(':')
+                            s_num = int(parts[0])
+                            a_num = int(parts[1])
                             full = await fetch_ayah_by_ref(s_num, a_num)
                             if full:
                                 results.append(full)
+
+        # احتياطي: alquran.cloud بتنسيق مختلف إذا فشل الأول
+        if not results:
+            search_url2 = (
+                f"https://api.alquran.cloud/v1/search/"
+                f"{urllib.parse.quote(search_query)}/all/ar"
+            )
+            async with aiohttp.ClientSession() as session:
+                async with session.get(search_url2, headers=headers, timeout=aiohttp.ClientTimeout(total=12)) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        if (data.get('code') == 200
+                                and 'data' in data
+                                and 'matches' in data['data']):
+                            matches = data['data']['matches'][:5]
+                            for match in matches:
+                                s_num = match['surah']['number']
+                                a_num = match['numberInSurah']
+                                full = await fetch_ayah_by_ref(s_num, a_num)
+                                if full:
+                                    results.append(full)
+
         return results
 
     except Exception as e:
@@ -8408,6 +8589,7 @@ async def handle_inline_query(update, context):
                 "questions": questions,
                 "time_per_q": 15,
                 "difficulty": diff,
+                "creator_id": query.from_user.id,
             }
             diff_txt = (
                 f"🕌 *اختبار إسلامي — {emoji} {diff}*\n"
@@ -8419,7 +8601,7 @@ async def handle_inline_query(update, context):
                 f"👥 *المنضمون:* 0\n\n"
                 "━━━━━━━━━━━━━━━━━━━━\n"
                 "✅ اضغط *انضم* للمشاركة\n"
-                "▶️ *مشرف القناة* يبدأ الاختبار"
+                "▶️ *من أرسل الاختبار* فقط يستطيع البدء"
             )
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ انضم للاختبار", callback_data=f"cqj_{q_id}")],
@@ -8477,15 +8659,18 @@ async def handle_inline_query(update, context):
     await query.answer(results, cache_time=0)
 
 async def handle_chosen_inline_result(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """يُسجّل inline_message_id عند اختيار نتيجة inline quiz"""
+    """يُسجّل inline_message_id ومعرّف المنشئ عند اختيار نتيجة inline quiz"""
     result = update.chosen_inline_result
     if not result:
         return
     chosen_id = result.result_id          # هو نفسه quiz_id مثل cq-سهل-1234567890
     inline_msg_id = result.inline_message_id
+    creator_id = result.from_user.id if result.from_user else None
     if chosen_id in PENDING_INLINE_QUIZZES and inline_msg_id:
         PENDING_INLINE_QUIZZES[chosen_id]["inline_message_id"] = inline_msg_id
-        logger.info(f"Inline quiz {chosen_id} linked to inline_message_id={inline_msg_id}")
+        if creator_id:
+            PENDING_INLINE_QUIZZES[chosen_id]["creator_id"] = creator_id
+        logger.info(f"Inline quiz {chosen_id} linked to inline_message_id={inline_msg_id}, creator={creator_id}")
 
 
 # ═══════════════════════════════════════════════════════════════════
